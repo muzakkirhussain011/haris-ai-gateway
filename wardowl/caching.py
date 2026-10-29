@@ -9,6 +9,15 @@ seconds later (plus whatever delay the permission service itself has). Call `inv
 a change you know about to drop cached decisions at once. An answer the authorizer gave before that
 call, to a retrieval still in progress, is not cached after it either.
 
+A permission service can itself answer from data up to some seconds old (SpiceDB under
+`minimizeLatency`, a policy engine that reloads its policies): just after `invalidate()` it may
+still give an answer from before the change. So for `source_staleness` seconds after
+`invalidate()` (the wrapped authorizer's `max_staleness` by default, 0 when it declares none), the
+answers for that subject, or for everyone, are passed on but cached nowhere. If the authorizer is
+never staler than that, a revocation reported with `invalidate()` stops granting access in this
+process within `source_staleness`, as it would without a cache, and in other processes sharing the
+cache within `source_staleness` plus `local_ttl`.
+
 What is cached, per (subject, action): the pre-filter from `filter_for`, and each `check` decision,
 keyed by the chunk id and its metadata, so a chunk whose metadata changes is decided again.
 Errors and malformed answers are never cached: every failure reaches the caller and retrieval fails
@@ -24,7 +33,8 @@ replicas copy it (with clocks kept in sync, as NTP does). `invalidate()` also re
 stored in the shared cache, and an entry is used only under the epoch it was written in, so an
 answer another replica obtained before the invalidation and writes after it is never read. A shared
 cache that fails is treated as a miss: the authorizer is asked, and the cache is never the reason
-access is granted.
+access is granted. The epoch also carries the end of the invalidation's hold, so every replica
+holds back the subject's answers as the one that called `invalidate()` does.
 """
 
 from __future__ import annotations
@@ -47,7 +57,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
-from wardowl.authz import AuthorizationError, Authorizer
+from wardowl.authz import AuthorizationError, Authorizer, _staleness
 from wardowl.filters import Filter, filter_from_dict, filter_to_dict
 from wardowl.types import Hit, Subject
 
@@ -56,8 +66,11 @@ __all__ = ["CacheStats", "CachingAuthorizer", "RedisCache", "SharedCache"]
 _NONE = object()  # cached "this authorizer returns no filter"
 _MISS = object()  # a shared entry that is absent, expired, unreadable, or from an earlier epoch
 _UNKNOWN = object()  # the shared epochs could not be read, so nothing learned is written there
-# How much longer than `ttl` an epoch is kept. Until it expires, entries written under the epoch it
-# replaced are refused; by then they have long expired, so "no epoch yet" cannot bring one back.
+_HOLD = object()  # read while invalidate() holds the subject's answers back: nothing learned is kept
+_HELD = -1  # the generation of a call that began during such a hold here: no answer of its is kept
+# How much longer than `ttl` and the hold an epoch is kept. Until it expires, entries written under
+# the epoch it replaced are refused; by then they have long expired, so "no epoch yet" cannot bring
+# one back.
 _EPOCH_MARGIN = 3600.0
 _log = logging.getLogger("wardowl")
 
@@ -182,13 +195,25 @@ def _claim(shared: SharedCache, namespace: str, authorizer: Authorizer) -> None:
         )
 
 
-def _epoch_id(blob: Any) -> str | None:
-    """The epoch a shared cache holds, as text to compare; None when it holds none yet."""
+def _epoch(blob: Any) -> tuple[str | None, float]:
+    """The epoch a shared cache holds, as text to compare (None when it holds none yet), and the
+    wall-clock time until which the `invalidate()` that wrote it holds answers back (-inf for none).
+
+    An epoch is 32 hex digits, then "/" and that time when the authorizer may answer from stale
+    data. The whole value is the text compared, as it was before epochs carried a hold, so every
+    version agrees on which epoch an entry was written under."""
     if blob is None:
-        return None
+        return None, -math.inf
     if not isinstance(blob, (bytes, bytearray)):
         raise TypeError(f"a shared cache returned {type(blob).__name__}, not bytes")
-    return bytes(blob).hex()
+    value = bytes(blob)
+    _, mark, hold = value.partition(b"/")
+    if not mark:
+        return value.hex(), -math.inf
+    until = float(hold.decode("ascii"))
+    if not math.isfinite(until):
+        raise ValueError("an epoch's hold must end at a finite time")
+    return value.hex(), until
 
 
 @dataclass(frozen=True)
@@ -235,6 +260,14 @@ class CachingAuthorizer:
     `invalidate()` made in another process takes to reach this one. Errors and malformed answers
     are never cached. `clock` is for tests.
 
+    `source_staleness` is how many seconds old the data behind the wrapped authorizer's answers can
+    be: by default its `max_staleness` (for `SpiceDBAuthorizer`, set by its consistency), 0 when it
+    declares none. For that long after `invalidate()`, answers for the invalidated subject, or for
+    everyone, are passed on but cached nowhere, so that one from before the change is not kept for
+    `ttl`. Set it for a service whose staleness the adapter cannot know: OpenFGA's check cache
+    under `MINIMIZE_LATENCY`, OPA's bundle polling, Cerbos's policy reloads. This cache's own
+    `max_staleness`, for anything that wraps it, is `ttl` plus `source_staleness`.
+
     Every `CachingAuthorizer` with the same `shared` cache and `namespace` uses the same answers,
     whatever authorizer it wraps: give each differently configured authorizer (another policy,
     store, tenant model or action mapping) a namespace of its own. In one process, a second
@@ -252,12 +285,15 @@ class CachingAuthorizer:
         shared: SharedCache | None = None,
         namespace: str | None = None,
         local_ttl: float = 1.0,
+        source_staleness: float | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not (math.isfinite(ttl) and math.isfinite(local_ttl)) or ttl <= 0 or maxsize < 1 or local_ttl <= 0:
             raise ValueError("ttl and local_ttl must be positive finite numbers, and maxsize positive")
         if namespace is not None and not namespace:
             raise ValueError("namespace must be non-empty")
+        declared = getattr(authorizer, "max_staleness", None) if source_staleness is None else source_staleness
+        staleness = _staleness(declared)
         if shared is not None:
             if namespace is None:
                 # The default namespace once shared by every authorizer: one answered for another.
@@ -273,6 +309,7 @@ class CachingAuthorizer:
         self.namespace = namespace
         # Without a shared cache this process's copy is the only one, and it lives for ttl.
         self.local_ttl = ttl if shared is None else min(local_ttl, ttl)
+        self.source_staleness = staleness
         self._clock = clock
         # Shared entries carry wall-clock expiry times; a test clock stands in for both clocks.
         self._wall = time.time if clock is time.monotonic else clock
@@ -281,12 +318,23 @@ class CachingAuthorizer:
         # Bumped by every invalidate(). An answer obtained by a call that started before the bump
         # may predate the change that prompted it, so it is not kept.
         self._generation = 0
-        # The shared cache's global epoch and when this process read it; read again after local_ttl.
-        self._global_epoch: tuple[float, str | None] | None = None
+        # Until these times on this process's clock, invalidate() holds back the answers for
+        # everyone, and for each subject id: the authorizer may still answer from before the change.
+        self._hold_all = -math.inf
+        self._holds: dict[str, float] = {}
+        # The shared cache's global epoch, when this process read it, and the end of its hold (wall
+        # clock); read again after local_ttl.
+        self._global_epoch: tuple[float, str | None, float] | None = None
         # Bumped when invalidate() sets the global epoch, so a read already in flight cannot put
         # back the epoch it replaced.
         self._global_version = 0
         self._stats = {"hits": 0, "shared_hits": 0, "misses": 0, "shared_failures": 0}
+
+    @property
+    def max_staleness(self) -> float:
+        """How many seconds old the data behind this cache's answers can be: `ttl` plus
+        `source_staleness`. A `CachingAuthorizer` that wraps this one reads it."""
+        return self.ttl + self.source_staleness
 
     # ---- this process's cache --------------------------------------------------------------
 
@@ -312,13 +360,23 @@ class CachingAuthorizer:
         with self._lock:
             return CacheStats(**self._stats, entries=len(self._entries))
 
+    def _start(self, subject: Subject) -> int:
+        """The generation under which a call about `subject` that begins now keeps its answers:
+        `_HELD`, so that none is kept, while an `invalidate()` of the subject or of everyone holds
+        answers back."""
+        with self._lock:
+            now = self._clock()
+            if now < self._hold_all or now < self._holds.get(subject.id, -math.inf):
+                return _HELD
+            return self._generation
+
     def _put(self, key: Any, value: Any, generation: int, ttl: float | None = None) -> None:
         lifetime = self.local_ttl if ttl is None else min(ttl, self.local_ttl)
         if not (math.isfinite(lifetime) and lifetime > 0):
             return  # an entry that would never expire, or has already expired, is not kept
         with self._lock:
             if generation != self._generation:
-                return  # invalidate() ran while this answer was being obtained
+                return  # invalidate() ran while this answer was being obtained, or holds it back
             self._entries[key] = (self._clock() + lifetime, value)
             self._entries.move_to_end(key)
             while len(self._entries) > self.maxsize:
@@ -345,23 +403,25 @@ class CachingAuthorizer:
             return f"{self.namespace}!epoch"
         return f"{self.namespace}!epoch:{{{_digest(str(subject_id))}}}"
 
-    def _global(self) -> tuple[str | None, float]:
-        """The shared cache's global epoch and when this process read it (on its own clock), read
-        again once this process's copy is `local_ttl` old."""
+    def _global(self) -> tuple[str | None, float, float]:
+        """The shared cache's global epoch, when this process read it (on its own clock), and when
+        the hold of the `invalidate()` that set it ends (on the wall clock); read again once this
+        process's copy is `local_ttl` old."""
         assert self.shared is not None
         now = self._clock()
         with self._lock:
             known, version = self._global_epoch, self._global_version
         if known is not None and now - known[0] < self.local_ttl:
-            return known[1], known[0]
+            return known[1], known[0], known[2]
         (blob,) = self.shared.get_many([self._epoch_name(None)])
-        epoch = _epoch_id(blob)
+        epoch, hold = _epoch(blob)
         with self._lock:
             if self._global_version != version and self._global_epoch is not None:
                 # invalidate() set a new epoch while this read was in flight: it wins.
-                return self._global_epoch[1], self._global_epoch[0]
-            self._global_epoch = (now, epoch)
-        return epoch, now
+                read_at, current, until = self._global_epoch
+                return current, read_at, until
+            self._global_epoch = (now, epoch, hold)
+        return epoch, now, hold
 
     def _encode(self, value: Any, expires: float, epoch: list[str | None]) -> bytes | None:
         if value is _NONE:
@@ -406,22 +466,29 @@ class CachingAuthorizer:
     def _shared_get(self, keys: list[tuple[Any, ...]], generation: int) -> tuple[list[Any], Any]:
         """Answers for these keys, all for one subject, from the shared cache (None for each miss),
         copied into this process's cache for the time they have left; and the epochs read with
-        them, under which answers learned now are written (`_UNKNOWN` if the read failed)."""
+        them, under which answers learned now are written (`_UNKNOWN` if the read failed, `_HOLD`
+        while an `invalidate()` of the subject or of everyone holds answers back)."""
         if self.shared is None or not keys:
             return [None] * len(keys), _UNKNOWN
+        if generation == _HELD:
+            return [None] * len(keys), _HOLD  # held back in this process: nothing to read or to keep
         try:
-            global_epoch, read_at = self._global()
+            global_epoch, read_at, global_hold = self._global()
             epoch: list[str | None] = [global_epoch, None]
             names = [self._name(k) for k in keys]
             blobs = self.shared.get_many([*names, self._epoch_name(keys[0][1].id)])
             if len(blobs) != len(names) + 1:
                 raise ValueError(f"{len(blobs)} values for {len(names) + 1} keys")
-            epoch[1] = _epoch_id(blobs[-1])
+            epoch[1], subject_hold = _epoch(blobs[-1])
         except Exception:
             _log.warning("wardowl shared cache read failed; asking the authorizer", exc_info=True)
             self._count("shared_failures")
             return [None] * len(keys), _UNKNOWN
         now = self._wall()
+        if now < max(global_hold, subject_hold):
+            # Another process's invalidate() holds the answers back: the authorizer may still give
+            # one from before the change, so until the hold ends answers are passed on, not kept.
+            return [None] * len(keys), _HOLD
         # An entry is accepted against this process's copy of the global epoch, which is up to
         # local_ttl old. Its copy here expires when that epoch would be read again, so an
         # invalidate() of everyone made elsewhere reaches this process within local_ttl, not twice it.
@@ -438,7 +505,7 @@ class CachingAuthorizer:
         return found, epoch
 
     def _shared_put(self, entries: Iterable[tuple[tuple[Any, ...], Any]], epoch: Any) -> None:
-        if self.shared is None or epoch is _UNKNOWN:
+        if self.shared is None or epoch is _UNKNOWN or epoch is _HOLD:
             return
         expires = self._wall() + self.ttl
         blobs = {}
@@ -462,6 +529,14 @@ class CachingAuthorizer:
         call, to a retrieval still in progress, is not cached afterwards, here or in the shared
         cache. Other processes stop using their own copies within `local_ttl` seconds. A failure
         to reach the shared cache is raised: the caller asked for the revocation now.
+
+        For `source_staleness` seconds after the call, while the authorizer may still answer from
+        before the change, its answers for the subject (for everyone, without one) are passed on
+        and cached nowhere, in this process or in any process that shares the cache. Call it once
+        the change is made at the source: then, if the authorizer is never staler than
+        `source_staleness`, no retrieval that starts in this process more than `source_staleness`
+        seconds later is given access the change took away, nor one in another process more than
+        `source_staleness` plus `local_ttl` seconds later.
         """
         if subject is not None and not isinstance(subject, (Subject, str)):
             # An id of another type (42 for "42") would miss this process's entries, keyed by the id.
@@ -475,13 +550,18 @@ class CachingAuthorizer:
         # A new epoch first, so that entries written under the old one are refused from now on;
         # then the entries themselves are deleted. Epochs lie outside "namespace:", so they stay.
         # Hex, not raw random bytes: a Redis client made with decode_responses=True must read it.
-        epoch = secrets.token_hex(16).encode()
-        lifetime = self.ttl + _EPOCH_MARGIN
+        # It carries the end of the hold, on the wall clock that shared entries' expiries use.
+        token = secrets.token_hex(16)
+        if self.source_staleness > 0:
+            token += f"/{self._wall() + self.source_staleness!r}"
+        epoch = token.encode()
+        lifetime = self.ttl + self.source_staleness + _EPOCH_MARGIN
         if subject_id is None:
             self.shared.set_many({self._epoch_name(None): epoch}, lifetime)
+            epoch_id, hold = _epoch(epoch)
             with self._lock:
                 self._global_version += 1
-                self._global_epoch = (self._clock(), _epoch_id(epoch))
+                self._global_epoch = (self._clock(), epoch_id, hold)
             self.shared.delete_prefix(f"{self.namespace}:")
         else:
             self.shared.set_many({self._epoch_name(subject_id): epoch}, lifetime)
@@ -490,9 +570,9 @@ class CachingAuthorizer:
         # first drop and before the new epoch, under the generation that drop started.
         self._drop_local(subject_id)
 
-    def _drop_local(self, subject_id: Any) -> None:
-        """Drop this process's answers for `subject_id` (all of them for None), and refuse answers
-        obtained by calls that began before now."""
+    def _drop_local(self, subject_id: str | None) -> None:
+        """Drop this process's answers for `subject_id` (all of them for None), refuse answers
+        obtained by calls that began before now, and keep none for `source_staleness` seconds."""
         with self._lock:
             self._generation += 1
             if subject_id is None:
@@ -500,6 +580,14 @@ class CachingAuthorizer:
             else:
                 for key in [k for k in self._entries if k[1].id == subject_id]:
                     del self._entries[key]
+            if self.source_staleness > 0:
+                now = self._clock()
+                until = now + self.source_staleness
+                if subject_id is None:
+                    self._hold_all = max(self._hold_all, until)
+                else:
+                    self._holds = {k: v for k, v in self._holds.items() if v > now}  # forget ended holds
+                    self._holds[subject_id] = max(self._holds.get(subject_id, until), until)
 
     # ---- Authorizer ------------------------------------------------------------------------
 
@@ -522,15 +610,15 @@ class CachingAuthorizer:
     def _remember(
         self, key: tuple[Any, ...] | None, result: Filter | None, generation: int, epoch: Any
     ) -> Filter | None:
-        if key is None or not _cacheable(result):  # a malformed answer is returned, for the retriever to refuse
-            return result
+        if key is None or epoch is _HOLD or not _cacheable(result):
+            return result  # nothing to key it by, held back, or malformed (for the retriever to refuse)
         value = _NONE if result is None else result
         self._put(key, value, generation)
         self._shared_put([(key, value)], epoch)
         return result
 
     def filter_for(self, subject: Subject, action: str = "read") -> Filter | None:
-        key, generation = self._answer_key("filter", subject, action), self._generation
+        key, generation = self._answer_key("filter", subject, action), self._start(subject)
         cached, epoch = self._lookup(key, generation)
         if cached is not None:
             return None if cached is _NONE else cached
@@ -542,7 +630,7 @@ class CachingAuthorizer:
         inner = getattr(self.authorizer, "scope_for", None)
         if inner is None:
             return None
-        key, generation = self._answer_key("scope", subject, action), self._generation
+        key, generation = self._answer_key("scope", subject, action), self._start(subject)
         cached, epoch = self._lookup(key, generation)
         if cached is not None:
             return None if cached is _NONE else cached
@@ -568,7 +656,7 @@ class CachingAuthorizer:
     async def ascope_for(self, subject: Subject, action: str = "read") -> Filter | None:
         if not hasattr(self.authorizer, "scope_for") and not hasattr(self.authorizer, "ascope_for"):
             return None
-        key, generation = self._answer_key("scope", subject, action), self._generation
+        key, generation = self._answer_key("scope", subject, action), self._start(subject)
         cached, epoch = await self._alookup(key, generation)
         if cached is not None:
             return None if cached is _NONE else cached
@@ -634,7 +722,7 @@ class CachingAuthorizer:
         return decisions, learned
 
     def check(self, subject: Subject, hits: Sequence[Hit], action: str = "read") -> list[bool]:
-        generation = self._generation
+        generation = self._start(subject)
         keys, cached = self._local(subject, hits, action)
         epoch: Any = _UNKNOWN
         positions, wanted = self._missing(keys, cached)
@@ -644,12 +732,12 @@ class CachingAuthorizer:
         todo = [h for h, known in zip(hits, cached, strict=True) if known is None]
         self._count("misses", len(todo))
         fresh = self.authorizer.check(subject, todo, action) if todo else []
-        decisions, learned = self._merge(keys, cached, fresh, generation)
+        decisions, learned = self._merge(keys, cached, fresh, _HELD if epoch is _HOLD else generation)
         self._shared_put(learned, epoch)
         return decisions
 
     async def afilter_for(self, subject: Subject, action: str = "read") -> Filter | None:
-        key, generation = self._answer_key("filter", subject, action), self._generation
+        key, generation = self._answer_key("filter", subject, action), self._start(subject)
         cached, epoch = await self._alookup(key, generation)
         if cached is not None:
             return None if cached is _NONE else cached
@@ -663,7 +751,7 @@ class CachingAuthorizer:
         return await self._aremember(key, result, generation, epoch)
 
     async def acheck(self, subject: Subject, hits: Sequence[Hit], action: str = "read") -> list[bool]:
-        generation = self._generation
+        generation = self._start(subject)
         keys, cached = self._local(subject, hits, action)
         epoch: Any = _UNKNOWN
         positions, wanted = self._missing(keys, cached)
@@ -679,8 +767,8 @@ class CachingAuthorizer:
                 fresh = await inner(subject, todo, action)
             else:
                 fresh = await asyncio.to_thread(self.authorizer.check, subject, todo, action)
-        decisions, learned = self._merge(keys, cached, fresh, generation)
-        if learned and epoch is not _UNKNOWN:
+        decisions, learned = self._merge(keys, cached, fresh, _HELD if epoch is _HOLD else generation)
+        if learned and epoch is not _UNKNOWN and epoch is not _HOLD:
             await asyncio.to_thread(self._shared_put, learned, epoch)
         return decisions
 
