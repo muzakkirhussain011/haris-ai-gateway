@@ -6,6 +6,84 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `ChromaBackend(fallback_candidates=...)`, how many chunks a search reads when its filter is too
+  large to send to Chroma whole (1,000 by default), and `wardowl.backends.chroma.FilterTooLarge`,
+  the `ValueError` that `filter_to_where` raises for such a filter. See Fixed.
+
+### Changed
+
+- `RetrievalResult.complete` is no longer True for a short or empty result from an approximate
+  search. A pre-filtered result with fewer hits than were asked for, an empty one included, is
+  complete only when the backend declares exact search; so is post-filtering that runs out of
+  candidates inside a scope. The acceptance run on Kaggle found pgvector returning no rows at all
+  to least-privileged users who could read several hundred chunks, because its iterative index
+  scan stopped at `hnsw.max_scan_tuples` or at its memory limit, and wardowl reported those empty
+  results as complete. That contradicted the field's documented meaning, "False when wardowl knows
+  results may be missing"; this corrects it. Users who may read fewer than k chunks now get
+  `complete=False` on approximate stores, which cannot tell them apart from an index that stopped
+  early. Nothing else changes: the same searches run, the same hits come back, and the safety
+  guarantees are unchanged. Post-filtering without a filter still reads a short candidate list as
+  the end of the store.
+- Backends can declare `exact_search = True` when `search` ranks every chunk that matches the
+  filter, so a result with fewer than k hits proves nothing else matches. It is optional and read
+  with `getattr`, not a required member of the `SearchBackend` protocol, so existing backends still
+  satisfy it. `InMemoryBackend` declares it, and `FaissBackend` does when its index is flat (the
+  default) or an ID map around a flat index. `RankFusion` does not, even over exact backends: it
+  leaves out chunks whose metadata differs between backends after each has filled its list, so a
+  short fused list proves nothing. Every other built-in backend searches approximately and does
+  not declare it. A subclass of `InMemoryBackend` that drops hits on purpose should set
+  `exact_search = False`.
+- `check_backend` checks a backend that declares `exact_search` as exact, whatever `exact=` says,
+  since the retriever takes its short results as proof that nothing else matches.
+
+### Security
+
+- `ChromaBackend` no longer sends Chroma a filter that can crash the application. With chromadb
+  1.5.9's embedded client, the first search by a subject in 40,000 groups ended the Python process
+  with a segmentation fault, without an exception or a message, in 5 of 5 processes (the filter-size
+  experiment for the paper). Anyone whose filter grows that large, through groups that users can
+  create and join themselves or an authorizer that lists that many values, could stop the
+  application for every user with one search. The cause inside Chroma is not established, and the
+  smallest filter that crashes was not measured (10,000 groups gave an error instead); a Chroma
+  server on a single node runs the same code. wardowl now sends a `where` only within bounds well
+  below anything Chroma refused or crashed on: 10,000 SQL parameters, an expression 250 deep, 32
+  levels of `$and` and `$or`, and 500,000 characters. Larger filters are applied by the backend
+  itself (see Fixed).
+
+### Fixed
+
+- `ChromaBackend` answers subjects in 1,000 groups or more. Chroma 1.5 writes each `$or` as one
+  binary OR per clause, and SQLite refuses an expression more than 1,000 deep, so the flat `$or`
+  wardowl sent made every search by such a subject fail with
+  `Expression tree is too large (maximum depth 1000)`. The conformance campaign and the filter-size
+  experiment for the paper both found it at 1,000 values. Each `$and` and `$or` now holds at most
+  16 clauses, nested as a balanced tree, which Chroma keeps nested: about 50 levels deep for 1,000
+  groups instead of 1,000. A filter beyond the bounds under Security (with `MetadataACLAuthorizer`,
+  a subject in more than about 3,200 groups with short names) is no longer sent whole: the search
+  sends the part of it every match must meet, such as a tenant, if that fits, or no `where`; reads
+  `fallback_candidates` chunks (1,000, or `k` if more); and applies the filter to them itself. It
+  never returns a chunk the filter excludes, but can return fewer than `k` hits though more chunks
+  match, which the retriever reports as `complete=False`. `filter_to_where` returns the nested form
+  and raises `FilterTooLarge` beyond the bounds. CI searches real Chroma for subjects in 1,001 and
+  in 40,000 groups, and checks that Chroma reads nested trees exactly as the reference semantics.
+
+### Documentation
+
+- A 47-second film on the documentation's front page, linked from the README: what wardowl does,
+  shown with an AI assistant that many companies share.
+- Corrected what the documentation said about filtered approximate search. Concepts said that
+  pgvector's iterative index scans keep a selective filter from cutting results short; they stop
+  at `hnsw.max_scan_tuples` (20,000 by default) or at `work_mem` × `hnsw.scan_mem_multiplier` of
+  memory (4 MB by default), so a selective filter can still return fewer than k rows, or none. The
+  pgvector page names both limits and how to raise them. The Qdrant page explains why filters on
+  common values, such as a tenant shared by most points or a shared corpus readable by everyone,
+  can lose recall in Qdrant's filtered HNSW search, and what helps: ACORN with `max_selectivity`,
+  per-tenant graphs (`is_tenant` with `m=0` and `payload_m`), and exact search. Concepts, the
+  security model, the threat model, operations, production, hybrid search and the store pages
+  describe `complete` as it now behaves.
+
 ## [2.1.0] - 2026-10-24
 
 Fixes found by real-world acceptance scenarios, run against real servers, a real identity provider
