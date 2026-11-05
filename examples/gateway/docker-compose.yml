@@ -21,7 +21,7 @@ services:
       retries: 20
 
   opa:
-    image: openpolicyagent/opa:1.21.2-static@sha256:0843d2adce51655422e8b95a803629ab9f424803c4bd27876e7f44cce9a2b84d
+    image: openpolicyagent/opa:1.22.0-static@sha256:906bfc9904b2693733e7959d71773dd073e6c135cf06f26d955abe94603e82b3
     command: ["run", "--server", "--addr=0.0.0.0:8181", "--log-level=error", "--ignore=*_test.rego", "/policies"]
     volumes: ["./policies:/policies:ro"]
 
