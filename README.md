@@ -17,6 +17,7 @@
   <a href="https://muzakkirhussain011.github.io/wardowl/"><img src="https://github.com/muzakkirhussain011/wardowl/actions/workflows/docs.yml/badge.svg?branch=main&amp;event=push" alt="Docs"></a>
   <a href="https://scorecard.dev/viewer/?uri=github.com/muzakkirhussain011/wardowl"><img src="https://api.securityscorecards.dev/projects/github.com/muzakkirhussain011/wardowl/badge" alt="OpenSSF Scorecard"></a>
   <a href="https://www.bestpractices.dev/projects/15794"><img src="https://www.bestpractices.dev/projects/15794/badge" alt="OpenSSF Best Practices"></a>
+  <a href="https://m8ven.ai/mcp/muzakkirhussain011-wardowl-qghhm7?s=readme"><img src="https://m8ven.ai/badge/mcp/muzakkirhussain011-wardowl-qghhm7?v=f700df08896162db4fdaedf860320b27&amp;variant=verified" alt="M8ven verified MCP server"></a>
   <a href="https://github.com/muzakkirhussain011/wardowl/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
 </p>
 
