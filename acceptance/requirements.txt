@@ -373,6 +373,7 @@ certifi==2026.10.23 \
     #   httpcore
     #   httpx
     #   kubernetes
+    #   langchain-core
     #   opensearch-py
     #   requests
     #   weaviate-client
@@ -1531,9 +1532,9 @@ lancedb==0.40.0 \
     --hash=sha256:aaea68920b88e3d0b84a9ec84bc1585ad04239b9ca1bfcd1e491c2c12bffddc2 \
     --hash=sha256:e967577fe42980217e43f9b6ecbe042c5ae314370a34b88f1c54e825f96b26f0
     # via wardowl
-langchain-core==1.7.0 \
-    --hash=sha256:c34e53358b103cd73f43c63f5f46f9b5c6c3467efdffcdf134892b89020494e4 \
-    --hash=sha256:e82b24d7ac51fc74874baa29d6b3c0b8234880d4f3d897f8ff57fb80dfd9b07d
+langchain-core==1.7.3 \
+    --hash=sha256:460c214bf31495d7b7e0a879e408dbfda677fd53fd879da786c1b966a4f6bff6 \
+    --hash=sha256:77f70b81e238c981bfd8405840b03fdf143735ac93c0729c2bdb39d6f0648024
     # via wardowl
 langchain-protocol==0.0.20 \
     --hash=sha256:0f5bd002474265648e91161771a9e0438fe9480bd55a416e51af0f60070637ec \
