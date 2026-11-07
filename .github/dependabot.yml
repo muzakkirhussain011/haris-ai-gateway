@@ -1,20 +1,30 @@
 version: 2
 # Version updates wait a week after a release, so a broken or malicious release is usually
 # caught and pulled before it reaches the lock. Security updates are never delayed.
+# Minor and patch updates come as one pull request per entry and week: separate pull requests that
+# each rewrite the same lock file conflict as soon as one is merged. Major updates stay separate.
 updates:
   # pyproject.toml and uv.lock, from which CI and the release install everything by hash.
   - package-ecosystem: uv
     directory: /
     schedule: { interval: weekly }
     cooldown: { default-days: 7 }
+    groups:
+      library: { patterns: ["*"], update-types: [minor, patch] }
   - package-ecosystem: uv
     directory: /examples/gateway
     schedule: { interval: weekly }
     cooldown: { default-days: 7 }
+    groups:
+      gateway: { patterns: ["*"], update-types: [minor, patch] }
+  # CodeQL's init and analyze must move together: bumped in separate pull requests (170, 171), each
+  # failed the analysis.
   - package-ecosystem: github-actions
     directory: /
     schedule: { interval: weekly }
     cooldown: { default-days: 7 }
+    groups:
+      actions: { patterns: ["*"], update-types: [minor, patch] }
   - package-ecosystem: docker
     directory: /examples/gateway
     schedule: { interval: weekly }
@@ -24,6 +34,8 @@ updates:
     directory: /examples/gateway
     schedule: { interval: weekly }
     cooldown: { default-days: 7 }
+    groups:
+      gateway-images: { patterns: ["*"], update-types: [minor, patch] }
   - package-ecosystem: docker
     directory: /.clusterfuzzlite
     schedule: { interval: weekly }
@@ -33,3 +45,5 @@ updates:
     directory: /.github/requirements
     schedule: { interval: weekly }
     cooldown: { default-days: 7 }
+    groups:
+      build-tools: { patterns: ["*"], update-types: [minor, patch] }
