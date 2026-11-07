@@ -373,6 +373,7 @@ certifi==2026.10.23 \
     #   httpcore
     #   httpx
     #   kubernetes
+    #   langchain-core
     #   opensearch-py
     #   requests
     #   weaviate-client
@@ -1525,15 +1526,16 @@ lance-namespace-urllib3-client==0.13.0 \
     --hash=sha256:1e8a79c6e4e6277033597fd76aa0e2f33d909ca1436c935936e9e569221f43ef \
     --hash=sha256:fb361eb4f6c7f2d1f9e92809609657b73e38241393e9c4516e12d6b6ee643a0a
     # via lance-namespace
-lancedb==0.40.0 \
-    --hash=sha256:10e6fbacc9a9be5698c8e635f150ef4346e428db71d15b31bc1b79aec2a382ff \
-    --hash=sha256:aac9e08a710ba2071a8aefc4b4ef7d8534f5f7e4e4ce1761f11469d97c36f1e2 \
-    --hash=sha256:aaea68920b88e3d0b84a9ec84bc1585ad04239b9ca1bfcd1e491c2c12bffddc2 \
-    --hash=sha256:e967577fe42980217e43f9b6ecbe042c5ae314370a34b88f1c54e825f96b26f0
+lancedb==0.41.0 \
+    --hash=sha256:984d97c50169face1539ccaa802a2002ebc7b50a445c3e7e8cd24513569c1aab \
+    --hash=sha256:b8892ff52eb32224c0414feb6f57357c4b79edeed0c2a4afe6d7f6f538dc12d0 \
+    --hash=sha256:c00ba59f0f880c2581566851a6018c00ef5c49be56ac4484c600e5129135f059 \
+    --hash=sha256:ca0b0418eaaa5c2aa8e9ff1e98a475b14d4517af3b9face22300213871bd1ebc \
+    --hash=sha256:e3da8fbde2c916d41fc324a91a25b3f57a7b8ac5eb2981d5fb8fd0914901c44e
     # via wardowl
-langchain-core==1.7.0 \
-    --hash=sha256:c34e53358b103cd73f43c63f5f46f9b5c6c3467efdffcdf134892b89020494e4 \
-    --hash=sha256:e82b24d7ac51fc74874baa29d6b3c0b8234880d4f3d897f8ff57fb80dfd9b07d
+langchain-core==1.7.3 \
+    --hash=sha256:460c214bf31495d7b7e0a879e408dbfda677fd53fd879da786c1b966a4f6bff6 \
+    --hash=sha256:77f70b81e238c981bfd8405840b03fdf143735ac93c0729c2bdb39d6f0648024
     # via wardowl
 langchain-protocol==0.0.20 \
     --hash=sha256:0f5bd002474265648e91161771a9e0438fe9480bd55a416e51af0f60070637ec \
@@ -2201,9 +2203,9 @@ opensearch-py==3.2.0 \
     # via
     #   -r acceptance/requirements.in
     #   wardowl
-opentelemetry-api==1.45.1 \
-    --hash=sha256:aa38ed19bcc084ba42782a73255b3582283eced7ad6dddbd6695189e69adfb75 \
-    --hash=sha256:b31553efa588ae44bc306f863c785c5333a9ecc091248c6ee68b4b6c87fdedfb
+opentelemetry-api==1.45.2 \
+    --hash=sha256:2cbd737377e710ee740d261c94e93fa0f08e6d037c18f17513cc0a2d94479a34 \
+    --hash=sha256:d7b0008e21e5fd61cbe7a7f34ca3b6905a78ab677d9bc395e299359c75cda6b4
     # via
     #   chromadb
     #   fastapi
@@ -2230,17 +2232,17 @@ opentelemetry-proto==1.45.1 \
     # via
     #   opentelemetry-exporter-otlp-proto-common
     #   opentelemetry-exporter-otlp-proto-grpc
-opentelemetry-sdk==1.45.1 \
-    --hash=sha256:63d24a6ca645019a631e6a51999c73e93adcac1196ca640b8ae78a7cc4762bf3 \
-    --hash=sha256:c604c11dc429810812348989115fa44bd558772a3d7442afc43d024f2c250ca4
+opentelemetry-sdk==1.45.2 \
+    --hash=sha256:7eec4de13dd21ff3a1670dcb0e02079e692736f94d733dfdce5af461d884248d \
+    --hash=sha256:ff974ea70ee4f1d51e2ec152db37c2b626c7bf82bb3f7d86114fd8704e7199c6
     # via
     #   -r acceptance/requirements.in
     #   chromadb
     #   opentelemetry-exporter-otlp-common
     #   opentelemetry-exporter-otlp-proto-grpc
-opentelemetry-semantic-conventions==0.66b1 \
-    --hash=sha256:497ca63bf383723411e8eaf60c8779e9877633c936bb641080adab59d0eb6ec8 \
-    --hash=sha256:d4cddeb4315490b35213f55e2bdc9ac54bb1e4d318927475bed62b35545e581b
+opentelemetry-semantic-conventions==0.66b2 \
+    --hash=sha256:4cbe61e5f9275d57ab31708446e7938ef4291ebbe6a7fca6f7a629c5acae87d8 \
+    --hash=sha256:7da5f1a5dc4383eb66711d4d3d3e71824d9403ac1559fea021cc103c1a4c4976
     # via opentelemetry-sdk
 orjson==3.13.0 \
     --hash=sha256:0526a3456db67b264c6d661b5f090077f326b6cd074d0ef53a72763595dec5d7 \
@@ -4279,8 +4281,8 @@ watchfiles==1.3.0 \
     --hash=sha256:ec3cd4bb181a7b6329134204c2277c7144ab5f62cce9c5335d6f901ee7ce8d6a \
     --hash=sha256:f0c9865240e065a2247f4b5248528ae3d01e0e8ae071462c250c884dc16e3ee3
     # via uvicorn
-weaviate-client==4.24.0 \
-    --hash=sha256:4427c055b5366f176ed6e5438cfa70da797f80d7b4a52ff3f73867d47b0ea400
+weaviate-client==4.24.1 \
+    --hash=sha256:787df83277dd6afaf852770d07deb97eec603e900c670777e173a0474e1f4f40
     # via wardowl
 websocket-client==1.9.2 \
     --hash=sha256:0fcb57545848be86992e128218fd96dd87a6769ffdb1a968dff79632b85604d0 \
