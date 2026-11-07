@@ -31,6 +31,46 @@
   <a href="https://github.com/muzakkirhussain011/wardowl/blob/main/CHANGELOG.md">Changelog</a>
 </p>
 
+A RAG answer can quote a chunk that the person asking is not allowed to read, because vector search
+ranks chunks by similarity, not by permission. **wardowl stops that:** it applies your permission
+system inside the vector store's search, checks every hit again and fails closed.
+
+```bash
+pip install wardowl
+```
+
+```python
+from wardowl import Document, InMemoryBackend, MetadataACLAuthorizer, PermissionedRetriever, Subject
+
+backend = InMemoryBackend(
+    [
+        Document("handbook", "Annual leave is 25 days.", {"allowed_groups": ["*"]}),
+        Document("salaries", "Salary bands for 2026 ...", {"allowed_groups": ["hr"]}),
+        Document("runbook", "Roll back a failed deploy ...", {"allowed_groups": ["engineering"]}),
+    ]
+)
+retriever = PermissionedRetriever(backend, MetadataACLAuthorizer())
+
+result = retriever.retrieve("leave salary bands", Subject("bob", groups=["engineering"]), k=3)
+print([hit.id for hit in result.hits])  # ['handbook']
+print(result.strategy, result.complete)  # prefilter True
+```
+
+`salaries` matches the query best, but Bob is not in `hr`, so wardowl never returns it. In
+production, `backend` is your vector store and `MetadataACLAuthorizer()` your permission system:
+pgvector, Qdrant, Milvus, OpenFGA, SpiceDB, OPA, Cerbos and
+[more](https://muzakkirhussain011.github.io/wardowl/integrations/index.html). `aretrieve` is the
+async equivalent, with the same arguments and guarantees.
+
+**Measured** on 57,600 real chunks (BEIR FiQA, run of 2026-10-16,
+[full results](https://github.com/muzakkirhussain011/wardowl/blob/main/benchmarks/results/fiqa-qwen3-embedding-0.6b.md)):
+
+- **No forbidden chunk** in 21,000 retrievals through wardowl, on pgvector, Chroma and brute-force
+  search.
+- **Recall kept where filtering afterwards fails:** for users who may read 0.9% of the corpus, far
+  from what they ask about, taking the top 10 and then filtering found none of the true top 10
+  (recall@10 0.000); wardowl's pre-filter on pgvector found 99.5% of them (0.995).
+
 <p align="center">
   <a href="https://muzakkirhussain011.github.io/wardowl/#see-it-in-47-seconds"><img src="https://raw.githubusercontent.com/muzakkirhussain011/wardowl/main/docs/_static/brand/wardowl-film-thumbnail.webp" alt="Watch the 47-second wardowl film: your information stays yours" width="720"></a>
 </p>
@@ -41,14 +81,6 @@ Cedar, access lists or your own rules) inside your vector store's search (pgvect
 Qdrant, Elasticsearch, Milvus and more), checks every hit again and fails closed, so each user's
 LLM prompt holds only the documents that user is allowed to read. It was called needtoknow before
 version 2.0.
-
-```python
-from wardowl import PermissionedRetriever, MetadataACLAuthorizer, Subject
-
-retriever = PermissionedRetriever(backend, MetadataACLAuthorizer())
-result = retriever.retrieve("What are this year's salary bands?", Subject("bob", groups=["engineering"]), k=5)
-# result.hits holds only chunks Bob may read. HR documents never reach the prompt.
-```
 
 ## Why
 
@@ -77,28 +109,9 @@ pip install wardowl
 ```
 
 Python 3.11 or newer: every Python version CPython still supports, each dropped in the first minor
-release after its end of life. Adapters for external systems install as optional extras.
-
-## Quickstart
-
-```python
-from wardowl import Document, InMemoryBackend, MetadataACLAuthorizer, PermissionedRetriever, Subject
-
-backend = InMemoryBackend(
-    [
-        Document("handbook", "Annual leave is 25 days.", {"allowed_groups": ["*"]}),
-        Document("salaries", "Salary bands for 2026 ...", {"allowed_groups": ["hr"]}),
-        Document("runbook", "Roll back a failed deploy ...", {"allowed_groups": ["engineering"]}),
-    ]
-)
-retriever = PermissionedRetriever(backend, MetadataACLAuthorizer())
-
-result = retriever.retrieve("leave salary bands", Subject("bob", groups=["engineering"]), k=3)
-print([hit.id for hit in result.hits])  # ['handbook']
-print(result.strategy, result.complete)  # prefilter True
-```
-
-`aretrieve` is the async equivalent, with the same arguments and guarantees.
+release after its end of life. Adapters for external systems install as optional extras. [Getting
+started](https://muzakkirhussain011.github.io/wardowl/quickstart.html) goes from a first
+permissioned search to a real vector store.
 
 ## How it works
 

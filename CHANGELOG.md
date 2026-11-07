@@ -195,6 +195,10 @@ All notable changes are recorded here. The format follows
 
 - A 47-second film on the documentation's front page, linked from the README: what wardowl does,
   shown with an AI assistant that many companies share.
+- The README opens with the problem, the runnable quickstart (which a new test runs, checking that
+  it prints what its comments say) and two results from the FiQA benchmark, linked to the results
+  file. The package metadata, shown on PyPI from the next release, adds keywords for more stores
+  and permission systems and the `Framework :: AsyncIO` and `Framework :: FastAPI` classifiers.
 - Corrected what the documentation said about filtered approximate search. Concepts said that
   pgvector's iterative index scans keep a selective filter from cutting results short; they stop
   at `hnsw.max_scan_tuples` (20,000 by default) or at `work_mem` × `hnsw.scan_mem_multiplier` of
