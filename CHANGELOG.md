@@ -72,6 +72,9 @@ All notable changes are recorded here. The format follows
 
 ### Changed
 
+- The MCP server's search tool now sets all four MCP tool hints explicitly: besides read-only and
+  closed world, not destructive and idempotent, so a host does not have to assume a default for any
+  of them.
 - `RetrievalResult.complete` is no longer True for a short or empty result from an approximate
   search. A pre-filtered result with fewer hits than were asked for, an empty one included, is
   complete only when the backend declares exact search; so is post-filtering that runs out of

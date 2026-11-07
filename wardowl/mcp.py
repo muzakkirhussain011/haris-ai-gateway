@@ -143,5 +143,8 @@ def add_search_tool(
     server.tool(
         name=name,
         description=description,
-        annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
+        # All four hints set explicitly, so a host never falls back to a default for any of them.
+        annotations=ToolAnnotations(
+            read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False
+        ),
     )(search)
