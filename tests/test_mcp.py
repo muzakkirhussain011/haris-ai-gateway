@@ -97,6 +97,7 @@ def test_the_model_cannot_choose_whose_permissions_apply():
 def test_the_tool_is_read_only_and_bounds_the_limit():
     (tool,) = asyncio.run(make_server(limit=3, max_limit=10).list_tools())
     assert tool.annotations.read_only_hint is True and tool.annotations.open_world_hint is False
+    assert tool.annotations.destructive_hint is False and tool.annotations.idempotent_hint is True
     limit = tool.input_schema["properties"]["limit"]
     assert limit["default"] == 3 and limit["maximum"] == 10 and limit["minimum"] == 1
     assert tool.output_schema is not None
