@@ -33,7 +33,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8.2", "hypothesis>=6.100", "ruff==0.17.1", "mypy==2.4.0", "pytest-cov==7.1.0"]
+dev = ["pytest>=8.2", "hypothesis>=6.100", "ruff==0.17.2", "mypy==2.4.0", "pytest-cov==7.1.0"]
 pgvector = ["psycopg[binary,pool]>=3.2"]
 chroma = ["chromadb>=1.5"]
 elasticsearch = ["elasticsearch>=8.12"]
