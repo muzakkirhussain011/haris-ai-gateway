@@ -6,37 +6,12 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
-### Added
+## [2.1.1] - 2026-11-08
 
-- `ChromaBackend(fallback_candidates=...)`, how many chunks a search reads when its filter is too
-  large to send to Chroma whole (1,000 by default), and `wardowl.backends.chroma.FilterTooLarge`,
-  the `ValueError` that `filter_to_where` raises for such a filter. See Fixed.
-
-### Changed
-
-- `RetrievalResult.complete` is no longer True for a short or empty result from an approximate
-  search. A pre-filtered result with fewer hits than were asked for, an empty one included, is
-  complete only when the backend declares exact search; so is post-filtering that runs out of
-  candidates inside a scope. The acceptance run on Kaggle found pgvector returning no rows at all
-  to least-privileged users who could read several hundred chunks, because its iterative index
-  scan stopped at `hnsw.max_scan_tuples` or at its memory limit, and wardowl reported those empty
-  results as complete. That contradicted the field's documented meaning, "False when wardowl knows
-  results may be missing"; this corrects it. Users who may read fewer than k chunks now get
-  `complete=False` on approximate stores, which cannot tell them apart from an index that stopped
-  early. Nothing else changes: the same searches run, the same hits come back, and the safety
-  guarantees are unchanged. Post-filtering without a filter still reads a short candidate list as
-  the end of the store.
-- Backends can declare `exact_search = True` when `search` ranks every chunk that matches the
-  filter, so a result with fewer than k hits proves nothing else matches. It is optional and read
-  with `getattr`, not a required member of the `SearchBackend` protocol, so existing backends still
-  satisfy it. `InMemoryBackend` declares it, and `FaissBackend` does when its index is flat (the
-  default) or an ID map around a flat index. `RankFusion` does not, even over exact backends: it
-  leaves out chunks whose metadata differs between backends after each has filled its list, so a
-  short fused list proves nothing. Every other built-in backend searches approximately and does
-  not declare it. A subclass of `InMemoryBackend` that drops hits on purpose should set
-  `exact_search = False`.
-- `check_backend` checks a backend that declares `exact_search` as exact, whatever `exact=` says,
-  since the retriever takes its short results as proof that nothing else matches.
+A security release for 2.1. It carries two fixes from the main branch and nothing else: Chroma no
+longer receives a filter that can crash the process, and `CachingAuthorizer.invalidate()` no longer
+lets a permission service that is itself behind refill the cache with a decision from before the
+change. Upgrade if you use `ChromaBackend`, or `CachingAuthorizer` with `invalidate()`.
 
 ### Security
 
@@ -51,6 +26,35 @@ All notable changes are recorded here. The format follows
   below anything Chroma refused or crashed on: 10,000 SQL parameters, an expression 250 deep, 32
   levels of `$and` and `$or`, and 500,000 characters. Larger filters are applied by the backend
   itself (see Fixed).
+- `CachingAuthorizer.invalidate()` no longer lets a permission service that is itself behind refill
+  the cache with a decision from before the change. After `invalidate()`, the next retrieval asked
+  the service, which could still answer from a stale snapshot (SpiceDB under `minimizeLatency`,
+  Cerbos before reloading a policy), and the cache kept that answer for its whole `ttl`. In the
+  paper's experiment X7, all 40 SpiceDB revocations with `invalidate()` took the full 30-second
+  `ttl` (a median 30.04 s, against a stated 5.5 s), 39 of 40 on a second replica, and Cerbos's took
+  as long. Now, for `source_staleness` seconds after `invalidate()`, answers for the subject (or
+  for everyone) are passed on and cached nowhere: not in the process, and not in the shared cache,
+  whose epoch carries the end of the hold so that every replica holds back too. The bound after
+  `invalidate()` is the service's own staleness when `source_staleness` covers it, plus `local_ttl`
+  on other replicas. With `source_staleness` 0, the default for every authorizer but
+  `SpiceDBAuthorizer` without `fullyConsistent`, nothing changes. Replicas of earlier versions
+  sharing the cache during an upgrade do not see the hold.
+
+### Added
+
+- `ChromaBackend(fallback_candidates=...)`, how many chunks a search reads when its filter is too
+  large to send to Chroma whole (1,000 by default), and `wardowl.backends.chroma.FilterTooLarge`,
+  the `ValueError` that `filter_to_where` raises for such a filter. See Fixed.
+- `CachingAuthorizer(source_staleness=...)`: how many seconds old the data behind the wrapped
+  authorizer's answers can be. By default it is the authorizer's `max_staleness`, an optional
+  attribute an authorizer declares when it can answer from stale data, or 0 when it declares none.
+  `SpiceDBAuthorizer.max_staleness` follows its consistency (11 seconds, twice the bound SpiceDB
+  documents for its default settings, or 0 with `fullyConsistent`; `max_staleness=` sets it),
+  `AllOf` and `AnyOf` declare the largest of their parts', and `CachingAuthorizer.max_staleness` is
+  its `ttl` plus `source_staleness`, for a cache that wraps another. See Security.
+
+These are new, optional parameters and attributes, added in a patch release because the security
+fixes need them; nothing existing changes for code that does not use them.
 
 ### Fixed
 
@@ -65,24 +69,10 @@ All notable changes are recorded here. The format follows
   sends the part of it every match must meet, such as a tenant, if that fits, or no `where`; reads
   `fallback_candidates` chunks (1,000, or `k` if more); and applies the filter to them itself. It
   never returns a chunk the filter excludes, but can return fewer than `k` hits though more chunks
-  match, which the retriever reports as `complete=False`. `filter_to_where` returns the nested form
-  and raises `FilterTooLarge` beyond the bounds. CI searches real Chroma for subjects in 1,001 and
-  in 40,000 groups, and checks that Chroma reads nested trees exactly as the reference semantics.
-
-### Documentation
-
-- A 47-second film on the documentation's front page, linked from the README: what wardowl does,
-  shown with an AI assistant that many companies share.
-- Corrected what the documentation said about filtered approximate search. Concepts said that
-  pgvector's iterative index scans keep a selective filter from cutting results short; they stop
-  at `hnsw.max_scan_tuples` (20,000 by default) or at `work_mem` × `hnsw.scan_mem_multiplier` of
-  memory (4 MB by default), so a selective filter can still return fewer than k rows, or none. The
-  pgvector page names both limits and how to raise them. The Qdrant page explains why filters on
-  common values, such as a tenant shared by most points or a shared corpus readable by everyone,
-  can lose recall in Qdrant's filtered HNSW search, and what helps: ACORN with `max_selectivity`,
-  per-tenant graphs (`is_tenant` with `m=0` and `payload_m`), and exact search. Concepts, the
-  security model, the threat model, operations, production, hybrid search and the store pages
-  describe `complete` as it now behaves.
+  match. In 2.1, `RetrievalResult.complete` does not flag such a short pre-filtered result; raise
+  `fallback_candidates` if such subjects need more. `filter_to_where` returns the nested form and
+  raises `FilterTooLarge` beyond the bounds. CI searches real Chroma for subjects in 1,001 and in
+  40,000 groups, and checks that Chroma reads nested trees exactly as the reference semantics.
 
 ## [2.1.0] - 2026-10-24
 
@@ -1308,7 +1298,8 @@ needed, in which case it will be announced in a second release candidate. Instal
 - The project is now `wardowl`, a permission-aware retrieval library (ADR 0005). The earlier
   Rampart gateway lives on as an example deployment in `examples/gateway`.
 
-[Unreleased]: https://github.com/muzakkirhussain011/wardowl/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/muzakkirhussain011/wardowl/compare/v2.1.1...HEAD
+[2.1.1]: https://github.com/muzakkirhussain011/wardowl/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/muzakkirhussain011/wardowl/compare/v2.0.1...v2.1.0
 [2.0.1]: https://github.com/muzakkirhussain011/wardowl/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/muzakkirhussain011/wardowl/compare/v1.6.0...v2.0.0

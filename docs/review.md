@@ -161,6 +161,8 @@ published as advisory
 | October 2026 | KetoAuthorizer's default batch of 100 exceeded Keto's default limit of 10, so retrievals of more than 10 chunks failed | 2.1.0 |
 | October 2026 | A chunk shortened after its redaction spans were written made every retrieval that reached it fail | 2.1.0 |
 | October 2026 | Chroma refused one large write, so loading a big corpus failed | 2.1.0 |
+| October 2026 | Chroma refused every search by a subject in about 1,000 groups, and the first search by a subject in 40,000 groups ended the Python process | 2.1.1 |
+| October 2026 | After `invalidate()`, a permission service still answering from a stale snapshot refilled the cache for its whole `ttl` | 2.1.1 |
 
 ## Reporting
 
