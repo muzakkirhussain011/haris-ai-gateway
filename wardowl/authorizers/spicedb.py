@@ -33,9 +33,15 @@ raises `AuthorizationError`. Connections are reused, transient failures are retr
 `CircuitBreaker` can pause requests to a failing server; see `wardowl.authorizers`.
 
 Consistency: the default, `{"minimizeLatency": true}`, lets SpiceDB answer from a recent snapshot,
-so a revoked permission can keep granting access for up to the datastore's revision quantization
-interval (5 seconds by default). Pass `consistency={"fullyConsistent": True}`, or
-`{"atLeastAsFresh": {"token": zedtoken}}` after a write, for fresher answers.
+so a revoked permission can keep granting access for a while. SpiceDB documents the bound as its
+revision quantization interval plus a share of it (`--datastore-revision-quantization-interval`,
+5 s, and `--datastore-revision-quantization-max-staleness-percent`, 10%: 5.5 s by default), plus
+the follower read delay when it reads from replicas. Measured against SpiceDB 1.56 on Postgres with
+the defaults, it reached 8.7 s, and successive answers moved backwards: a revoked permission granted
+access again after it had stopped. `max_staleness` declares twice the documented bound, 11 s, which
+`CachingAuthorizer` reads; pass `max_staleness=` for a server with other settings. Pass
+`consistency={"fullyConsistent": True}` (`max_staleness` 0), or `{"atLeastAsFresh": {"token":
+zedtoken}}` with the token of the change, for answers that include it.
 """
 
 from __future__ import annotations
@@ -46,11 +52,18 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from wardowl.authorizers._http import DEFAULT_MAX_RESPONSE_BYTES, CircuitBreaker, JsonClient
-from wardowl.authz import AuthorizationError
+from wardowl.authz import AuthorizationError, _staleness
 from wardowl.filters import Filter, In
 from wardowl.types import Hit, Subject
 
 __all__ = ["SpiceDBAuthorizer"]
+
+# How stale a read that is not fullyConsistent can be, with `spicedb serve`'s defaults. SpiceDB
+# rounds the revision such a read uses down to --datastore-revision-quantization-interval (5 s), and
+# may pick one older still by --datastore-revision-quantization-max-staleness-percent of it (0.1):
+# 5.5 s in all (https://authzed.com/docs/spicedb/concepts/commands). SpiceDB 1.56.2 on Postgres was
+# measured up to 8.7 s stale with those defaults, so twice that bound is declared: 2 x 5 x 1.1 s.
+_DEFAULT_STALENESS = 11.0
 
 _HAS = "PERMISSIONSHIP_HAS_PERMISSION"
 _NO = "PERMISSIONSHIP_NO_PERMISSION"
@@ -77,6 +90,12 @@ class SpiceDBAuthorizer:
     `retries`, `circuit_breaker`, `ssl_context`, `max_response_bytes` and `allow_insecure` work as
     in `OPAAuthorizer`: a `token` sent over http:// to a host other than this machine needs
     `allow_insecure=True`. Every failure raises `AuthorizationError`.
+
+    `max_staleness` is how many seconds old SpiceDB's answers can be: 0 with
+    `{"fullyConsistent": True}`, and otherwise 11 by default, twice the bound SpiceDB documents for
+    its default quantization settings (see the module docstring). Pass it for a server with other
+    settings, or 0 if you send `atLeastAsFresh` with the token of every change you report with
+    `CachingAuthorizer.invalidate()`.
     """
 
     def __init__(
@@ -92,6 +111,7 @@ class SpiceDBAuthorizer:
         group_relation: str = "member",
         group_subjects: bool = False,
         consistency: Mapping[str, Any] | None = None,
+        max_staleness: float | None = None,
         caveat_context: Callable[[Subject], Mapping[str, Any]] | None = None,
         lookup_limit: int = 1000,
         batch_size: int = 100,
@@ -125,9 +145,18 @@ class SpiceDBAuthorizer:
         self.group_relation = group_relation
         self.group_subjects = group_subjects
         self.consistency = dict(consistency or {"minimizeLatency": True})
+        self._max_staleness = None if max_staleness is None else _staleness(max_staleness)
         self.caveat_context = caveat_context
         self.lookup_limit = lookup_limit
         self.batch_size = batch_size
+
+    @property
+    def max_staleness(self) -> float:
+        """How many seconds old SpiceDB's answers can be: as passed, or 0 for `fullyConsistent`
+        and 11 for any other consistency, which may answer from a quantized revision."""
+        if self._max_staleness is not None:
+            return self._max_staleness
+        return 0.0 if self.consistency.get("fullyConsistent") is True else _DEFAULT_STALENESS
 
     # ---- helpers ---------------------------------------------------------------------------
 
