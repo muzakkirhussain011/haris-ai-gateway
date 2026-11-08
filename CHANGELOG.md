@@ -6,37 +6,20 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
-### Added
+## [2.0.2] - 2026-11-08
 
-- `ChromaBackend(fallback_candidates=...)`, how many chunks a search reads when its filter is too
-  large to send to Chroma whole (1,000 by default), and `wardowl.backends.chroma.FilterTooLarge`,
-  the `ValueError` that `filter_to_where` raises for such a filter. See Fixed.
+A security release for 2.0. It carries two fixes from the main branch and nothing else: Chroma no
+longer receives a filter that can crash the process, and `CachingAuthorizer.invalidate()` no longer
+lets a permission service that is itself behind refill the cache with a decision from before the
+change. Upgrade if you use `ChromaBackend`, or `CachingAuthorizer` with `invalidate()`.
 
-### Changed
-
-- `RetrievalResult.complete` is no longer True for a short or empty result from an approximate
-  search. A pre-filtered result with fewer hits than were asked for, an empty one included, is
-  complete only when the backend declares exact search; so is post-filtering that runs out of
-  candidates inside a scope. The acceptance run on Kaggle found pgvector returning no rows at all
-  to least-privileged users who could read several hundred chunks, because its iterative index
-  scan stopped at `hnsw.max_scan_tuples` or at its memory limit, and wardowl reported those empty
-  results as complete. That contradicted the field's documented meaning, "False when wardowl knows
-  results may be missing"; this corrects it. Users who may read fewer than k chunks now get
-  `complete=False` on approximate stores, which cannot tell them apart from an index that stopped
-  early. Nothing else changes: the same searches run, the same hits come back, and the safety
-  guarantees are unchanged. Post-filtering without a filter still reads a short candidate list as
-  the end of the store.
-- Backends can declare `exact_search = True` when `search` ranks every chunk that matches the
-  filter, so a result with fewer than k hits proves nothing else matches. It is optional and read
-  with `getattr`, not a required member of the `SearchBackend` protocol, so existing backends still
-  satisfy it. `InMemoryBackend` declares it, and `FaissBackend` does when its index is flat (the
-  default) or an ID map around a flat index. `RankFusion` does not, even over exact backends: it
-  leaves out chunks whose metadata differs between backends after each has filled its list, so a
-  short fused list proves nothing. Every other built-in backend searches approximately and does
-  not declare it. A subclass of `InMemoryBackend` that drops hits on purpose should set
-  `exact_search = False`.
-- `check_backend` checks a backend that declares `exact_search` as exact, whatever `exact=` says,
-  since the retriever takes its short results as proof that nothing else matches.
+2.1.0 fixed two more security problems that the 2.0 line does not carry, because each changes
+behaviour: `SpiceDBAuthorizer` checked the user's groups as subjects of their own by default
+(`group_subjects=True`), so under an exclusion such as `viewer - banned` a banned user still read a
+document granted to their group; and `AuthorizationError` messages carried the text of the exception
+behind them, which agent tools can show to a model. Upgrade to 2.1.1 for both. On 2.0, pass
+`group_subjects=False` and write group memberships to SpiceDB if your permissions exclude or
+intersect.
 
 ### Security
 
@@ -51,6 +34,35 @@ All notable changes are recorded here. The format follows
   below anything Chroma refused or crashed on: 10,000 SQL parameters, an expression 250 deep, 32
   levels of `$and` and `$or`, and 500,000 characters. Larger filters are applied by the backend
   itself (see Fixed).
+- `CachingAuthorizer.invalidate()` no longer lets a permission service that is itself behind refill
+  the cache with a decision from before the change. After `invalidate()`, the next retrieval asked
+  the service, which could still answer from a stale snapshot (SpiceDB under `minimizeLatency`,
+  Cerbos before reloading a policy), and the cache kept that answer for its whole `ttl`. In the
+  paper's experiment X7, all 40 SpiceDB revocations with `invalidate()` took the full 30-second
+  `ttl` (a median 30.04 s, against a stated 5.5 s), 39 of 40 on a second replica, and Cerbos's took
+  as long. Now, for `source_staleness` seconds after `invalidate()`, answers for the subject (or
+  for everyone) are passed on and cached nowhere: not in the process, and not in the shared cache,
+  whose epoch carries the end of the hold so that every replica holds back too. The bound after
+  `invalidate()` is the service's own staleness when `source_staleness` covers it, plus `local_ttl`
+  on other replicas. With `source_staleness` 0, the default for every authorizer but
+  `SpiceDBAuthorizer` without `fullyConsistent`, nothing changes. Replicas of earlier versions
+  sharing the cache during an upgrade do not see the hold.
+
+### Added
+
+- `ChromaBackend(fallback_candidates=...)`, how many chunks a search reads when its filter is too
+  large to send to Chroma whole (1,000 by default), and `wardowl.backends.chroma.FilterTooLarge`,
+  the `ValueError` that `filter_to_where` raises for such a filter. See Fixed.
+- `CachingAuthorizer(source_staleness=...)`: how many seconds old the data behind the wrapped
+  authorizer's answers can be. By default it is the authorizer's `max_staleness`, an optional
+  attribute an authorizer declares when it can answer from stale data, or 0 when it declares none.
+  `SpiceDBAuthorizer.max_staleness` follows its consistency (11 seconds, twice the bound SpiceDB
+  documents for its default settings, or 0 with `fullyConsistent`; `max_staleness=` sets it),
+  `AllOf` and `AnyOf` declare the largest of their parts', and `CachingAuthorizer.max_staleness` is
+  its `ttl` plus `source_staleness`, for a cache that wraps another. See Security.
+
+These are new, optional parameters and attributes, added in a patch release because the security
+fixes need them; nothing existing changes for code that does not use them.
 
 ### Fixed
 
@@ -65,183 +77,10 @@ All notable changes are recorded here. The format follows
   sends the part of it every match must meet, such as a tenant, if that fits, or no `where`; reads
   `fallback_candidates` chunks (1,000, or `k` if more); and applies the filter to them itself. It
   never returns a chunk the filter excludes, but can return fewer than `k` hits though more chunks
-  match, which the retriever reports as `complete=False`. `filter_to_where` returns the nested form
-  and raises `FilterTooLarge` beyond the bounds. CI searches real Chroma for subjects in 1,001 and
-  in 40,000 groups, and checks that Chroma reads nested trees exactly as the reference semantics.
-
-### Documentation
-
-- A 47-second film on the documentation's front page, linked from the README: what wardowl does,
-  shown with an AI assistant that many companies share.
-- Corrected what the documentation said about filtered approximate search. Concepts said that
-  pgvector's iterative index scans keep a selective filter from cutting results short; they stop
-  at `hnsw.max_scan_tuples` (20,000 by default) or at `work_mem` × `hnsw.scan_mem_multiplier` of
-  memory (4 MB by default), so a selective filter can still return fewer than k rows, or none. The
-  pgvector page names both limits and how to raise them. The Qdrant page explains why filters on
-  common values, such as a tenant shared by most points or a shared corpus readable by everyone,
-  can lose recall in Qdrant's filtered HNSW search, and what helps: ACORN with `max_selectivity`,
-  per-tenant graphs (`is_tenant` with `m=0` and `payload_m`), and exact search. Concepts, the
-  security model, the threat model, operations, production, hybrid search and the store pages
-  describe `complete` as it now behaves.
-
-## [2.1.0] - 2026-10-24
-
-Fixes found by real-world acceptance scenarios, run against real servers, a real identity provider
-and real models: a SpiceDB setting that let a banned user read through their group, a permission
-service's error text reaching models, Ory Keto's batch limit, stale redaction spans failing every
-retrieval, Chroma's batch limit, and the example gateway's streaming and OpenAI content parts. The
-scenarios join the project and run weekly against the release on PyPI. SpiceDB's
-`group_subjects` and Keto's `batch_size` change their defaults; see Security and Fixed.
-
-### Added
-
-- Acceptance scenarios (`acceptance/`): the applications a company builds with wardowl, run from
-  the documentation against real servers, a real identity provider (Keycloak), real embedding and
-  reranking models, and a local LLM, with every result checked against an oracle of who may read
-  what that does not use wardowl. They cover 14 stores, seven permission systems, LangChain,
-  LlamaIndex, Haystack and MCP, the HTTP service, day-2 operations with servers stopped mid-traffic,
-  redaction and reranking, a team's own store and policy, and the example gateway: 3,912 checks,
-  run weekly against the release on PyPI. A Kaggle notebook runs the assistant at scale on GPUs.
-
-- `wardowl.InvalidQuery`, a `ValueError` for a query that cannot be searched through its own fault,
-  raised by `Query.embedded`, `Query.keywords`, the retriever's checks of `k`, Vespa's keyword mode
-  and `FaissBackend` (a query vector whose length is not `dim`). Code that catches `ValueError` keeps
-  working; a backend of your own can raise it.
-- `OIDCAuthenticator(ssl_context=...)` fetches the identity provider's keys with that context, for a
-  provider whose certificate a private CA signed, instead of a process-wide `SSL_CERT_FILE`.
-- `InMemoryBackend.delete(ids)`, as every other backend has; ids not stored are ignored.
-- `ChromaBackend(batch_size=...)`.
-
-### Security
-
-- Example gateway (`examples/gateway`): the audit record links the records of one question by an
-  HMAC-SHA256 under a key derived from `RAMPART_KEY_SECRET` (`question_hmac`) instead of an unkeyed
-  SHA-256 (`question_sha256`), which anyone who could read the log could reverse when the only
-  unknown in a question was a masked phone or ID number, by hashing every candidate. `rampart
-  ingest` and `rampart verify-audit` now need `RAMPART_KEY_SECRET` (or `RAMPART_DEMO=1`), as
-  `rampart serve` already did. A request from a disabled principal is now audited, without anything
-  it carried, and counted as `account_disabled`; it was refused without a record, like a request
-  with an unknown key. Every read of the audit log, through `/v1/audit`, `/v1/audit/verify` or the
-  dashboard, is audited too.
-
-- `SpiceDBAuthorizer` checks only the user by default (`group_subjects=False`, was `True`), and
-  SpiceDB follows the group memberships it stores. With groups checked as subject sets of their own,
-  a chunk was allowed when the user or any group had the permission, so under an exclusion such as
-  `permission view = viewer - banned` a banned user still read a document granted to their group
-  (the group is not banned), and under an intersection a grant through a group was refused. If your
-  group memberships live only in the token and your permissions neither exclude nor intersect, pass
-  `group_subjects=True` to keep the old behaviour; otherwise write the memberships to SpiceDB
-  (`group:<name>#member@user:<id>`). A real-SpiceDB test checks that a banned member of a permitted
-  group is denied.
-- `AuthorizationError` messages are fixed and never carry the text of the exception behind them,
-  which stays the error's `__cause__` (and so in logged tracebacks; `RetrievalEvent.cause` still names
-  its type). The retriever wrapped an authorizer's or redactor's exception as
-  `authorizer failed: <its text>`, so a failure such as
-  `could not reach opa.internal:8181 as svc-wardowl (password hunter2)` reached a model through
-  Haystack's `Agent`, which shows tool errors to it, and through LangChain and LlamaIndex agents.
-  The same holds for the LlamaIndex postprocessor, the HTTP client the permission services share
-  (which now names the exception's type, not its text), Casbin, Cedar, Cerbos `roles`, OPA's filter,
-  SpiceDB's `caveat_context` and the OIDC key fetch.
-
-### Fixed
-
-- Example gateway: `/v1/chat/completions` accepts a message's `content` as OpenAI's list of text
-  parts, joined with newlines, as well as a string; it refused the list with 422, so SDKs and chat
-  UIs that send it got no answer. The 4,000-character limit applies to the joined text, a message
-  holds at most 50 parts, and a part that is not text (an image, audio, a file) is refused with 422
-  naming its type.
-- Example gateway: `stream: true` on `/v1/chat/completions` answers in OpenAI's server-sent events
-  (`chat.completion.chunk` objects, a last chunk with `finish_reason` and the `rampart` block, a
-  usage chunk with `stream_options.include_usage`, then `data: [DONE]`). It was ignored and
-  answered with one JSON body, which streaming clients could not read. The answer is checked in
-  full first and then streamed in pieces, so the policy, masking, audit and metrics are those of
-  any other answer, and a denied request is the usual 403.
-- Example gateway: denied ingests and audit reads are counted in `rampart_policy_denials_total`, as
-  `ingest_not_allowed` and `audit_not_allowed`; only denied questions were, although the reason
-  codes existed. The dashboard's denials by reason count every action too.
-- Example gateway: Compose passes the gateway's settings through, with the gateway's defaults.
-  `RAMPART_LLM_API_KEY`, needed for a model server that wants a key, `RAMPART_MAX_BODY_BYTES`, the
-  embedding model and dimension and the tuning settings could not be set. `RAMPART_LOCAL_MODEL`
-  makes the `local-llm` profile pull a smaller chat model and serve it under the name the policy
-  approves. `RAMPART_DEFAULT_MODEL` is gone: nothing read it, since the policy chooses the model.
-
-- `KetoAuthorizer` sends 10 tuples per batch check by default (`batch_size=10`, was 100). Keto
-  refuses more than `limit.max_batch_check_size` tuples, 10 unless configured, with HTTP 400, so with
-  both defaults every check of more than 10 chunks failed, closed. Raise both together for larger
-  batches. The real-Keto CI tests now send more than 10 tuples.
-- `SpanRedactor` hides a chunk whole when one of its spans ends past the text, as when the text was
-  shortened after its spans were written, as it does for a `sha256` mismatch. It used to raise, so
-  every retrieval that reached the chunk failed, for its readers too. Spans that are wrong whatever
-  the text (not two integers with `0 <= start < end`, and the other malformed cases) still fail the
-  retrieval.
-- `ChromaBackend` writes in batches of at most `batch_size` records: the client's own maximum
-  (`get_max_batch_size()`, about 5,400 for a local client) by default, or 1,000 when the collection
-  reports none. `add`, `delete` and `set_metadata` sent everything in one call, which Chroma refuses
-  above its maximum. Every record is checked before the first batch is written.
-- An open `CircuitBreaker` raises `AuthorizationError` caused by the new
-  `wardowl.authorizers.CircuitOpenError`, so `RetrievalEvent.cause` is `"CircuitOpenError"`. It had
-  no cause, which monitoring could not tell from a malformed answer.
-- The HTTP service answers 422, echoing nothing, for a query it cannot search as sent (the new
-  `wardowl.InvalidQuery`): `k` over the retriever's `max_candidates`, only a vector for a keyword
-  backend, only text for a backend without an embed function, or a vector of the wrong length for
-  `FaissBackend`. These answered 500. Other errors remain server faults and answer 500.
-
-### Documentation
-
-- Concepts says what each strategy sends to the store: post-filtering searches inside the
-  authorizer's scope when it has one, and for an `AllOf` whose parts all give filters that scope is
-  the whole filter, even with `strategy="postfilter"`. The authorizer table lists every built-in
-  authorizer. Combining and the Chroma page's speed advice say the same.
-- Combining shows `TenantAuthorizer`'s `attribute` as it is (`None`, meaning the field's name) and
-  how one chunk serves several tenants through a list-valued `tenant` field.
-- Vespa: `namespace` only names document paths, a search covers the whole schema, and tenants are
-  kept apart by the permission filter or by a schema each. Redis: each index needs its own prefix,
-  and clients need socket timeouts. Qdrant: index `tenant` in multi-tenant collections. Cassandra:
-  `create_table` does not create the keyspace. Chroma, Elasticsearch and OpenSearch: searches are
-  approximate, with what tunes their recall.
-- Hybrid search lists Vespa's keyword mode, and Your own vectors covers LanceDB, FAISS, Vespa,
-  Cassandra and Pinecone and what a query vector of the wrong size raises.
-- Redaction warns that a span's `sha256` of a short value can be recovered by guessing, so the
-  spans must not reach callers.
-- Extending says `check_authorizer` proves consistency, not a correct policy, and shows a test of
-  known cases.
-- SpiceDB explains why `group_subjects=True` fails under an intersection or an exclusion, and what
-  to do instead. Casbin says what a custom `request` skips and must do itself. Keto and OpenFGA show
-  how to keep tenants apart in one server. OPA recommends files or bundles over policies uploaded
-  through its API.
-- Operations, Security and the integrations overview name all five HTTP authorizers, and the shared
-  cache's Redis client gets timeouts. Revocation covers Keto, Cedar and Casbin.
-- HTTP service: mapping a real provider's tokens, with Keycloak's `sub`, group paths, admin-only
-  claims and audience mapper. LangChain: a per-call `subject=` wins over `for_subject`. Haystack:
-  what a model can set on the agent tool, `inputs_from_state`, and `outputs_to_state` for getting
-  the documents back. MCP: a stdio server for a signed-in user. Agent frameworks: the `mcp` 2 client
-  takes its header on an `httpx2` client, and the MCP adapters for LangChain, LlamaIndex and
-  Haystack.
-
-- Example gateway: the README says exactly which requests are audited (not `/v1/me`, nor requests
-  refused before the policy is asked with 401, 413 or 422), how the policy chooses the model and how
-  to change it or serve a smaller one under the approved name, and how to stream. The quickstart
-  waits for the models before ingesting (`docker compose wait ollama-pull`), uses
-  `docker compose exec -T`, and says the model server needs the models pulled. It gives the status
-  and body of an over-limit request (422) and of a disabled principal (403,
-  `{"detail": "account disabled"}`), lists the `admin` demo principal, and explains that the express
-  delivery question gets no answer because the vendor FAQ is a single chunk, quarantined whole. The
-  threat model covers the keyed fingerprint, audited audit reads and disabled principals, and the
-  limit on content parts.
-
-- The Keto guide explains the batch limit and how to raise it; the example configuration keeps
-  Keto's default on purpose.
-- The HTTP service guide lists every status code, 500 included, and shows `ssl_context`.
-- The SpiceDB guide describes the new default and why `group_subjects=True` must not be used with
-  permissions that exclude or intersect; the README and the review checklist say the same.
-- The security model, threat model, operations guide, runbook and Haystack guide describe fixed
-  error messages and the `CircuitOpenError` cause; the redaction guide says which spans hide a chunk
-  and which fail the retrieval; the Chroma guide describes batched writes.
-- `OpenSearchBackend`'s docstring said to set `ef_search` in the index settings; that applies to the
-  Faiss engine only, and with the default Lucene engine the query's `k` sets the search breadth.
-- The README's Redis example sets `socket_timeout` and `socket_connect_timeout`, so a Redis that
-  stops answering fails the search instead of holding it.
-- `InMemoryBackend.add` says why it takes no `embeddings`: it matches words and keeps no vectors.
+  match. In 2.0, `RetrievalResult.complete` does not flag such a short pre-filtered result; raise
+  `fallback_candidates` if such subjects need more. `filter_to_where` returns the nested form and
+  raises `FilterTooLarge` beyond the bounds. CI searches real Chroma for subjects in 1,001 and in
+  40,000 groups, and checks that Chroma reads nested trees exactly as the reference semantics.
 
 ## [2.0.1] - 2026-10-24
 
@@ -1308,7 +1147,8 @@ needed, in which case it will be announced in a second release candidate. Instal
 - The project is now `wardowl`, a permission-aware retrieval library (ADR 0005). The earlier
   Rampart gateway lives on as an example deployment in `examples/gateway`.
 
-[Unreleased]: https://github.com/muzakkirhussain011/wardowl/compare/v2.0.1...HEAD
+[Unreleased]: https://github.com/muzakkirhussain011/wardowl/compare/v2.0.2...HEAD
+[2.0.2]: https://github.com/muzakkirhussain011/wardowl/compare/v2.0.1...v2.0.2
 [2.0.1]: https://github.com/muzakkirhussain011/wardowl/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/muzakkirhussain011/wardowl/compare/v1.6.0...v2.0.0
 [1.6.0]: https://github.com/muzakkirhussain011/wardowl/compare/v1.5.0...v1.6.0
