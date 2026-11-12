@@ -21,7 +21,7 @@ services:
       retries: 20
 
   opa:
-    image: openpolicyagent/opa:1.22.0-static@sha256:906bfc9904b2693733e7959d71773dd073e6c135cf06f26d955abe94603e82b3
+    image: openpolicyagent/opa:1.22.1-static@sha256:e9e6cf5d569ff419cfa5785ab28d46709a5e69cb5856d53e1b6cb8d343a39730
     command: ["run", "--server", "--addr=0.0.0.0:8181", "--log-level=error", "--ignore=*_test.rego", "/policies"]
     volumes: ["./policies:/policies:ro"]
 
@@ -29,7 +29,7 @@ services:
   # to any Ollama or vLLM endpoint and skip this profile. Local: docker compose --profile local-llm up -d
   # Pinned to a release and its multi-arch digest, like the Dockerfile's base images.
   ollama:
-    image: ollama/ollama:0.40.13@sha256:b2f0122c476bc9fe7ce679d8bb4bd555351e25e2554eefb156f61cb0a89cf429
+    image: ollama/ollama:0.40.14@sha256:ebaef4f4c5d93660e1f25f8ad085a112f51ccfb0e8458073e71793959dba91c9
     profiles: [local-llm]
     volumes: [ollama:/root/.ollama]
 
@@ -37,7 +37,7 @@ services:
   # chat model by name (gemma4:e2b in policies/data.json). On a small machine, RAMPART_LOCAL_MODEL
   # names a smaller model to pull instead, copied to that name (`ollama cp`) so the policy admits it.
   ollama-pull:
-    image: ollama/ollama:0.40.13@sha256:b2f0122c476bc9fe7ce679d8bb4bd555351e25e2554eefb156f61cb0a89cf429
+    image: ollama/ollama:0.40.14@sha256:ebaef4f4c5d93660e1f25f8ad085a112f51ccfb0e8458073e71793959dba91c9
     profiles: [local-llm]
     depends_on: [ollama]
     environment:
