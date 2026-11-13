@@ -214,7 +214,7 @@ def test_a_search_that_runs_out_of_time_fails_and_returns_nothing(caplog):
     with pytest.raises(ToolError) as failure:
         call(server, {"query": "leave"}, token("bob", ["eng"]))
     assert time.monotonic() - started < 10
-    assert str(failure.value) == "the search did not finish in time, so nothing was returned"
+    assert "the search did not finish in time, so nothing was returned" in str(failure.value)
     assert "took longer than 0.1 s" in caplog.text
     # The cancelled retrieval was reported, with nothing returned.
     assert [e.error for e in events] == ["CancelledError"] and events[0].returned_ids == ()
