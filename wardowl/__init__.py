@@ -22,7 +22,7 @@ from wardowl.redaction import PatternRedactor, Redactor, SpanRedactor
 from wardowl.retriever import PermissionedRetriever, Reranker, RetrievalResult, SearchBackend, Strategy
 from wardowl.types import Document, Hit, InvalidQuery, Query, Subject
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 
 __all__ = [
     "AllOf",

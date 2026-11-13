@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 
 from hypothesis import strategies as st
 
@@ -98,3 +99,25 @@ filters = st.recursive(
 
 def expected_ids(docs: Sequence[Document], f: Filter) -> set[str]:
     return {d.id for d in docs if matches(f, d.metadata)}
+
+
+def chroma_where_matches(where: dict[str, Any], stored: dict[str, Any], fanout: int = 16) -> bool:
+    """Chroma's reading of a `where` that `filter_to_where` wrote, against a record's stored metadata.
+
+    Written from Chroma's documented operators, not from wardowl's filter code: `$and` and `$or`, and
+    `$in` and `$eq`, which compare values of the same type only. It also checks the shape Chroma
+    needs: every `$and` and `$or` holds 2 to `fanout` clauses.
+    """
+    ((key, test),) = where.items()
+    if key in ("$and", "$or"):
+        assert 2 <= len(test) <= fanout, f"{key} of {len(test)} clauses"
+        found = [chroma_where_matches(c, stored, fanout) for c in test]  # every clause, to check every node
+        return all(found) if key == "$and" else any(found)
+    ((op, operand),) = test.items()
+    if key not in stored:
+        return False
+    value = stored[key]
+    if op == "$in":
+        return any(type(value) is type(v) and value == v for v in operand)
+    assert op == "$eq" and operand is True
+    return value is True

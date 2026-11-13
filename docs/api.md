@@ -183,6 +183,8 @@ An observer is any callable that takes a `RetrievalEvent`.
 
 .. autofunction:: wardowl.backends.chroma.filter_to_where
 
+.. autoexception:: wardowl.backends.chroma.FilterTooLarge
+
 .. autoclass:: wardowl.backends.elasticsearch.ElasticsearchBackend
    :members: add, set_metadata, delete, search, asearch
 
