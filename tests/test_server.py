@@ -31,6 +31,7 @@ from wardowl import (  # noqa: E402
     Query,
     Subject,
 )
+from wardowl._timeout import TimedOut, within  # noqa: E402
 from wardowl.server import InvalidToken, OIDCAuthenticator, _BodyLimit, create_app  # noqa: E402
 
 DOCS = [
@@ -321,6 +322,173 @@ def test_limits_must_be_positive(limit):
     retriever = PermissionedRetriever(InMemoryBackend(DOCS), MetadataACLAuthorizer())
     with pytest.raises(ValueError):
         create_app(retriever, tokens, **{limit: 0})
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        {"retrieval_timeout": 0},
+        {"retrieval_timeout": -1},
+        {"retrieval_timeout": float("nan")},
+        {"retrieval_timeout": float("inf")},
+        {"retrieval_timeout": True},
+        {"retrieval_timeout": "5"},
+        {"max_workers": 0},
+        {"max_workers": True},
+        {"max_workers": 2.5},
+    ],
+)
+def test_time_and_thread_bounds_must_be_valid(setting):
+    retriever = PermissionedRetriever(InMemoryBackend(DOCS), MetadataACLAuthorizer())
+    with pytest.raises(ValueError):
+        create_app(retriever, tokens, **setting)
+
+
+# --- time bounds, the executor and observers ---------------------------------------------------
+
+
+class Held:
+    """A store whose search waits until released, like a database behind a proxy that stopped answering."""
+
+    supports_filters = False
+
+    def __init__(self):
+        self.entered, self.release = threading.Event(), threading.Event()
+
+    def search(self, query, k, filter=None):
+        self.entered.set()
+        self.release.wait(10)
+        return [Hit("all-hands", "the launch date for everyone", 1.0, {"allowed_groups": ["*"]})]
+
+
+def test_a_retrieval_that_runs_out_of_time_answers_503_returns_nothing_and_is_reported(caplog):
+    store, events = Held(), []
+    retriever = PermissionedRetriever(store, MetadataACLAuthorizer(), observers=[events.append])
+    app = create_app(retriever, tokens, retrieval_timeout=0.2)
+
+    async def run():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://wardowl.test") as c:
+            headers = {"Authorization": "Bearer ann-token"}
+            started = time.monotonic()
+            answer = await asyncio.wait_for(c.post("/v1/retrieve", json={"query": "launch"}, headers=headers), 5)
+            took = time.monotonic() - started
+            store.release.set()
+            for _ in range(500):  # the cancelled retrieval reports its event as it unwinds
+                if events:
+                    break
+                await asyncio.sleep(0.01)
+            return answer, took
+
+    try:
+        answer, took = asyncio.run(run())
+    finally:
+        store.release.set()
+    # The store was still searching when the bound ran out: nothing it found reaches the caller.
+    assert store.entered.is_set() and took < 5
+    assert answer.status_code == 503
+    assert answer.json() == {"detail": "the retrieval did not finish in time, so nothing was returned"}
+    assert "took longer than 0.2 s" in caplog.text
+    assert [e.error for e in events] == ["CancelledError"] and events[0].returned_ids == ()
+
+
+class Sleeping(InMemoryBackend):
+    """A store with a native async search that never answers in time."""
+
+    async def asearch(self, query, k, filter=None):
+        await asyncio.sleep(30)
+        return []
+
+
+def test_the_time_bound_cancels_a_native_async_search_and_spares_quick_ones():
+    slow = PermissionedRetriever(Sleeping(DOCS), MetadataACLAuthorizer())
+    started = time.monotonic()
+    assert ask(TestClient(create_app(slow, tokens, retrieval_timeout=0.1)), {"query": "launch"}).status_code == 503
+    assert time.monotonic() - started < 10
+    quick = ask(client(retrieval_timeout=5), {"query": "launch"})
+    assert quick.status_code == 200 and {h["id"] for h in quick.json()["hits"]} == {"eng-plan", "all-hands"}
+
+
+def test_max_workers_sizes_the_thread_pool_the_retrieval_runs_in():
+    names = []
+
+    class Recorded(InMemoryBackend):
+        def search(self, query, k, filter=None):
+            names.append(threading.current_thread().name)
+            return super().search(query, k, filter)
+
+    events = []
+    retriever = PermissionedRetriever(Recorded(DOCS), MetadataACLAuthorizer(), observers=[events.append])
+    with TestClient(create_app(retriever, tokens, max_workers=1)) as c:  # the lifespan runs
+        for _ in range(3):
+            assert ask(c, {"query": "launch"}).status_code == 200
+    # One thread, the pool's, ran every search, and the observers too.
+    assert len(names) == 3 and set(names) == {"wardowl_0"} and len(events) == 3
+
+
+def test_a_slow_observer_does_not_stall_other_requests():
+    entered, release = threading.Event(), threading.Event()
+
+    def slow(event):  # an audit sink whose collector stopped reading
+        entered.set()
+        release.wait(10)
+
+    retriever = PermissionedRetriever(InMemoryBackend(DOCS), MetadataACLAuthorizer(), observers=[slow])
+
+    async def run():
+        transport = httpx.ASGITransport(app=create_app(retriever, tokens))
+        async with httpx.AsyncClient(transport=transport, base_url="http://wardowl.test") as c:
+            headers = {"Authorization": "Bearer ann-token"}
+            pending = asyncio.ensure_future(c.post("/v1/retrieve", json={"query": "launch"}, headers=headers))
+            for _ in range(200):
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            health = await asyncio.wait_for(c.get("/healthz"), 5)
+            stalled = not pending.done()
+            release.set()
+            return health, stalled, await pending
+
+    try:
+        health, stalled, answer = asyncio.run(run())
+    finally:
+        release.set()
+    # The request waits for its own observer; the service goes on answering others.
+    assert entered.is_set() and health.status_code == 200 and stalled and answer.status_code == 200
+
+
+def test_the_time_bound_runs_the_retrieval_as_its_own_task_and_cancels_it_with_the_caller():
+    async def answer(value, delay=0.0):
+        await asyncio.sleep(delay)
+        return value
+
+    async def stubborn():  # a client that turns its cancellation into an error of its own
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            raise RuntimeError("cancelled") from None
+
+    async def run():
+        assert await within(answer("now"), None) == "now"
+        assert await within(answer("soon", 0.01), 5) == "soon"
+        with pytest.raises(TimedOut):
+            await within(stubborn(), 0.05)
+        inner = []
+
+        async def watched():
+            inner.append(asyncio.current_task())
+            await asyncio.sleep(30)
+
+        outer = asyncio.ensure_future(within(watched(), 30))
+        while not inner:
+            await asyncio.sleep(0.01)
+        outer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await outer
+        await asyncio.sleep(0.01)
+        return inner[0]
+
+    assert asyncio.run(run()).cancelled()
 
 
 # --- OIDCAuthenticator -------------------------------------------------------------------------

@@ -31,11 +31,16 @@ How it holds:
    is never logged.
 5. A synchronous authenticator, such as `OIDCAuthenticator`, runs in a worker thread, so a slow
    identity provider never stalls the event loop.
+6. With `retrieval_timeout`, a retrieval that runs longer is cancelled and answers 503, and nothing
+   is returned. `max_workers` sizes the thread pool that synchronous stores, authorizers and
+   observers run in.
 """
 
 # No `from __future__ import annotations`: FastAPI resolves string annotations against the module's
 # globals, so the request models defined inside `create_app` must be real annotations.
 
+import asyncio
+import contextlib
 import http.client
 import inspect
 import logging
@@ -43,9 +48,11 @@ import math
 import ssl
 import threading
 import time
-from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from typing import Annotated, Any
 
+from wardowl._timeout import TimedOut, checked, within
 from wardowl.authz import AuthorizationError
 from wardowl.retriever import PermissionedRetriever
 from wardowl.types import InvalidQuery, Query, Subject
@@ -258,6 +265,8 @@ def create_app(
     metadata_fields: Collection[str] = (),
     title: str = "wardowl",
     docs: bool = False,
+    retrieval_timeout: float | None = None,
+    max_workers: int | None = None,
 ) -> FastAPI:
     """A FastAPI application serving `retriever` to callers that `authenticate` identifies.
 
@@ -266,12 +275,43 @@ def create_app(
     worker thread. `metadata_fields` lists the metadata returned with each hit (none by default).
     A request body over `max_body_bytes` is refused with 413. `docs` serves the interactive API
     pages at `/docs`.
+
+    `retrieval_timeout` (seconds; None, the default, sets no bound) bounds each retrieval: one that
+    takes longer is cancelled, answers 503 and returns nothing. A synchronous call it was making in
+    a worker thread cannot be stopped and runs on to its own client's timeout, holding that thread.
+
+    `max_workers` (None, the default, leaves the event loop's default executor alone) replaces the
+    event loop's default executor, while the application's lifespan runs, with a thread pool of that
+    many threads. `aretrieve` runs every synchronous store, authorizer, reranker and redactor call,
+    and its observers, in that executor, as `CachingAuthorizer` runs its Redis calls, so its size
+    bounds how many of them run at once. A synchronous authenticator runs in Starlette's own thread
+    pool instead.
     """
     if min(max_k, max_query_length, max_vector_length, max_body_bytes) < 1:
         raise ValueError("max_k, max_query_length, max_vector_length and max_body_bytes must be positive")
+    retrieval_timeout = checked(retrieval_timeout)
+    workers: Any = max_workers
+    if workers is not None and (isinstance(workers, bool) or not isinstance(workers, int) or workers < 1):
+        raise ValueError("max_workers must be None or a positive integer")
     fields = frozenset(metadata_fields)
     bearer = HTTPBearer(auto_error=False)
-    app = FastAPI(title=title, docs_url="/docs" if docs else None, redoc_url=None)
+
+    @contextlib.asynccontextmanager
+    async def sized_executor(_app: FastAPI) -> AsyncIterator[None]:
+        pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="wardowl")
+        asyncio.get_running_loop().set_default_executor(pool)
+        try:
+            yield
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    app = FastAPI(
+        title=title,
+        docs_url="/docs" if docs else None,
+        redoc_url=None,
+        # Only when asked for: an application given a lifespan no longer runs on_event handlers.
+        lifespan=sized_executor if max_workers is not None else None,
+    )
     app.add_middleware(_BodyLimit, limit=max_body_bytes)
 
     @app.exception_handler(RequestValidationError)
@@ -328,7 +368,13 @@ def create_app(
             raise HTTPException(422, "a request needs a query, a vector, or both")
         query = Query(body.query, body.vector) if body.vector is not None else body.query or ""
         try:
-            result = await retriever.aretrieve(query, subject, body.k)
+            result = await within(retriever.aretrieve(query, subject, body.k), retrieval_timeout)
+        except TimedOut:
+            _log.error(
+                "wardowl's retrieval took longer than %s s; it was cancelled and nothing was returned",
+                retrieval_timeout,
+            )
+            raise HTTPException(503, "the retrieval did not finish in time, so nothing was returned") from None
         except AuthorizationError:
             _log.exception("wardowl's permission check failed; nothing was returned")
             raise HTTPException(503, "the permission check could not be completed, so nothing was returned") from None

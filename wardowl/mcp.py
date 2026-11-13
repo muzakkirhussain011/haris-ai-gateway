@@ -22,13 +22,15 @@ unless its keys are named in `metadata`, because permission fields describe who 
 failure of the permission service reaches the model as a tool error without internal details, and
 nothing is returned. Any other failure (the vector store, or `subject_for` itself) reaches it only
 as "Error executing tool search": the SDK keeps the exception, with whatever hosts or credentials
-its text names, in the server's log. Tests hold both to that.
+its text names, in the server's log. Tests hold both to that. With `retrieval_timeout`, a search
+that runs longer is cancelled and ends with a tool error, and nothing is returned.
 """
 
 # No `from __future__ import annotations`: the SDK reads the tool's annotations, which refer to
 # values (the result limit) known only when the tool is added.
 
 import inspect
+import logging
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Annotated, Any
 
@@ -41,11 +43,14 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import INVALID_REQUEST, ToolAnnotations
 from pydantic import BaseModel, Field
 
+from wardowl._timeout import TimedOut, checked, within
 from wardowl.authz import AuthorizationError
 from wardowl.retriever import PermissionedRetriever
 from wardowl.types import Subject
 
 __all__ = ["SearchHit", "SearchResults", "SubjectFor", "add_search_tool"]
+
+_log = logging.getLogger("wardowl")
 
 SubjectFor = Callable[[AccessToken], Subject | Awaitable[Subject]]
 """Turns the verified access token of a request into the subject whose permissions apply."""
@@ -83,6 +88,7 @@ def add_search_tool(
     max_limit: int = 20,
     max_query_length: int = 4000,
     metadata: Sequence[str] = (),
+    retrieval_timeout: float | None = None,
 ) -> None:
     """Register a permission-aware search tool on `server`.
 
@@ -91,11 +97,16 @@ def add_search_tool(
     synchronous one runs in a worker thread. The tool takes `query` (at most `max_query_length`
     characters) and `limit` (default `limit`, at most `max_limit`); `metadata` names the metadata
     keys included in each result.
+
+    `retrieval_timeout` (seconds; None, the default, sets no bound) bounds each search: one that
+    takes longer is cancelled and ends with a tool error, and nothing is returned. A synchronous
+    call it was making in a worker thread cannot be stopped and runs on to its own client's timeout.
     """
     if not 1 <= limit <= max_limit:
         raise ValueError("limit must be at least 1 and at most max_limit")
     if max_query_length < 1:
         raise ValueError("max_query_length must be positive")
+    retrieval_timeout = checked(retrieval_timeout)
     if not isinstance(subject, Subject) and not callable(subject):
         raise TypeError("subject must be a wardowl Subject or a function of the access token")
     keys = tuple(metadata)
@@ -126,7 +137,12 @@ def add_search_tool(
     ) -> SearchResults:
         who = await caller()
         try:
-            result = await retriever.aretrieve(query, who, limit)
+            result = await within(retriever.aretrieve(query, who, limit), retrieval_timeout)
+        except TimedOut:
+            _log.error(
+                "wardowl's search took longer than %s s; it was cancelled and nothing was returned", retrieval_timeout
+            )
+            raise ToolError("the search did not finish in time, so nothing was returned") from None
         except AuthorizationError:
             raise ToolError("the permission check could not be completed, so nothing was returned") from None
         hits = [

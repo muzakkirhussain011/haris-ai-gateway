@@ -49,6 +49,10 @@ fails. Each item links to the page with the details.
 - [ ] HTTP authorizers have a `timeout` and `retries` you have chosen, and a shared
   `CircuitBreaker` so a failing service is not flooded.
   ([Operations](operations.md#resilience-of-remote-permission-services))
+- [ ] The HTTP service and the MCP tool have a `retrieval_timeout`, and the HTTP service's thread
+  pool is sized with `max_workers` for the concurrency you expect. Every store and permission
+  service still has its own client timeouts, which free the threads that `retrieval_timeout`
+  cannot stop. ([HTTP service](integrations/http.md#time-bounds-and-threads))
 - [ ] Connections use TLS and credentials (`headers=`, or `token=` for SpiceDB).
 - [ ] `CachingAuthorizer` sits in front, with a `ttl` chosen as a security decision: it is the
   longest a revoked permission keeps granting access. ([Operations](operations.md#permission-caching))
@@ -92,6 +96,8 @@ says why. The table shows what each failure looks like.
 | A shared-cache entry is unsigned, tampered with or copied under another key | Ignores it (with `signing_key`) | Nothing: it is a miss |
 | `invalidate()` cannot reach Redis | Raises, because the caller asked for a revocation now | The exception at the caller |
 | An observer raises | Logs it; retrieval is unaffected | An error on the `wardowl` logger |
+| An observer blocks (a full disk, a collector that stopped reading) | Under `aretrieve`, waits for it in a worker thread: that request is delayed, the others are not | Slower requests; with `retrieval_timeout`, 503s or tool errors |
+| A retrieval in the HTTP service or the MCP tool takes longer than `retrieval_timeout` | Cancels it and returns nothing: 503, or a tool error | An error on the `wardowl` logger; `error.type = CancelledError` |
 
 What to do about each, containment first, is in the [incident runbook](runbook.md).
 

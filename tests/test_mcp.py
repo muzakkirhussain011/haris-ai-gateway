@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -191,6 +192,34 @@ def test_arguments_are_checked():
         add_search_tool(MCPServer("x"), retriever, from_claims, max_query_length=0)
     with pytest.raises(TypeError):
         add_search_tool(MCPServer("x"), retriever, "bob")
+    for bad in (0, -1, float("nan"), float("inf"), True):
+        with pytest.raises(ValueError):
+            add_search_tool(MCPServer("x"), retriever, from_claims, retrieval_timeout=bad)
+
+
+class Sleeping(InMemoryBackend):
+    """A store with a native async search that never answers in time."""
+
+    async def asearch(self, query, k, filter=None):
+        await asyncio.sleep(30)
+        return []
+
+
+def test_a_search_that_runs_out_of_time_fails_and_returns_nothing(caplog):
+    events = []
+    retriever = PermissionedRetriever(Sleeping(DOCS), MetadataACLAuthorizer(), observers=[events.append])
+    server = MCPServer("knowledge")
+    add_search_tool(server, retriever, from_claims, retrieval_timeout=0.1)
+    started = time.monotonic()
+    with pytest.raises(ToolError) as failure:
+        call(server, {"query": "leave"}, token("bob", ["eng"]))
+    assert time.monotonic() - started < 10
+    assert "the search did not finish in time, so nothing was returned" in str(failure.value)
+    assert "took longer than 0.1 s" in caplog.text
+    # The cancelled retrieval was reported, with nothing returned.
+    assert [e.error for e in events] == ["CancelledError"] and events[0].returned_ids == ()
+    quick = call(make_server(retrieval_timeout=5), {"query": "leave"}, token("bob", ["eng"]))
+    assert set(ids(quick)) == {"handbook", "runbook"}
 
 
 class BrokenStore:

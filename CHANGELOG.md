@@ -88,8 +88,33 @@ All notable changes are recorded here. The format follows
   now runs in a transaction of its own for it. None, the default, sets nothing.
 - `SpiceDBAuthorizer(trust_empty_lookup=True)` takes a LookupResources answer with no document as
   "nothing is readable", as before; see Changed.
+- `create_app(retrieval_timeout=...)` and `add_search_tool(retrieval_timeout=...)`, in seconds,
+  bound each retrieval of the HTTP service and the MCP tool. A retrieval that takes longer is
+  cancelled, answers 503 or ends with a tool error, and returns nothing; the `wardowl` logger
+  records the timeout, and the retrieval's event records `CancelledError`. Neither waited for a
+  retrieval's end before: a store or permission service that never answered held the request
+  indefinitely, while `/healthz` kept answering. A synchronous call already running in a worker
+  thread cannot be stopped and runs on to its own client's timeout. None, the default, sets no
+  bound, as before.
+- `create_app(max_workers=...)` replaces the event loop's default executor, while the application's
+  lifespan runs, with a thread pool of that many threads. Every synchronous store, authorizer,
+  reranker and redactor call of `aretrieve`, `CachingAuthorizer`'s Redis calls and the observers run
+  in that executor, whose default size, CPython's, bounded the service's concurrency without being
+  set or documented. None, the default, leaves the executor alone, as before. The HTTP service page
+  documents both settings, and that `/healthz` reports liveness only.
 
 ### Changed
+
+- `aretrieve` calls the observers in a worker thread of the event loop's default executor, and waits
+  for them before it returns or raises, as before. They ran on the event loop, so an audit sink that
+  blocked on its stream (a full disk, a network mount, a collector that stopped reading) stopped
+  every request the HTTP service or the MCP server was serving until the write returned. Now it
+  delays only the request whose event it writes. The event is still built when the retrieval ends,
+  so its timings do not include the wait for a thread, and a call cancelled while its event is on
+  the way stops waiting, while the event is still delivered. Observers must be thread-safe, as they
+  already had to be for `retrieve` called from several threads; `JsonLinesAudit` and the
+  OpenTelemetry observers are. A retrieval closed without finishing (`GeneratorExit`) still calls
+  them in place, since it can await nothing more.
 
 - The MCP server's search tool now sets all four MCP tool hints explicitly: besides read-only and
   closed world, not destructive and idempotent, so a host does not have to assume a default for any

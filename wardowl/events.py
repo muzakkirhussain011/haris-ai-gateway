@@ -9,6 +9,9 @@ without storing them; without a key there is no fingerprint at all, because a pl
 query can be reversed by guessing.
 
 An observer that raises is logged on the `wardowl` logger and does not affect retrieval.
+`retrieve` calls observers in the caller's thread; `aretrieve` calls them in a worker thread, off
+the event loop, and waits for them before it returns or raises. Observers may therefore be called
+from several threads at once.
 """
 
 from __future__ import annotations

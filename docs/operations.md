@@ -304,6 +304,16 @@ flushes after each event:
 An observer that raises is logged on the `wardowl` logger and never changes what retrieval
 returns or raises.
 
+`retrieve` calls the observers in the caller's thread. `aretrieve` calls them in a worker thread of
+the event loop's default executor, off the event loop, and waits for them before it returns or
+raises: an observer that blocks on a full disk, a network mount or a collector that stopped
+reading delays the request whose event it is writing, but not the other requests the loop serves.
+Either way an observer can be called from several threads at once, so it must be thread-safe, as
+`JsonLinesAudit` and the OpenTelemetry observers are. A cancelled retrieval, such as one the
+[HTTP service](integrations/http.md#time-bounds-and-threads) stopped at its `retrieval_timeout`, is
+reported with `error = "CancelledError"`. A call cancelled while its event is on the way to the
+observers stops waiting at once, and the event is still delivered.
+
 ## Tracing
 
 `OpenTelemetryObserver` records each retrieval as a span named `wardowl.retrieve`, timed from
