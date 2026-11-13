@@ -65,8 +65,8 @@ circuit breaker can make it fail fast while the service recovers. See [Operation
 
 ## How fast is it?
 
-On pgvector with a million chunks, pre-filtered retrieval reached 129 retrievals a second on four
-CPUs, with recall@10 between 0.88 and 0.97. Across 21,000 benchmark retrievals, no forbidden chunk
+On pgvector with a million chunks, pre-filtered retrieval reached 131 retrievals a second on four
+CPUs, with recall@10 between 0.886 and 0.973. Across 21,000 benchmark retrievals, no forbidden chunk
 was returned. [Benchmarks](benchmarks.md) has the method and the scripts to reproduce it.
 
 ## Is wardowl ready for production?

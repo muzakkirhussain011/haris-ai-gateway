@@ -163,7 +163,7 @@ retriever = PermissionedRetriever(backend, authorizer, short_results="widen", wi
 
 HNSW is approximate: how many of the true nearest neighbours a search finds depends on
 `hnsw.ef_search`, the size of the candidate list it keeps (40 by default, 1 to 1000). Higher finds
-more and takes longer. On a million chunks at the default, the index's top 10 held 0.895 of the
+more and takes longer. On a million chunks at the default, the index's top 10 held 0.886 of the
 exact top 10 (see [Benchmarks](../benchmarks.md#at-a-million-chunks-under-load)).
 
 ```python
