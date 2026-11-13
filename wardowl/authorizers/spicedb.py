@@ -105,6 +105,12 @@ class SpiceDBAuthorizer:
     in `OPAAuthorizer`: a `token` sent over http:// to a host other than this machine needs
     `allow_insecure=True`. Every failure raises `AuthorizationError`.
 
+    A `check` sends one CheckBulkPermissions request per `batch_size` (resource, subject) pairs,
+    and `filter_for` one LookupResources request per subject (the user, and each group with
+    `group_subjects`), one after another. `timeout` bounds each request; `total_timeout` (seconds;
+    None, the default, for no bound) bounds all the requests of one `check` or `filter_for`
+    together, so that the call raises `AuthorizationError` once it runs out.
+
     `max_staleness` is how many seconds old SpiceDB's answers can be: 0 with
     `{"fullyConsistent": True}`, and otherwise 11 by default, twice the bound SpiceDB documents for
     its default quantization settings (see the module docstring). Pass it for a server with other
@@ -139,6 +145,7 @@ class SpiceDBAuthorizer:
         ssl_context: ssl.SSLContext | None = None,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         allow_insecure: bool = False,
+        total_timeout: float | None = None,
     ) -> None:
         if batch_size < 1 or lookup_limit < 1:
             raise ValueError("batch_size and lookup_limit must be positive")
@@ -153,6 +160,7 @@ class SpiceDBAuthorizer:
             ssl_context=ssl_context,
             max_response_bytes=max_response_bytes,
             allow_insecure=allow_insecure,
+            total_timeout=total_timeout,
         )
         self.permissions = dict(permissions or {"read": "view"})
         self.resource_type = resource_type
@@ -222,6 +230,7 @@ class SpiceDBAuthorizer:
         context = self._context(subject)
         pairs = [(r, s) for r in unique for s in subjects]
         allowed = dict.fromkeys(unique, False)
+        deadline = self._client.deadline()  # one for every batch of this check
         for start in range(0, len(pairs), self.batch_size):
             batch = pairs[start : start + self.batch_size]
             items = [
@@ -237,6 +246,7 @@ class SpiceDBAuthorizer:
                 "/v1/permissions/checkbulk",
                 {"consistency": self.consistency, "items": items},
                 "SpiceDB CheckBulkPermissions",
+                deadline=deadline,
             )
             results = answer.get("pairs") if isinstance(answer, dict) else None
             if not isinstance(results, list):
@@ -267,6 +277,7 @@ class SpiceDBAuthorizer:
         permission = self._permission(action)
         context = self._context(subject)
         found: set[str] = set()
+        deadline = self._client.deadline()  # one for every subject's lookup
         for s in self._subjects(subject):
             payload = {
                 "consistency": self.consistency,
@@ -276,7 +287,9 @@ class SpiceDBAuthorizer:
                 "optionalLimit": self.lookup_limit,
                 **context,
             }
-            lines = self._client.post_json("/v1/permissions/resources", payload, "SpiceDB LookupResources", lines=True)
+            lines = self._client.post_json(
+                "/v1/permissions/resources", payload, "SpiceDB LookupResources", lines=True, deadline=deadline
+            )
             for line in lines:
                 result = line.get("result") if isinstance(line, dict) else None
                 if not isinstance(result, dict) or line.get("error"):

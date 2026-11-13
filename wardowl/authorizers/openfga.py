@@ -88,6 +88,11 @@ class OpenFGAAuthorizer:
     be partial, so it gives no filter. `timeout`, `retries`, `circuit_breaker`, `ssl_context`,
     `max_response_bytes` and `allow_insecure` work as in `OPAAuthorizer`. Every failure raises
     `AuthorizationError`.
+
+    A `check` sends one batch-check request per `batch_size` distinct resources, one after
+    another. `timeout` bounds each request; `total_timeout` (seconds; None, the default, for no
+    bound) bounds all the requests of one `check` or `filter_for` together, so that the call raises
+    `AuthorizationError` once it runs out.
     """
 
     def __init__(
@@ -114,6 +119,7 @@ class OpenFGAAuthorizer:
         ssl_context: ssl.SSLContext | None = None,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         allow_insecure: bool = False,
+        total_timeout: float | None = None,
     ) -> None:
         if batch_size < 1 or list_objects_limit < 1:
             raise ValueError("batch_size and list_objects_limit must be positive")
@@ -131,6 +137,7 @@ class OpenFGAAuthorizer:
             ssl_context=ssl_context,
             max_response_bytes=max_response_bytes,
             allow_insecure=allow_insecure,
+            total_timeout=total_timeout,
         )
         self._store_path = f"/stores/{quote(store_id, safe='')}"
         self.base = self._client.url + self._store_path
@@ -150,12 +157,14 @@ class OpenFGAAuthorizer:
 
     # ---- helpers ---------------------------------------------------------------------------
 
-    def _post(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post(self, endpoint: str, payload: dict[str, Any], deadline: float | None) -> dict[str, Any]:
         if self.model_id:
             payload = {**payload, "authorization_model_id": self.model_id}
         if self.consistency:
             payload = {**payload, "consistency": self.consistency}
-        document = self._client.post_json(f"{self._store_path}/{endpoint}", payload, f"OpenFGA {endpoint}")
+        document = self._client.post_json(
+            f"{self._store_path}/{endpoint}", payload, f"OpenFGA {endpoint}", deadline=deadline
+        )
         if not isinstance(document, dict):
             raise AuthorizationError(f"OpenFGA {endpoint} returned an unexpected response")
         return document
@@ -214,6 +223,7 @@ class OpenFGAAuthorizer:
         unique = sorted({r for r in resources if r is not None})
         allowed: dict[str, bool] = {}
         user, context = self._user(subject), self._context(subject)
+        deadline = self._client.deadline()  # one for every batch of this check
         for start in range(0, len(unique), self.batch_size):
             batch = unique[start : start + self.batch_size]
             checks = [
@@ -224,7 +234,7 @@ class OpenFGAAuthorizer:
                 }
                 for i, r in enumerate(batch)
             ]
-            result = self._post("batch-check", {"checks": checks}).get("result")
+            result = self._post("batch-check", {"checks": checks}, deadline).get("result")
             if not isinstance(result, dict):
                 raise AuthorizationError("OpenFGA batch-check returned no result")
             for i, resource in enumerate(batch):
@@ -244,7 +254,7 @@ class OpenFGAAuthorizer:
             **self._context(subject),
         }
         started = time.monotonic()
-        objects = self._post("list-objects", payload).get("objects")
+        objects = self._post("list-objects", payload, self._client.deadline()).get("objects")
         elapsed = time.monotonic() - started
         if not isinstance(objects, list) or not all(isinstance(o, str) for o in objects):
             raise AuthorizationError("OpenFGA list-objects returned an unexpected response")

@@ -123,6 +123,11 @@ class CerbosAuthorizer:
     both principal and resources. `timeout`, `retries`, `circuit_breaker`, `ssl_context`,
     `max_response_bytes` and `allow_insecure` work as in `OPAAuthorizer`. Every failure raises
     `AuthorizationError`.
+
+    A `check` sends one CheckResources request per `batch_size` chunks, one after another.
+    `timeout` bounds each request; `total_timeout` (seconds; None, the default, for no bound)
+    bounds all the requests of one `check` or `filter_for` together, so that the call raises
+    `AuthorizationError` once it runs out.
     """
 
     def __init__(
@@ -143,6 +148,7 @@ class CerbosAuthorizer:
         ssl_context: ssl.SSLContext | None = None,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         allow_insecure: bool = False,
+        total_timeout: float | None = None,
     ) -> None:
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
@@ -156,6 +162,7 @@ class CerbosAuthorizer:
             ssl_context=ssl_context,
             max_response_bytes=max_response_bytes,
             allow_insecure=allow_insecure,
+            total_timeout=total_timeout,
         )
         self.actions = dict(actions or {"read": "read"})
         self.resource_kind = resource_kind
@@ -206,6 +213,7 @@ class CerbosAuthorizer:
         cerbos_action = self._action(action)
         principal = self._principal(subject)
         decisions: list[bool] = []
+        deadline = self._client.deadline()  # one for every batch of this check
         for start in range(0, len(hits), self.batch_size):
             batch = hits[start : start + self.batch_size]
             resources: list[dict[str, Any]] = [
@@ -218,7 +226,7 @@ class CerbosAuthorizer:
                 for h in batch
             ]
             payload = {"requestId": "wardowl", "principal": principal, "resources": resources}
-            answer = self._client.post_json("/api/check/resources", payload, "Cerbos CheckResources")
+            answer = self._client.post_json("/api/check/resources", payload, "Cerbos CheckResources", deadline=deadline)
             results = answer.get("results") if isinstance(answer, dict) else None
             if not isinstance(results, list) or len(results) != len(batch):
                 raise AuthorizationError("Cerbos CheckResources returned an unexpected response")
@@ -238,7 +246,9 @@ class CerbosAuthorizer:
             "principal": self._principal(subject),
             "resource": self._versioned({"kind": self.resource_kind}),
         }
-        answer = self._client.post_json("/api/plan/resources", payload, "Cerbos PlanResources")
+        answer = self._client.post_json(
+            "/api/plan/resources", payload, "Cerbos PlanResources", deadline=self._client.deadline()
+        )
         plan = answer.get("filter") if isinstance(answer, dict) else None
         if not isinstance(plan, dict) or plan.get("kind") not in (
             "KIND_ALWAYS_ALLOWED",

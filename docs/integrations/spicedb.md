@@ -110,6 +110,13 @@ with each one, not by position. A conditional answer (a caveat whose context was
 not a decision and raises `AuthorizationError`; supply caveat context with
 `caveat_context=lambda subject: {...}`.
 
+The requests are sent one after another. A check of r distinct resources for s subjects (the user,
+plus each group with `group_subjects=True`) sends r × s / `batch_size` requests, rounded up, and
+`filter_for` sends one LookupResources request per subject. `timeout=` bounds each request.
+`total_timeout=` (seconds; no bound by default) bounds all the requests of one `check` or
+`filter_for` together: once it runs out, the request in flight is abandoned, nothing more is sent,
+and the call raises `AuthorizationError` caused by a `TimeoutError`.
+
 ## Pre-filtering
 
 `filter_for` calls LookupResources for the user (and, with `group_subjects=True`, for each group
@@ -164,8 +171,9 @@ is not held for `ttl`; the bound is then the staleness alone, plus `local_ttl` o
 ## Failures
 
 Every failure raises `AuthorizationError`, so retrieval returns nothing: an unreachable server, a
-timeout (`timeout=`, 2 seconds by default, for the whole call except the DNS lookup of the host, as
-[for OPA](opa.md#failing-closed)), an HTTP error, a malformed answer or one larger than
+timeout (`timeout=`, 2 seconds by default, for each request except the DNS lookup of the host, as
+[for OPA](opa.md#failing-closed); `total_timeout=` for a whole call, as [above](#checks)), an HTTP
+error, a malformed answer or one larger than
 `max_response_bytes=` (10 MiB by default), a per-item error, or a missing answer. Connections are
 reused, transient failures are retried once, and a `CircuitBreaker` can pause requests to a failing
 server (see [Operations](../operations.md#resilience-of-remote-permission-services)).
