@@ -580,7 +580,7 @@ for randomly generated corpora, permissions, users and queries, every strategy m
 ## Benchmarks
 
 On 57,600 real chunks (BEIR FiQA, Qwen3-Embedding-0.6B), across 33,000 retrievals, no wardowl
-strategy returned a single forbidden chunk. Filtering inside the search kept recall@10 at 0.949 or
+strategy returned a single forbidden chunk. Filtering inside the search kept recall@10 at 0.950 or
 better on pgvector for users who may read anywhere from 0.06% to 100% of the corpus, including when
 what they may read is far from what they ask about. Filtering after a top-10 search found almost
 nothing for selective permissions. Method, tables and caveats: [Benchmarks](https://muzakkirhussain011.github.io/wardowl/benchmarks.html).

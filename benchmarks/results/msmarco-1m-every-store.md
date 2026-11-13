@@ -1,10 +1,10 @@
 # MS MARCO, a million chunks, bge-small-en-v1.5, six stores: load benchmark results
 
 Run on 2026-11-08 with [`kaggle_stores.ipynb`](../kaggle_stores.ipynb) (plan `all-stores`, Kaggle
-version 1 of the notebook, 10,138 s in total) at commit `e3d3730`, on main with the 1.4.0 code. The
-stores took 2,265 s (Qdrant, the first, including reading and embedding the corpus), 1,681 s
-(Elasticsearch), 2,083 s (OpenSearch), 1,597 s (Weaviate), 721 s (LanceDB) and 1,071 s (Redis).
-The six stores ran one after another in one session, on the same machine, so their numbers compare
+version 1 of the notebook, 10,138 s in total) at commit `e3d3730`, the 1.4.0 release. The
+benchmark took 2,265 s on Qdrant (the first, including reading and embedding the corpus), 1,681 s
+on Elasticsearch, 2,083 s on OpenSearch, 1,597 s on Weaviate, 721 s on LanceDB and 1,071 s on
+Redis. The six stores ran one after another in one session, on the same machine, so their numbers compare
 directly; each was stopped and its data deleted before the next started. The session embedded the
 passages and questions once, with the same model as the [pgvector run](msmarco-1m-bge-small.md),
 and loaded every store with those vectors, so every store was measured on the same million vectors,

@@ -230,6 +230,14 @@ All notable changes are recorded here. The format follows
   run did exactly that: it set a 20-second deadline and left the request timeout at its default, so
   OpenFGA never started and its configuration was reported as a start-up timeout. The run now sets
   the request timeout as well.
+- The published benchmark results are now those of re-executions on 2026-11-07 and 2026-11-08,
+  each of the same notebook at the same commit as the run it replaces. The results files, the
+  Benchmarks page, the README and the pages that quote them give the new numbers; no wardowl
+  strategy leaked in any of them. Where a statement no longer held, it now says what the
+  re-execution measured: OpenSearch's first throughput setting ran at full speed (it was under 1
+  request a second in two of three runs before), and Elasticsearch's quantized default index took
+  more disk than `int8_hnsw` and `hnsw` rather than less. The Benchmarks page also no longer links a
+  LanceDB tuning run that does not exist, or lists Redis as not measured at a million chunks.
 
 ## [2.1.0] - 2026-10-24
 

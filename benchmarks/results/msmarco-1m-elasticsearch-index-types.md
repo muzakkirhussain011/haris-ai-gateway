@@ -41,7 +41,7 @@ Pre-filtered recall@10 and median latency, one query at a time:
 | 10% | 0.819, 5.6 ms | 0.930, 9.3 ms | 0.928, 9.4 ms |
 | 100% | 0.875, 7.0 ms | 0.971, 7.1 ms | 0.986, 7.4 ms |
 
-| Index | Size | Loading through `add` | Peak throughput (users, p99) | At 16 users (p99) |
+| Index | Size on disk | Loading through `add` | Peak throughput (users, p99) | At 16 users (p99) |
 |---|---|---|---|---|
 | `bbq_hnsw` (default) | 3.4 GiB | 17.1 min | 323 requests/s (16, 65 ms) | 323 requests/s (65 ms) |
 | `int8_hnsw` | 3.0 GiB | 19.8 min | 271 requests/s (16, 79 ms) | 271 requests/s (79 ms) |

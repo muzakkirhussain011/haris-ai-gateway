@@ -118,14 +118,15 @@ brute-force search in NumPy, for scale.
 
 **Filtering after the search does not work for selective permissions.** Naive top-k never leaks,
 but its recall is roughly the share of the corpus the user may read, and 0.001 or less when up to
-4.8% is readable and it is far from the query. wardowl's post-filtering widens the search and does far
+4.8% is readable and what is readable is far from the query. wardowl's post-filtering widens the
+search and does far
 better, yet at 1,000 candidates it still finds almost nothing for a user who may read 0.1% of a
 corpus, or 1% of one whose readable documents are unrelated to the question. It reports those
 results as incomplete (`complete=False` for 100% of them) rather than passing them off as an
 answer.
 
 **Pre-filtering holds recall at the index's own level across the whole range.** With the filter in
-the search, recall stays at 0.949 or better at every selectivity and in every layout, including
+the search, recall stays at 0.950 or better at every selectivity and in every layout, including
 the misaligned one, where post-filtering collapses. This is why `strategy="auto"` pre-filters
 whenever the authorizer can produce a filter.
 
@@ -301,22 +302,24 @@ Median latency of a pre-filtered retrieval, one query at a time, in milliseconds
   settings; they returned errors, not data. What the stores differ in is recall and speed at their
   defaults.
 - **Elasticsearch's lower recall comes from its default index.** For 384-dimensional vectors,
-  Elasticsearch 9.1 and later index with `bbq_hnsw`, a 1-bit quantization that saves memory and
-  costs recall, and the backend asks each shard for 100 candidates. Measured in a separate session
-  with `num_candidates=500`, `int8_hnsw` reached 0.986, 0.979, 0.930 and 0.971 pre-filtered recall
-  (0.1% to 100% readable) in 3.0 GiB, and full-precision `hnsw` 1.000, 1.000, 0.928 and 0.986 in
-  2.5 GiB, against 3.4 GiB for the default index here, at median latencies of 7.1 to 15.6 ms and
-  7.4 to 14.5 ms against 5.6 to 11.2 ms here
+  Elasticsearch 9.1 and later index with `bbq_hnsw`, a 1-bit quantization that costs recall, and
+  the backend asks each shard for 100 candidates. Measured in a separate session with
+  `num_candidates=500`, `int8_hnsw` reached 0.986, 0.979, 0.930 and 0.971 pre-filtered recall
+  (0.1% to 100% readable), and full-precision `hnsw` 1.000, 1.000, 0.928 and 0.986, at median
+  latencies of 7.1 to 15.6 ms and 7.4 to 14.5 ms against 5.6 to 11.2 ms here
   ([full results](https://github.com/muzakkirhussain011/wardowl/blob/main/benchmarks/results/msmarco-1m-elasticsearch-index-types.md)).
   The index type and the candidate count changed together, so part of the gain is the larger count.
+  The quantized default did not take less disk: just after loading, the index held 3.4 GiB here,
+  against 3.0 GiB with `int8_hnsw` and 2.5 GiB with `hnsw`. Memory use was not measured.
 - **Redis's recall falls as users may read more**, from 0.998 at 0.1% readable to 0.759 at 100%:
   its HNSW search keeps 10 candidates (`EF_RUNTIME`) by default, which a broad filter leaves too
   few of. Set `ef_runtime` on `RedisBackend` higher for users who may read most of the corpus.
 - **LanceDB, embedded, found about half the true top 10 at its defaults** (IVF_PQ without
   `refine_factor`), at every share readable: 0.457 to 0.501 from 0.1% to 10% readable, and 0.512
-  with everything readable; a
-  [tuning run](https://github.com/muzakkirhussain011/wardowl/blob/main/benchmarks/results/msmarco-1m-lancedb.md)
-  shows what `nprobes` and `refine_factor` buy.
+  with everything readable. A
+  [run of its own](https://github.com/muzakkirhussain011/wardowl/blob/main/benchmarks/results/msmarco-1m-lancedb.md),
+  at the same defaults, found 0.479 to 0.512; what `nprobes` and `refine_factor` buy has not been
+  measured.
 - **Post-filtering collapses for selective users on every store** (0.079 to 0.095 of the top 10 at
   0.1% readable): it is a property of post-filtering, not of any store, and the reason
   `strategy="auto"` pre-filters.
@@ -338,7 +341,7 @@ Median latency of a pre-filtered retrieval, one query at a time, in milliseconds
 Two corpora, two embedding models and a few hundred queries each; indexes at their default
 settings; a single 4-CPU machine, which in the load benchmark ran the store, OPA and the client
 together, so no network sat between them; local Chroma, not Chroma's distributed or cloud service;
-Milvus, MongoDB Atlas and Redis not yet measured at a million chunks, and LanceDB only at its
+Milvus and MongoDB Atlas not yet measured at a million chunks, and LanceDB only at its
 defaults; OpenFGA not
 measured; and under concurrent load, the per-store runs counted errors but did not check results
 (the pgvector run checked every chunk, and the harness now always does). Index tuning (pgvector
