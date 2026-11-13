@@ -231,6 +231,14 @@ All notable changes are recorded here. The format follows
   OpenFGA never started and its configuration was reported as a start-up timeout. The run now sets
   the request timeout as well.
 
+## [2.1.1] - 2026-11-13
+
+A security release from the 2.1 branch. It carries two fixes listed above under [Unreleased] and nothing else: `ChromaBackend` no longer sends Chroma a filter that can crash the process ([GHSA-pxx6-228g-4fw5](https://github.com/muzakkirhussain011/wardowl/security/advisories/GHSA-pxx6-228g-4fw5)), and `CachingAuthorizer.invalidate()` no longer lets a permission service that is itself behind refill the cache ([GHSA-3f2r-rrm4-mhwj](https://github.com/muzakkirhussain011/wardowl/security/advisories/GHSA-3f2r-rrm4-mhwj)), with `SpiceDBAuthorizer.max_staleness` and `CachingAuthorizer(source_staleness=...)`, which that fix needs. `RetrievalResult.complete` keeps its 2.1 meaning there. The full notes are on the [release page](https://github.com/muzakkirhussain011/wardowl/releases/tag/v2.1.1).
+
+## [2.0.2] - 2026-11-13
+
+The same two security fixes for the 2.0 branch, without 2.1.0's batched Chroma writes. The 2.0 line does not carry two security fixes of 2.1.0 that change behaviour (`SpiceDBAuthorizer`'s `group_subjects` default, and the text of the exception behind an `AuthorizationError` in its message); its notes say how to get them. The full notes are on the [release page](https://github.com/muzakkirhussain011/wardowl/releases/tag/v2.0.2).
+
 ## [2.1.0] - 2026-10-24
 
 Fixes found by real-world acceptance scenarios, run against real servers, a real identity provider
@@ -1455,7 +1463,9 @@ needed, in which case it will be announced in a second release candidate. Instal
 - The project is now `wardowl`, a permission-aware retrieval library (ADR 0005). The earlier
   Rampart gateway lives on as an example deployment in `examples/gateway`.
 
-[Unreleased]: https://github.com/muzakkirhussain011/wardowl/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/muzakkirhussain011/wardowl/compare/v2.1.1...HEAD
+[2.1.1]: https://github.com/muzakkirhussain011/wardowl/compare/v2.1.0...v2.1.1
+[2.0.2]: https://github.com/muzakkirhussain011/wardowl/compare/v2.0.1...v2.0.2
 [2.1.0]: https://github.com/muzakkirhussain011/wardowl/compare/v2.0.1...v2.1.0
 [2.0.1]: https://github.com/muzakkirhussain011/wardowl/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/muzakkirhussain011/wardowl/compare/v1.6.0...v2.0.0
