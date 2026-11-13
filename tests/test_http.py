@@ -226,6 +226,55 @@ def test_breaker_and_client_validate_their_settings():
         OPAAuthorizer("http://opa:8181", max_response_bytes=0)
 
 
+def test_total_timeout_must_be_a_positive_number_of_seconds():
+    for bad in (0, -1, float("nan"), float("inf"), True, "5"):
+        with pytest.raises(ValueError, match="total_timeout"):
+            JsonClient("http://opa:8181", service="t", timeout=1, headers={}, total_timeout=bad)
+        with pytest.raises(ValueError, match="total_timeout"):
+            SpiceDBAuthorizer("http://spicedb:8443", total_timeout=bad)
+    assert JsonClient("http://opa:8181", service="t", timeout=1, headers={}).deadline() is None
+    client = JsonClient("http://opa:8181", service="t", timeout=1, headers={}, total_timeout=5)
+    assert 4 < client.deadline() - time.monotonic() <= 5
+
+
+def test_total_timeout_ends_the_request_in_flight_and_sends_nothing_after_it(server):
+    breaker = CircuitBreaker(failures=1)
+    client = JsonClient(server.url, service="test", timeout=2.0, headers={}, breaker=breaker, total_timeout=0.3)
+    payload = {"input": {"subject": {"id": "bob", "groups": ["eng"]}, "resources": []}}
+    deadline = client.deadline()  # one call's: shared by all its requests
+    assert client.post_json("/x", payload, "test", deadline=deadline) == {"result": []}
+    server.script = ["slow"]  # answers after 0.4 s: past total_timeout, well within timeout
+    with pytest.raises(AuthorizationError, match="timed out: total_timeout ran out") as cut:
+        client.post_json("/x", payload, "test", deadline=deadline)
+    assert isinstance(cut.value.__cause__, TimeoutError)
+    # A socket's timeout can fire a little before time.monotonic() reaches the deadline (Windows'
+    # clock is coarse), and a request with time left is still sent: wait until none is left.
+    while time.monotonic() <= deadline:
+        time.sleep(0.01)
+    with pytest.raises(AuthorizationError, match="was not sent: total_timeout ran out") as late:
+        client.post_json("/x", payload, "test", deadline=deadline)
+    assert isinstance(late.value.__cause__, TimeoutError) and len(server.requests) == 2
+    # The caller ran out of time, which shows nothing about the service: the breaker stays closed.
+    assert not breaker.is_open
+    assert client.post_json("/x", payload, "test", deadline=client.deadline()) == {"result": []}  # a new call
+
+
+def test_a_probe_released_without_an_outcome_leaves_the_breaker_open_for_the_next_one():
+    now = [0.0]
+    breaker = CircuitBreaker(failures=1, reset_after=10, clock=lambda: now[0])
+    breaker.allow()
+    breaker.record(False)
+    now[0] = 10.0
+    breaker.allow()  # the probe
+    with pytest.raises(AuthorizationError):
+        breaker.allow()  # one probe at a time
+    breaker.release()
+    assert breaker.is_open
+    breaker.allow()  # the next probe
+    breaker.record(True)
+    assert not breaker.is_open
+
+
 def test_timeout_bounds_the_whole_call_not_each_read(server):
     # The answer arrives a byte every 20 ms: each read is quick, the whole would take about 2 s.
     server.script = ["drip"]

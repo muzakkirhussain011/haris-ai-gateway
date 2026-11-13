@@ -85,7 +85,7 @@ says why. The table shows what each failure looks like.
 
 | What fails | What wardowl does | What you see |
 |---|---|---|
-| The permission service is down, slow or erroring | Raises `AuthorizationError` after the timeout and retries; with a circuit breaker open, at once | `wardowl.retrievals` with `error.type = AuthorizationError`; no results reach the model |
+| The permission service is down, slow or erroring | Raises `AuthorizationError` after the timeout and retries, or when an authorizer's `total_timeout` for the whole check runs out; with a circuit breaker open, at once | `wardowl.retrievals` with `error.type = AuthorizationError`; no results reach the model |
 | The permission service gives a malformed answer (wrong count, non-booleans, not a filter) | Raises `AuthorizationError`; never caches the answer | As above |
 | The vector store is down | Raises the store client's own error; nothing is returned | `error.type` names that error |
 | The vector store ignores or mistranslates the filter | The re-check drops every chunk outside it | `violations > 0` on the result, the event and the `wardowl.violations` metric |

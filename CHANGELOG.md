@@ -70,6 +70,16 @@ All notable changes are recorded here. The format follows
   (without `indexed_only`). In vector mode, `count` asks Qdrant for an exact count, and
   `search(..., exact=True)` searches with a copy of `search_params` that sets `exact=True` and
   `indexed_only=False`. ACORN is set through `search_params`, as before.
+- `total_timeout=...` on `KetoAuthorizer`, `SpiceDBAuthorizer`, `OpenFGAAuthorizer` and
+  `CerbosAuthorizer`, in seconds: one deadline for all the requests of one `check` or
+  `filter_for`. These authorizers send a large check as several requests, one after another, and
+  `timeout` bounds each request alone, so a check could take its number of requests times
+  `timeout`: for Keto with `group_subjects=True`, 1,000 candidates for a subject in 20 groups is
+  2,100 requests. Once `total_timeout` runs out, the request in flight is abandoned, nothing more
+  is sent, and the call raises `AuthorizationError` caused by a `TimeoutError`. A request it cut
+  short counts as neither a success nor a failure for a `CircuitBreaker`, which gains `release()`
+  for that. None, the default, sets no bound, as before. Each authorizer's page now gives its
+  number of requests per check.
 - `wardowl.UnsupportedSubject`, raised by an authorizer when its permission service cannot represent
   the subject's id or one of its groups, before anything is sent. It is an `AuthorizationError`, so
   code that catches that and retrieval behave as before (retrieval fails closed), and a

@@ -61,6 +61,22 @@ def test_batch_check_dedupes_resources_batches_requests_and_sends_groups(fga):
     }
 
 
+def test_total_timeout_bounds_every_batch_of_a_check_together(fga):
+    def slow(path, payload):
+        time.sleep(0.15)
+        return _all_allowed(path, payload)
+
+    fga.responder = slow
+    hits = [Hit(f"c{i}", "t", 1.0, {"doc_id": f"d{i}"}) for i in range(20)]
+    authz = OpenFGAAuthorizer(fga.url, "store1", batch_size=1, timeout=2.0, total_timeout=0.4)
+    with pytest.raises(AuthorizationError, match="total_timeout ran out") as failure:
+        authz.check(BOB, hits)
+    assert isinstance(failure.value.__cause__, TimeoutError) and len(fga.requests) <= 3
+    fga.requests.clear()
+    fga.responder = _all_allowed
+    assert authz.check(BOB, hits) == [True] * 20 and len(fga.requests) == 20  # its own deadline
+
+
 def test_chunks_without_a_resource_id_are_denied_without_asking(fga):
     authz = OpenFGAAuthorizer(fga.url, "s")
     assert authz.check(BOB, [Hit("c1", "t", 1.0, {})]) == [False]

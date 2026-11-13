@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -158,6 +159,31 @@ def test_filter_for_reads_the_lookup_stream(server):
     assert SpiceDBAuthorizer(server.url, group_subjects=True).filter_for(ANN) == In("doc_id", ["d1"])
     assert [p["subject"]["object"]["objectId"] for _, p, _ in server.requests] == ["ann", "eng"]
     assert server.requests[0][1]["optionalLimit"] == 1000
+
+
+def test_total_timeout_bounds_every_lookup_and_batch_of_one_call_together(server):
+    has = "LOOKUP_PERMISSIONSHIP_HAS_PERMISSION"
+    lookup = _lookup({"result": {"resourceObjectId": "d1", "permissionship": has}})
+    bulk = _bulk(set())
+
+    def slow(path, payload):
+        time.sleep(0.15)
+        return (lookup if path.endswith("/resources") else bulk)(path, payload)
+
+    server.responder = slow
+    many = Subject("ann", [f"g{i}" for i in range(20)])  # one lookup each, one after another
+    authz = SpiceDBAuthorizer(server.url, group_subjects=True, batch_size=1, timeout=2.0, total_timeout=0.4)
+    with pytest.raises(AuthorizationError, match="total_timeout ran out") as failure:
+        authz.filter_for(many)
+    assert isinstance(failure.value.__cause__, TimeoutError) and len(server.requests) <= 3
+    server.requests.clear()
+    with pytest.raises(AuthorizationError, match="total_timeout ran out"):
+        authz.check(many, HITS)  # 2 resources x 21 subjects, one pair per request
+    assert len(server.requests) <= 3
+    server.requests.clear()
+    # Each call has its own deadline: a quick call after a slow one is not refused.
+    server.responder = lambda path, payload: (lookup if path.endswith("/resources") else bulk)(path, payload)
+    assert authz.filter_for(ANN) == In("doc_id", ["d1"])
 
 
 def test_a_possibly_truncated_or_conditional_lookup_gives_no_filter(server):

@@ -40,6 +40,11 @@ class KetoAuthorizer:
     tuples, 10 unless configured otherwise. Raise both together. `timeout`, `retries`,
     `circuit_breaker`, `ssl_context`, `max_response_bytes` and `allow_insecure` work as in
     `OPAAuthorizer`. Every failure raises `AuthorizationError`.
+
+    The batches of one `check` are sent one after another: one request per `batch_size` tuples,
+    and a chunk is one tuple, plus one per group with `group_subjects`. `timeout` bounds each
+    request; `total_timeout` (seconds; None, the default, for no bound) bounds all the requests of
+    one `check` together, so that the call raises `AuthorizationError` once it runs out.
     """
 
     def __init__(
@@ -60,6 +65,7 @@ class KetoAuthorizer:
         ssl_context: ssl.SSLContext | None = None,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         allow_insecure: bool = False,
+        total_timeout: float | None = None,
     ) -> None:
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
@@ -73,6 +79,7 @@ class KetoAuthorizer:
             ssl_context=ssl_context,
             max_response_bytes=max_response_bytes,
             allow_insecure=allow_insecure,
+            total_timeout=total_timeout,
         )
         self.namespace = namespace
         self.actions = dict(actions or {"read": "view"})
@@ -115,9 +122,12 @@ class KetoAuthorizer:
                 tuples.append({"namespace": self.namespace, "object": obj, "relation": relation, **who})
                 owners.append(index)
         allowed = [False] * len(hits)
+        deadline = self._client.deadline()  # one for every batch of this check
         for start in range(0, len(tuples), self.batch_size):
             batch = tuples[start : start + self.batch_size]
-            answer = self._client.post_json("/relation-tuples/batch/check", {"tuples": batch}, "Keto batch check")
+            answer = self._client.post_json(
+                "/relation-tuples/batch/check", {"tuples": batch}, "Keto batch check", deadline=deadline
+            )
             results = answer.get("results") if isinstance(answer, dict) else None
             if not isinstance(results, list) or len(results) != len(batch):
                 raise AuthorizationError("Keto returned an unexpected number of check results")

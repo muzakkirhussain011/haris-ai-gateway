@@ -56,6 +56,12 @@ resourcePolicy:
 request) and reads `EFFECT_ALLOW` or `EFFECT_DENY` for each. An answer for a different resource, a
 missing or unknown effect, or a wrong number of results raises `AuthorizationError`.
 
+The requests are sent one after another: n chunks take n / `batch_size` of them, rounded up.
+`timeout=` bounds each request. `total_timeout=` (seconds; no bound by default) bounds all the
+requests of one `check` or `filter_for` together: once it runs out, the request in flight is
+abandoned, nothing more is sent, and the call raises `AuthorizationError` caused by a
+`TimeoutError`.
+
 ## Pre-filtering from query plans
 
 `filter_for` asks PlanResources which documents the principal may read. Cerbos answers with a query
@@ -87,8 +93,9 @@ attribute in the shape the policy assumes.
 ## Failures
 
 Every failure raises `AuthorizationError`, so retrieval returns nothing. `timeout=` (2 seconds by
-default) bounds the whole call except the DNS lookup of the host
-([OPA](opa.md#failing-closed) explains), and an answer larger than `max_response_bytes=` (10 MiB by
+default) bounds each request except the DNS lookup of the host
+([OPA](opa.md#failing-closed) explains), `total_timeout=` bounds a whole call ([above](#checks)),
+and an answer larger than `max_response_bytes=` (10 MiB by
 default) is refused. An `Authorization` header over `http://` to another machine needs
 `allow_insecure=True`, as for [OPA](opa.md#failing-closed). Connections are reused, transient
 failures are retried once, and a `CircuitBreaker` can pause requests to a failing PDP (see

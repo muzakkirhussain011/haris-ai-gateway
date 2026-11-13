@@ -198,6 +198,13 @@ and `KetoAuthorizer`, share an HTTP client built for permission checks on every 
   effects. Timeouts are not retried, and neither are other HTTP errors or invalid answers, so the
   worst case is one `timeout`, plus the DNS lookup when a connection is opened, which only the
   system resolver's settings bound (see [OPA](integrations/opa.md#failing-closed)).
+- **One deadline for a whole check**, with `total_timeout`. `timeout` bounds each request, and
+  `KetoAuthorizer`, `SpiceDBAuthorizer`, `OpenFGAAuthorizer` and `CerbosAuthorizer` send a large
+  check as several requests, one after another, so without it a check can take its number of
+  requests times `timeout`. `total_timeout` bounds all the requests of one `check` or `filter_for`
+  together: once it runs out, nothing more is sent and the call raises `AuthorizationError`. A
+  request it cuts short counts as neither a success nor a failure for the circuit breaker, since
+  it says nothing about the service. Each authorizer's page gives its number of requests per check.
 - **A circuit breaker** pauses requests to a service that keeps failing, so retries do not pile on
   during an outage. Retrieval fails closed either way; the breaker makes it fail fast.
 - **Redirects are never followed**, and the standard `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY`
@@ -217,6 +224,7 @@ authorizer = OpenFGAAuthorizer(
     "https://openfga.internal:8443",
     store_id,
     timeout=1.0,
+    total_timeout=3.0,  # every request of one check together
     circuit_breaker=CircuitBreaker(failures=5, reset_after=30),
     ssl_context=tls,
 )
