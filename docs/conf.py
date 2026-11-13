@@ -26,7 +26,7 @@ source_suffix = {".md": "markdown"}
 templates_path = ["_templates"]
 # The architecture decision records describe the project's history (including the gateway it grew
 # out of); they are linked from the contributing page on GitHub rather than built into the site.
-exclude_patterns = ["_build", "adr", "_static", "_templates"]
+exclude_patterns = ["_build", "adr", "_static", "_templates", "_extra"]
 
 myst_enable_extensions = ["colon_fence", "deflist", "attrs_inline"]
 myst_heading_anchors = 3
@@ -105,5 +105,10 @@ html_sidebars = {"**": ["sidebars/localtoc.html", "sidebars/edit-this-page.html"
 # and the front page's 3D logo (hero.js, with three.js vendored in _static/vendor).
 html_static_path = ["_static"]
 html_css_files = ["brand.css"]
+# Copied as they are to the top of the site: the IndexNow key, which search engines that take part
+# in IndexNow (Bing among them) fetch to accept change notifications for the site's pages. The key
+# is public by design. The file sits under /wardowl/, not at the host's root, so every notification
+# names it as keyLocation, and that limits the key to URLs under /wardowl/.
+html_extra_path = ["_extra"]
 # The theme's script is added at priority 500; the icons must be registered before it starts.
 html_js_files = [("wo-icons.js", {"priority": 400})]

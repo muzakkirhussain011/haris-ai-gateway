@@ -8,13 +8,15 @@ description: Answers to common questions about wardowl, permission-aware retriev
 
 wardowl is an open-source Python library (MIT) for permission-aware retrieval in RAG. It sits
 between your application and your vector store. For each question it asks your permission system
-what the user may read, applies that as a filter inside the store's search, and checks every hit
-again before anything reaches the LLM prompt. Each user gets only the chunks they are allowed to
-read.
+what the user may read. When the system can express that as a filter (OpenFGA, SpiceDB, Cerbos,
+access lists on the chunks, and OPA when its policy returns one), the filter goes inside the
+store's search and every hit is checked again; Cedar, Casbin and Ory Keto check each candidate
+after the search instead. Each user gets only the chunks they are allowed to read, and an error
+from the permission system returns nothing.
 
 ## How do I stop a RAG chatbot from showing users documents they are not allowed to see?
 
-Enforce permissions at retrieval, before the LLM sees any text. Telling the model in a prompt to
+Enforce document permissions at retrieval, before the LLM sees any text. Telling the model in a prompt to
 withhold documents does not work, because whatever reaches the prompt can come out in the answer.
 With wardowl, you pass the authenticated user to `PermissionedRetriever.retrieve`. It returns only
 chunks that user may read, and on any error from the permission system it returns nothing rather
