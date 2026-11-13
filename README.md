@@ -32,8 +32,9 @@
 </p>
 
 A RAG answer can quote a chunk that the person asking is not allowed to read, because vector search
-ranks chunks by similarity, not by permission. **wardowl stops that:** it applies your permission
-system inside the vector store's search, checks every hit again and fails closed.
+ranks chunks by similarity, not by permission. **wardowl stops that:** it puts your permission
+system's filter inside the vector store's search when the system can express one, checks every hit
+before it is returned and fails closed.
 
 ```bash
 pip install wardowl
@@ -76,11 +77,12 @@ async equivalent, with the same arguments and guarantees.
 </p>
 
 **wardowl** is an open-source Python library for permission-aware retrieval in RAG
-(retrieval-augmented generation). It applies your permission system (OpenFGA, SpiceDB, OPA, Cerbos,
-Cedar, access lists or your own rules) inside your vector store's search (pgvector, Pinecone,
-Qdrant, Elasticsearch, Milvus and more), checks every hit again and fails closed, so each user's
-LLM prompt holds only the documents that user is allowed to read. It was called needtoknow before
-version 2.0.
+(retrieval-augmented generation). When your permission system can express what a user may read as
+a filter (OpenFGA, SpiceDB, Cerbos, access lists on the chunks, and OPA when its policy returns
+one), wardowl puts that filter inside your vector store's search (pgvector, Pinecone, Qdrant,
+Elasticsearch, Milvus and more) and checks every hit again. Cedar, Casbin and Ory Keto check each
+candidate after the search instead. Either way it fails closed, so each user's LLM prompt holds
+only the documents that user is allowed to read. It was called needtoknow before version 2.0.
 
 ## Why
 

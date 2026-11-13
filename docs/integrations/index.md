@@ -1,4 +1,11 @@
+---
+description: Every vector store, permission system and framework wardowl works with, what each needs installed, and whether it filters inside the search.
+---
+
 # Integrations
+
+This page lists every vector store, permission system and framework wardowl works with, what each
+one needs installed, and whether it applies the permission filter inside the search.
 
 Each integration is an optional extra, so the core stays free of dependencies. The OPA, OpenFGA,
 SpiceDB, Cerbos and Keto authorizers need no extra at all: they use the standard library's HTTP

@@ -291,6 +291,11 @@ All notable changes are recorded here. The format follows
   run did exactly that: it set a 20-second deadline and left the request timeout at its default, so
   OpenFGA never started and its configuration was reported as a start-up timeout. The run now sets
   the request timeout as well.
+- Corrected how the README, the FAQ and the site's description for search engines summed up
+  wardowl. They said it applies every listed permission system inside the vector store's search.
+  The filter goes inside the search only when the permission system can express one (OpenFGA,
+  SpiceDB, Cerbos, access lists, and OPA when its policy returns one); Cedar, Casbin and Ory Keto
+  check each candidate after the search, as the integrations tables already said.
 - The published benchmark results are now those of re-executions on 2026-11-07 and 2026-11-08,
   each of the same notebook at the same commit as the run it replaces. The results files, the
   Benchmarks page, the README and the pages that quote them give the new numbers; no wardowl
