@@ -11,6 +11,11 @@ An authorizer can answer two questions:
   every chunk it matches is readable, such as the subject's tenant. When there is no exact
   filter, post-filtering searches only inside the scope and still checks each candidate.
 
+An authorizer whose answers can come from data older than now, such as SpiceDB's under
+`minimizeLatency`, may declare `max_staleness`: the most seconds old that data can be.
+`CachingAuthorizer` reads it to know how long after `invalidate()` an answer can still predate the
+change. Without the attribute, answers count as current.
+
 `AllOf` and `AnyOf` combine authorizers, and `TenantAuthorizer` keeps each subject inside its
 tenant. Any failure to decide must raise `AuthorizationError`. The retriever then returns nothing: it fails
 closed and never falls back to unfiltered results.
@@ -19,6 +24,7 @@ closed and never falls back to unfiltered results.
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol, runtime_checkable
 
@@ -38,6 +44,20 @@ __all__ = [
 
 class AuthorizationError(RuntimeError):
     """The authorizer could not make a decision. No results are returned."""
+
+
+def _staleness(value: Any) -> float:
+    """A declared staleness: a finite number of seconds, zero or more. None, undeclared, is 0."""
+    if value is None:
+        return 0.0
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise ValueError(f"a staleness is a finite number of seconds, zero or more, not {value!r}")
+    return float(value)
+
+
+def _stalest(authorizers: Sequence[Any]) -> float:
+    """The largest `max_staleness` that any of `authorizers` declares (0 when none does)."""
+    return max(_staleness(getattr(a, "max_staleness", None)) for a in authorizers)
 
 
 @runtime_checkable
@@ -150,13 +170,19 @@ class AllOf:
     about the chunks every earlier one allowed, so put cheap ones first. The pre-filter is the
     conjunction of every authorizer's filter, or none when one of them has none; `scope_for` then
     gives the conjunction of the filters that do exist, so post-filtering searches only inside
-    them (for example only the subject's tenant).
+    them (for example only the subject's tenant). `max_staleness` is the largest any of them
+    declares.
     """
 
     def __init__(self, *authorizers: Authorizer) -> None:
         if not authorizers:
             raise ValueError("AllOf needs at least one authorizer")
         self.authorizers = authorizers
+
+    @property
+    def max_staleness(self) -> float:
+        """The largest `max_staleness` of the authorizers combined: an answer is as old as its oldest part."""
+        return _stalest(self.authorizers)
 
     def check(self, subject: Subject, hits: Sequence[Hit], action: str = "read") -> list[bool]:
         allowed = [True] * len(hits)
@@ -202,13 +228,19 @@ class AnyOf:
     `AnyOf(MetadataACLAuthorizer(), OPAAuthorizer(...))`. Authorizers are asked in order, each only
     about the chunks every earlier one denied. The pre-filter is the disjunction of every
     authorizer's filter, or none when one of them has none; `scope_for` is the disjunction of
-    every authorizer's filter or scope, or none when one has neither.
+    every authorizer's filter or scope, or none when one has neither. `max_staleness` is the
+    largest any of them declares.
     """
 
     def __init__(self, *authorizers: Authorizer) -> None:
         if not authorizers:
             raise ValueError("AnyOf needs at least one authorizer")
         self.authorizers = authorizers
+
+    @property
+    def max_staleness(self) -> float:
+        """The largest `max_staleness` of the authorizers combined: an answer is as old as its oldest part."""
+        return _stalest(self.authorizers)
 
     def check(self, subject: Subject, hits: Sequence[Hit], action: str = "read") -> list[bool]:
         allowed = [False] * len(hits)

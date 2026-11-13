@@ -6,6 +6,82 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.0.2] - 2026-11-08
+
+A security release for 2.0. It carries two fixes from the main branch and nothing else: Chroma no
+longer receives a filter that can crash the process, and `CachingAuthorizer.invalidate()` no longer
+lets a permission service that is itself behind refill the cache with a decision from before the
+change. Upgrade if you use `ChromaBackend`, or `CachingAuthorizer` with `invalidate()`.
+
+2.1.0 fixed two more security problems that the 2.0 line does not carry, because each changes
+behaviour: `SpiceDBAuthorizer` checked the user's groups as subjects of their own by default
+(`group_subjects=True`), so under an exclusion such as `viewer - banned` a banned user still read a
+document granted to their group; and `AuthorizationError` messages carried the text of the exception
+behind them, which agent tools can show to a model. Upgrade to 2.1.1 for both. On 2.0, pass
+`group_subjects=False` and write group memberships to SpiceDB if your permissions exclude or
+intersect.
+
+### Security
+
+- `ChromaBackend` no longer sends Chroma a filter that can crash the application. With chromadb
+  1.5.9's embedded client, the first search by a subject in 40,000 groups ended the Python process
+  with a segmentation fault, without an exception or a message, in 5 of 5 processes (the filter-size
+  experiment for the paper). Anyone whose filter grows that large, through groups that users can
+  create and join themselves or an authorizer that lists that many values, could stop the
+  application for every user with one search. The cause inside Chroma is not established, and the
+  smallest filter that crashes was not measured (10,000 groups gave an error instead); a Chroma
+  server on a single node runs the same code. wardowl now sends a `where` only within bounds well
+  below anything Chroma refused or crashed on: 10,000 SQL parameters, an expression 250 deep, 32
+  levels of `$and` and `$or`, and 500,000 characters. Larger filters are applied by the backend
+  itself (see Fixed).
+- `CachingAuthorizer.invalidate()` no longer lets a permission service that is itself behind refill
+  the cache with a decision from before the change. After `invalidate()`, the next retrieval asked
+  the service, which could still answer from a stale snapshot (SpiceDB under `minimizeLatency`,
+  Cerbos before reloading a policy), and the cache kept that answer for its whole `ttl`. In the
+  paper's experiment X7, all 40 SpiceDB revocations with `invalidate()` took the full 30-second
+  `ttl` (a median 30.04 s, against a stated 5.5 s), 39 of 40 on a second replica, and Cerbos's took
+  as long. Now, for `source_staleness` seconds after `invalidate()`, answers for the subject (or
+  for everyone) are passed on and cached nowhere: not in the process, and not in the shared cache,
+  whose epoch carries the end of the hold so that every replica holds back too. The bound after
+  `invalidate()` is the service's own staleness when `source_staleness` covers it, plus `local_ttl`
+  on other replicas. With `source_staleness` 0, the default for every authorizer but
+  `SpiceDBAuthorizer` without `fullyConsistent`, nothing changes. Replicas of earlier versions
+  sharing the cache during an upgrade do not see the hold.
+
+### Added
+
+- `ChromaBackend(fallback_candidates=...)`, how many chunks a search reads when its filter is too
+  large to send to Chroma whole (1,000 by default), and `wardowl.backends.chroma.FilterTooLarge`,
+  the `ValueError` that `filter_to_where` raises for such a filter. See Fixed.
+- `CachingAuthorizer(source_staleness=...)`: how many seconds old the data behind the wrapped
+  authorizer's answers can be. By default it is the authorizer's `max_staleness`, an optional
+  attribute an authorizer declares when it can answer from stale data, or 0 when it declares none.
+  `SpiceDBAuthorizer.max_staleness` follows its consistency (11 seconds, twice the bound SpiceDB
+  documents for its default settings, or 0 with `fullyConsistent`; `max_staleness=` sets it),
+  `AllOf` and `AnyOf` declare the largest of their parts', and `CachingAuthorizer.max_staleness` is
+  its `ttl` plus `source_staleness`, for a cache that wraps another. See Security.
+
+These are new, optional parameters and attributes, added in a patch release because the security
+fixes need them; nothing existing changes for code that does not use them.
+
+### Fixed
+
+- `ChromaBackend` answers subjects in 1,000 groups or more. Chroma 1.5 writes each `$or` as one
+  binary OR per clause, and SQLite refuses an expression more than 1,000 deep, so the flat `$or`
+  wardowl sent made every search by such a subject fail with
+  `Expression tree is too large (maximum depth 1000)`. The conformance campaign and the filter-size
+  experiment for the paper both found it at 1,000 values. Each `$and` and `$or` now holds at most
+  16 clauses, nested as a balanced tree, which Chroma keeps nested: about 50 levels deep for 1,000
+  groups instead of 1,000. A filter beyond the bounds under Security (with `MetadataACLAuthorizer`,
+  a subject in more than about 3,200 groups with short names) is no longer sent whole: the search
+  sends the part of it every match must meet, such as a tenant, if that fits, or no `where`; reads
+  `fallback_candidates` chunks (1,000, or `k` if more); and applies the filter to them itself. It
+  never returns a chunk the filter excludes, but can return fewer than `k` hits though more chunks
+  match. In 2.0, `RetrievalResult.complete` does not flag such a short pre-filtered result; raise
+  `fallback_candidates` if such subjects need more. `filter_to_where` returns the nested form and
+  raises `FilterTooLarge` beyond the bounds. CI searches real Chroma for subjects in 1,001 and in
+  40,000 groups, and checks that Chroma reads nested trees exactly as the reference semantics.
+
 ## [2.0.1] - 2026-10-24
 
 The wardowl logo arrives, on PyPI, in the README and in 3D on the documentation's front page, and
@@ -1071,7 +1147,8 @@ needed, in which case it will be announced in a second release candidate. Instal
 - The project is now `wardowl`, a permission-aware retrieval library (ADR 0005). The earlier
   Rampart gateway lives on as an example deployment in `examples/gateway`.
 
-[Unreleased]: https://github.com/muzakkirhussain011/wardowl/compare/v2.0.1...HEAD
+[Unreleased]: https://github.com/muzakkirhussain011/wardowl/compare/v2.0.2...HEAD
+[2.0.2]: https://github.com/muzakkirhussain011/wardowl/compare/v2.0.1...v2.0.2
 [2.0.1]: https://github.com/muzakkirhussain011/wardowl/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/muzakkirhussain011/wardowl/compare/v1.6.0...v2.0.0
 [1.6.0]: https://github.com/muzakkirhussain011/wardowl/compare/v1.5.0...v1.6.0

@@ -13,7 +13,16 @@ from helpers import corpora, oracle_top_k, queries, subjects
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from wardowl import AuthorizationError, Document, Hit, In, InMemoryBackend, PermissionedRetriever, Subject
+from wardowl import (
+    AuthorizationError,
+    CachingAuthorizer,
+    Document,
+    Hit,
+    In,
+    InMemoryBackend,
+    PermissionedRetriever,
+    Subject,
+)
 from wardowl.authorizers.spicedb import SpiceDBAuthorizer
 from wardowl.testing import check_authorizer
 
@@ -146,6 +155,19 @@ def test_a_possibly_truncated_or_conditional_lookup_gives_no_filter(server):
         {"result": {"resourceObjectId": "d1", "permissionship": "LOOKUP_PERMISSIONSHIP_CONDITIONAL_PERMISSION"}}
     )
     assert SpiceDBAuthorizer(server.url).filter_for(ANN) is None
+
+
+def test_max_staleness_follows_the_consistency_unless_it_is_given():
+    # Read by CachingAuthorizer, which keeps nothing for that long after invalidate().
+    assert SpiceDBAuthorizer("http://127.0.0.1:1").max_staleness == 11.0  # minimizeLatency, twice SpiceDB's 5.5 s
+    assert SpiceDBAuthorizer("http://127.0.0.1:1", consistency={"fullyConsistent": True}).max_staleness == 0.0
+    token = {"atLeastAsFresh": {"token": "GhUKEzE2NjE"}}
+    assert SpiceDBAuthorizer("http://127.0.0.1:1", consistency=token).max_staleness == 11.0
+    assert SpiceDBAuthorizer("http://127.0.0.1:1", consistency=token, max_staleness=0).max_staleness == 0.0
+    assert CachingAuthorizer(SpiceDBAuthorizer("http://127.0.0.1:1", max_staleness=3)).source_staleness == 3.0
+    for bad in (-1, float("nan"), float("inf"), True):
+        with pytest.raises(ValueError, match="staleness"):
+            SpiceDBAuthorizer("http://127.0.0.1:1", max_staleness=bad)
 
 
 @pytest.mark.parametrize(

@@ -11,9 +11,21 @@ import contextlib
 import json
 import os
 import uuid
+from unittest import mock
 
 import pytest
-from helpers import QUERY, HashingEmbedder, corpora, expected_ids, filters, labelled_docs, may_read, queries, subjects
+from helpers import (
+    QUERY,
+    HashingEmbedder,
+    chroma_where_matches,
+    corpora,
+    expected_ids,
+    filters,
+    labelled_docs,
+    may_read,
+    queries,
+    subjects,
+)
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
@@ -177,6 +189,138 @@ def test_chroma_search_drops_a_hit_only_a_stale_list_field_matches(chroma_factor
     assert backend.search("leave plan", 5, In("allowed_groups", ["eng"])) == []
     (hit,) = backend.search("leave plan", 5, In("allowed_groups", ["sales"]))
     assert hit.id == "a" and hit.metadata == {"allowed_groups": ["sales"]}
+
+
+class SearchableChroma:
+    """Enough of a Chroma collection to search: it answers with the stored records a `where` admits,
+    in order of id and all at distance 0.5, and keeps each query's `where` and `n_results`."""
+
+    def __init__(self):
+        self.records = {}
+        self.queries = []
+
+    def count(self):
+        return len(self.records)
+
+    def add(self, ids, documents, metadatas, embeddings=None):
+        for doc_id, text, metadata in zip(ids, documents, metadatas, strict=True):
+            self.records[doc_id] = (text, dict(metadata))
+
+    def delete(self, ids):
+        for doc_id in ids:
+            self.records.pop(doc_id, None)
+
+    def query(self, n_results, include, where=None, **embedded):
+        self.queries.append({"where": where, "n_results": n_results})
+        found = [i for i in sorted(self.records) if where is None or chroma_where_matches(where, self.records[i][1])]
+        found = found[:n_results]
+        return {
+            "ids": [found],
+            "documents": [[self.records[i][0] for i in found]],
+            "metadatas": [[self.records[i][1] for i in found]],
+            "distances": [[0.5] * len(found)],
+        }
+
+
+def test_chroma_never_sends_a_where_too_large_and_applies_the_filter_itself():
+    # Chroma refused the flat where of a subject in 1,000 groups, and the process died (SIGSEGV) on
+    # that of a subject in 40,000. A where beyond the bounds is never sent: the search sends the
+    # part every match must meet, if one fits, and applies the whole filter to the candidates.
+    from wardowl import And
+    from wardowl.backends.chroma import ChromaBackend, filter_to_where
+
+    held = [f"group-{i:05d}" for i in range(40_000)]
+    collection = SearchableChroma()
+    backend = ChromaBackend(collection, EMBED)
+    backend.add(
+        [
+            Document("a1", "doc", {"tenant": "acme", "allowed_groups": [held[5]]}),
+            Document("a2", "doc", {"tenant": "acme", "allowed_groups": ["other"]}),
+            Document("a3", "doc", {"tenant": "acme", "allowed_groups": ["other", held[-1]]}),
+            Document("g1", "doc", {"tenant": "globex", "allowed_groups": [held[5]]}),
+        ]
+    )
+    tenant, groups = In("tenant", ["acme"]), In("allowed_groups", held)
+    assert [h.id for h in backend.search(QUERY, 10, And(tenant, groups))] == ["a1", "a3"]
+    assert collection.queries == [{"where": filter_to_where(tenant), "n_results": 1000}]
+    # Nothing every match must meet fits: no where, and never more than k hits.
+    collection.queries.clear()
+    assert [h.id for h in backend.search(QUERY, 1, groups)] == ["a1"]
+    assert collection.queries == [{"where": None, "n_results": 1000}]
+    # fallback_candidates sets how many candidates are read, k if more.
+    collection.queries.clear()
+    fewer = ChromaBackend(collection, EMBED, fallback_candidates=2)
+    assert [h.id for h in fewer.search(QUERY, 1, groups)] == ["a1"]
+    assert [h.id for h in fewer.search(QUERY, 3, groups)] == ["a1", "a3"]
+    assert [q["n_results"] for q in collection.queries] == [2, 3]
+    with pytest.raises(ValueError, match="fallback_candidates"):
+        ChromaBackend(collection, fallback_candidates=0)
+    # A where that fits is sent whole, for k hits, as before.
+    collection.queries.clear()
+    few = In("allowed_groups", held[:20])
+    assert [h.id for h in backend.search(QUERY, 10, few)] == ["a1", "g1"]
+    assert collection.queries == [{"where": filter_to_where(few), "n_results": 10}]
+
+
+class RecordedWheres:
+    """A Chroma collection that keeps the `where` of every query."""
+
+    def __init__(self, collection):
+        self.collection = collection
+        self.wheres = []
+
+    def count(self):
+        return self.collection.count()
+
+    def query(self, **kwargs):
+        self.wheres.append(kwargs.get("where"))
+        return self.collection.query(**kwargs)
+
+
+@pytest.mark.parametrize("count", [1_001, 40_000])
+def test_chroma_answers_a_subject_in_thousands_of_groups(chroma_factory, count):
+    # Chroma 1.5 writes an $or as one binary OR per clause, and SQLite refuses an expression more
+    # than 1,000 deep. With the flat $or wardowl used to send, every search of a subject in 1,001
+    # groups failed, and the first search of a subject in 40,000 groups ended the process with
+    # SIGSEGV (chromadb 1.5.9, the paper's filter-size experiment). Both take well under a second.
+    from wardowl.backends.chroma import filter_to_where
+
+    held = [f"group-{i:05d}" for i in range(count)]
+    step = count // 20
+    docs = [Document(f"in-{i:02d}", "doc", {"allowed_groups": [held[i * step]]}) for i in range(20)]
+    docs += [Document(f"out-{i:02d}", "doc", {"allowed_groups": [f"other-{i}"]}) for i in range(10)]
+    docs += [
+        Document("mixed", "doc", {"allowed_groups": ["other", held[-1]]}),
+        Document("scalar", "doc", {"allowed_groups": held[1]}),
+        Document("user", "doc", {"allowed_users": ["alice"]}),
+        Document("nobody", "doc", {}),
+    ]
+    backend = chroma_factory(docs)
+    backend.collection = recorder = RecordedWheres(backend.collection)
+    subject = Subject("alice", held)
+    retriever = PermissionedRetriever(backend, MetadataACLAuthorizer(), strategy="prefilter")
+    result = retriever.retrieve(QUERY, subject, len(docs))
+    assert {h.id for h in result.hits} == {f"in-{i:02d}" for i in range(20)} | {"mixed", "scalar", "user"}
+    assert result.violations == 0
+    (where,) = recorder.wheres
+    if count == 1_001:  # sent whole, as a tree of nodes of at most 16 clauses
+        assert where == filter_to_where(MetadataACLAuthorizer().filter_for(subject))
+    else:  # far too large to send: Chroma got no where, and the backend applied the filter
+        assert where is None
+
+
+@EXAMPLES
+@given(docs=labelled_docs(), f=filters)
+def test_chroma_reads_nested_where_trees_as_the_reference(chroma_factory, docs, f):
+    # The backend nests $and and $or 16 clauses to a node. With 2 to a node, every filter here
+    # becomes a tree several levels deep, and Chroma itself must find exactly the records it matches.
+    from wardowl.backends import chroma
+
+    backend = chroma_factory(docs)
+    with mock.patch.object(chroma, "_FANOUT", 2):
+        where = chroma._where(f)
+    found = set() if where is None else set(backend.collection.get(where=where, include=["metadatas"])["ids"])
+    assert found == expected_ids(docs, f)
 
 
 # ---- pgvector specifics ----------------------------------------------------------------------

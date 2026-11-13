@@ -154,6 +154,8 @@ published as advisory
 | October 2026 | One chunk id OpenFGA or SpiceDB refused failed every retrieval that returned it | 2.0.0 |
 | October 2026 | A string `audit_key` or `signing_key` turned audit events or the shared cache off without an error | 2.0.0 |
 | October 2026 | The example gateway parsed bodies of any size before authentication, and two of its patterns took quadratic time | the gateway example |
+| October 2026 | Chroma refused every search by a subject in about 1,000 groups, and the first search by a subject in 40,000 groups ended the Python process | 2.0.2, 2.1.1 |
+| October 2026 | After `invalidate()`, a permission service still answering from a stale snapshot refilled the cache for its whole `ttl` | 2.0.2, 2.1.1 |
 
 ## Reporting
 

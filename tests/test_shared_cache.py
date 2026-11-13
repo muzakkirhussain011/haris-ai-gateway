@@ -404,6 +404,31 @@ def test_replicas_share_decisions_through_redis():
     a.invalidate()
 
 
+@needs_redis
+@pytest.mark.parametrize("decoding", [False, True])
+def test_the_hold_of_an_invalidation_reaches_replicas_through_redis(decoding):
+    # The epoch carries when the hold ends, signed like any value, and readable by a client that
+    # decodes responses: replica b keeps nothing for bob until then, though it declares no staleness.
+    redis = pytest.importorskip("redis")
+    namespace, clock = f"wo-{uuid.uuid4().hex}", Clock()
+    clock.now = time.time()  # shared entries and holds carry wall-clock times
+    client = redis.Redis.from_url(REDIS_URL, decode_responses=decoding)
+    shared = RedisCache(client, signing_key=b"s" * 32)
+    one, two = Counting(), Counting()
+    a = CachingAuthorizer(one, shared=shared, namespace=namespace, source_staleness=5, clock=clock)
+    b = CachingAuthorizer(two, shared=shared, namespace=namespace, clock=clock)
+    a.invalidate(BOB)
+    b.check(BOB, HITS)
+    b.check(BOB, HITS)
+    assert two.checks == 4  # asked both times: nothing kept during the hold
+    clock.now += 5.5
+    b.check(BOB, HITS)
+    b.check(BOB, HITS)
+    assert two.checks == 6  # after it, kept as usual
+    a.invalidate()
+    shared.delete_prefix(f"{namespace}!")  # the epochs, which outlive the test otherwise
+
+
 def test_a_shared_filter_nested_too_deep_is_a_miss():
     shared = FakeShared()
     _, (_one, two), (a, b) = _replicas(shared)
