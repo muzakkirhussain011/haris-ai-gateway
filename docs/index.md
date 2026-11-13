@@ -241,20 +241,20 @@ forbidden chunks returned in 21,000 benchmark retrievals
 
 :::{grid-item-card}
 :class-card: wo-stat
-<span class="wo-stat__value">0.88–0.97</span>
+<span class="wo-stat__value">0.886–0.973</span>
 recall@10 at a million chunks, pre-filtered on pgvector
 :::
 
 :::{grid-item-card}
 :class-card: wo-stat
-<span class="wo-stat__value">129/s</span>
+<span class="wo-stat__value">131/s</span>
 retrievals on 4 CPUs, a million chunks in PostgreSQL
 :::
 
 :::{grid-item-card}
 :class-card: wo-stat
-<span class="wo-stat__value">8–10%</span>
-cost of a remote permission service, all of it recovered by caching
+<span class="wo-stat__value">7.9–8.6%</span>
+cost of a remote permission service, nearly all of it recovered by caching
 :::
 ::::
 

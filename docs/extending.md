@@ -66,7 +66,11 @@ when they are there.
 Optionally, give it `set_metadata(metadata: Mapping[str, Mapping[str, Any]])` to replace stored
 chunks' metadata without re-embedding them ([Changing a document's permissions](operations.md#changing-a-documents-permissions)):
 replace the whole metadata, ignore ids that are not stored, and return once searches see the
-change. The conformance kit checks it when it is there.
+change. The conformance kit checks it when it is there. A store that can compare a stored value
+and write in one atomic step can also take `revision=` on `add` and `set_metadata`, as pgvector and
+MongoDB do, and raise `wardowl.backends.StaleRevision` for chunks stored with a newer one
+([One writer at a time for each document](operations.md#one-writer-at-a-time-for-each-document)).
+The retriever never writes, so this is optional.
 
 `query` is whatever the caller passed to `retrieve`. String queries arrive as strings; a caller
 with its own vector passes a `Query`, and `Query.of(query).embedded(self.embed)` gives the vector

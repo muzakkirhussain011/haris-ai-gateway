@@ -162,6 +162,60 @@ Until a change is synced, the chunks keep their old permissions; sync often enou
 window is acceptable, and see [Operations](../operations.md#changing-a-documents-permissions)
 for what changes take effect at once.
 
+## One writer at a time for each file
+
+Two writers usually write a file's chunks: your indexer, with `add`, and the permission sync above,
+with `set_metadata`. Every backend keeps the write that lands last, whenever its data was read. An
+indexer that read a file's sharing before a revocation, and writes after the sync wrote the
+revocation, puts the revoked access back:
+
+| Step | Indexer | Permission sync | The chunks |
+|---|---|---|---|
+| 1 | Reads the file and its sharing: alice may read it | | alice may read |
+| 2 | | Drive removes alice, and the feed reports the file | alice may read |
+| 3 | | Reads the sharing and writes it with `set_metadata` | alice may not read |
+| 4 | Writes the chunks it read in step 1 with `add` | | alice may read again |
+
+The feed reported the change once, in step 2, so nothing corrects step 4 until the file changes
+again. Run the writes for one file one after another, each from its read to its write: put a file's
+indexing and its syncs in one queue or worker chosen by the file id, or hold a lock on the file id
+from the read to the write in both. Writes for different files can still run at the same time.
+
+### Revisions, on pgvector and MongoDB
+
+`PgVectorBackend` and `MongoDBBackend` can also refuse a write older than what is stored. Pass the
+file's revision to both `add` and `set_metadata`: a chunk stored with a newer revision is then not
+replaced, and the call raises `StaleRevision` ([pgvector](pgvector.md#revisions),
+[MongoDB](mongodb.md#revisions)). In step 4 above, the indexer's write would be refused.
+
+```python
+from wardowl.backends import StaleRevision
+
+files = build("drive", "v3", credentials=credentials).files()
+# Read the revision first: before the sharing and, in the indexer, before the content.
+version = int(files.get(fileId=file_id, fields="version", supportsAllDrives=True).execute()["version"])
+access = drive.access(file_id)
+try:
+    backend.set_metadata({cid: with_access(md, access) for cid, md in chunks(file_id).items()}, revision=version)
+except StaleRevision:
+    pass  # a newer write is stored already
+```
+
+- Read the revision before the data you write with it, never after. A revision read after the
+  data can be newer than the data, and an old answer would then be stored under a new number.
+- `StaleRevision` means a newer write is stored already. The sync has nothing more to do; the
+  indexer reads the file again and writes what it says now, under its new revision.
+- Google documents Drive's `version` as a number that only grows and that reflects every change to
+  the file on the server. It does not say whether a change of sharing counts, and wardowl's tests
+  do not run against Drive. Before relying on it, change a test file's sharing and check that its
+  `version` grows: if it does not, an old answer written under the same version is not refused.
+- The comparison is per chunk. A chunk that is not stored has no revision, so it is written: while
+  a file's chunks are deleted and added again, or when its chunk ids change from one version to the
+  next, a late write is not caught. Keep ids such as `"<file id>#<n>"`, and keep the writes for
+  each file in order; revisions catch what slips past that.
+- Chroma and the other backends have no revision check. With them, running the writes for each
+  file one after another is the only protection.
+
 ## Checking the mapping
 
 The tests run the reader against the response shapes Google documents for `permissions.list`,

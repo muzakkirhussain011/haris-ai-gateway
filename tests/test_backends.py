@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import json
 import os
+import threading
 import time
 import uuid
 from types import SimpleNamespace
@@ -42,6 +43,7 @@ from wardowl import (
     Subject,
     matches,
 )
+from wardowl.backends import StaleRevision
 from wardowl.testing import QUERY as KIT_QUERY
 from wardowl.testing import check_backend
 
@@ -1000,3 +1002,138 @@ def test_a_permission_change_leaves_nothing_of_the_old_permissions(factory, chan
     retriever = PermissionedRetriever(backend, MetadataACLAuthorizer(), strategy="prefilter")
     assert retriever.retrieve("doc leave", Subject("bob", ["eng"]), 5).hits == []
     assert [h.id for h in retriever.retrieve("doc leave", Subject("ann", ["hr"]), 5).hits] == ["plan"]
+
+
+# ---- write ordering: revisions -----------------------------------------------------------------
+
+
+def test_stale_revision_names_the_chunks_stored_with_a_newer_revision():
+    error = StaleRevision([f"c{i}" for i in range(7)] + ["c0"], 4)
+    assert error.ids == tuple(f"c{i}" for i in range(7)) and error.revision == 4
+    assert str(error) == "a revision newer than 4 is stored for 'c0', 'c1', 'c2', 'c3', 'c4' and 2 more"
+    assert isinstance(error, RuntimeError)
+
+
+@pytest.mark.parametrize("bad", [True, 1.5, "7", 2**63, -(2**63) - 1])
+def test_pgvector_revision_must_be_a_64_bit_integer(bad):
+    pytest.importorskip("psycopg")
+    from wardowl.backends.pgvector import PgVectorBackend
+
+    backend = PgVectorBackend(None, EMBED)  # refused before the pool is used
+    with pytest.raises(ValueError, match="revision must be an integer"):
+        backend.add([Document("a", "leave", {})], revision=bad)
+    with pytest.raises(ValueError, match="revision must be an integer"):
+        backend.set_metadata({"a": {}}, revision=bad)
+
+
+@pytest.fixture
+def revised(pgvector_pool):
+    from wardowl.backends.pgvector import PgVectorBackend, create_schema
+
+    create_schema(pgvector_pool, EMBED.dim, table="wo_revision", hnsw=False)
+    with pgvector_pool.connection() as conn:
+        conn.execute("TRUNCATE wo_revision")
+    return PgVectorBackend(pgvector_pool, EMBED, table="wo_revision", iterative_scan=None)
+
+
+def _part(users, ids=("a#0", "a#1")):
+    """Chunks of one source document, readable by `users`."""
+    return [Document(i, f"salary bands part {i}", {"allowed_users": list(users)}) for i in ids]
+
+
+def _revoke(ids=("a#0", "a#1")):
+    return {i: {"allowed_users": []} for i in ids}
+
+
+def _pg_stored(pool):
+    """Each stored chunk's readers and revision, by id."""
+    with pool.connection() as conn:
+        rows = conn.execute("SELECT id, metadata, revision FROM wo_revision").fetchall()
+    return {i: (m.get("allowed_users"), r) for i, m, r in rows}
+
+
+def test_pgvector_without_a_revision_a_late_reindex_undoes_a_revocation(revised):
+    # Last writer wins: an indexer reads the document while alice may still read it, the permission
+    # sync then writes the revocation, and the indexer's write lands last.
+    revised.add(_part(["alice"]))
+    revised.set_metadata(_revoke())
+    revised.add(_part(["alice"]))
+    retriever = PermissionedRetriever(revised, MetadataACLAuthorizer())
+    assert len(retriever.retrieve("salary", Subject("alice"), 5).hits) == 2
+
+
+def test_pgvector_refuses_a_write_older_than_the_stored_revision(revised, pgvector_pool):
+    revised.add(_part(["alice"]), revision=5)  # the indexer, at revision 5
+    revised.set_metadata(_revoke(), revision=6)  # the permission sync, at revision 6
+    # The indexer's late write, read at revision 5, with a chunk the document did not have before.
+    with pytest.raises(StaleRevision) as refused:
+        revised.add(_part(["alice"], ("a#0", "a#1", "a#2")), revision=5)
+    assert refused.value.ids == ("a#0", "a#1") and refused.value.revision == 5
+    assert _pg_stored(pgvector_pool) == {"a#0": ([], 6), "a#1": ([], 6)}  # nothing written, a#2 neither
+    with pytest.raises(StaleRevision) as refused:
+        revised.set_metadata({"a#1": {"allowed_users": ["alice"]}, "a#0": {"allowed_users": ["alice"]}}, revision=5)
+    assert refused.value.ids == ("a#0", "a#1")
+    assert _pg_stored(pgvector_pool) == {"a#0": ([], 6), "a#1": ([], 6)}
+    assert PermissionedRetriever(revised, MetadataACLAuthorizer()).retrieve("salary", Subject("alice"), 5).hits == []
+    # The same revision again (a retry) is written, and so is a newer one; ids not stored stay ignored.
+    revised.set_metadata({"a#0": {"allowed_users": ["bob"]}, "gone": {"allowed_users": ["bob"]}}, revision=6)
+    assert _pg_stored(pgvector_pool) == {"a#0": (["bob"], 6), "a#1": ([], 6)}
+    revised.add(_part(["carol"], ("a#0", "a#1", "a#2")), revision=7)
+    assert _pg_stored(pgvector_pool) == {"a#0": (["carol"], 7), "a#1": (["carol"], 7), "a#2": (["carol"], 7)}
+
+
+def test_pgvector_writes_without_a_revision_are_unconditional_and_keep_the_stored_one(revised, pgvector_pool):
+    revised.add(_part(["alice"]))
+    assert _pg_stored(pgvector_pool) == {"a#0": (["alice"], None), "a#1": (["alice"], None)}
+    revised.add(_part(["bob"]), revision=3)  # a chunk stored without a revision is never newer
+    revised.set_metadata({"a#0": {"allowed_users": ["carol"]}})
+    revised.add(_part(["dave"], ("a#1",)))
+    assert _pg_stored(pgvector_pool) == {"a#0": (["carol"], 3), "a#1": (["dave"], 3)}
+    with pytest.raises(StaleRevision):
+        revised.add(_part(["erin"]), revision=2)
+
+
+def _until_a_write_waits_for_a_row_lock(pool, timeout=20.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        # A connection per look: pg_stat_activity is read once per transaction.
+        with pool.connection() as conn:
+            (waiting,) = conn.execute(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database()"
+                " AND wait_event_type = 'Lock' AND query LIKE %s",
+                ["%wo_revision%"],
+            ).fetchone()
+        if waiting:
+            return
+        time.sleep(0.05)
+    raise AssertionError("the write never waited for the row lock")
+
+
+@pytest.mark.parametrize("change", ["add", "set_metadata"])
+def test_pgvector_compares_with_a_newer_write_that_commits_while_it_waits(revised, pgvector_pool, change):
+    # A newer write holds the row when a write at the revision stored so far arrives. Compared with
+    # what it read before waiting, that write would pass; it must wait, compare with what the newer
+    # write committed, and write nothing.
+    revised.add(_part(["alice"]), revision=5)
+    outcome = []
+
+    def late_write():
+        try:
+            if change == "add":
+                revised.add(_part(["alice"]), revision=5)
+            else:
+                revised.set_metadata({c.id: c.metadata for c in _part(["alice"])}, revision=5)
+        except StaleRevision as error:
+            outcome.append(error.ids)
+        else:
+            outcome.append(None)
+
+    writer = threading.Thread(target=late_write)
+    with pgvector_pool.connection() as newer, newer.transaction():
+        revoked = json.dumps({"allowed_users": []})
+        newer.execute("UPDATE wo_revision SET metadata = %s::jsonb, revision = 6 WHERE id = 'a#0'", [revoked])
+        writer.start()
+        _until_a_write_waits_for_a_row_lock(pgvector_pool)
+    writer.join(30)
+    assert not writer.is_alive() and outcome == [("a#0",)]
+    assert _pg_stored(pgvector_pool) == {"a#0": ([], 6), "a#1": (["alice"], 5)}  # rolled back whole

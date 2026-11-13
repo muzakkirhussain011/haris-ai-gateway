@@ -22,6 +22,9 @@ also when its new permission terms are searchable.
 `MongoDBBackend(..., mode="keyword")` searches the text with Atlas Search (`$search`, BM25) under
 the same permission filter, written with Atlas Search's own operators, in an index that
 `create_text_index` creates. A backend given `text_index` waits for that index too.
+
+`add` and `set_metadata` given a `revision` store it on each chunk, in `wardowl_revision`, and do
+not replace a chunk stored with a newer one: they raise `StaleRevision` instead.
 """
 
 from __future__ import annotations
@@ -35,12 +38,13 @@ from functools import partial
 from typing import Any
 
 from wardowl.backends._engines import _SEP, TERMS_FIELD, digest, tag, terms
-from wardowl.backends._errors import required
+from wardowl.backends._errors import StaleRevision, required, revision_number
 from wardowl.backends._vectors import document_vectors
 from wardowl.filters import And, Filter, In, Or, _ordered
 from wardowl.types import Document, Hit, Query
 
 __all__ = [
+    "REVISION_FIELD",
     "TERMS_FIELD",
     "WRITE_FIELD",
     "MongoDBBackend",
@@ -55,6 +59,9 @@ Embed = Callable[[str], Sequence[float]]
 
 WRITE_FIELD = "wardowl_write"
 """A marker each `add` writes, so it can tell when the search index has caught up."""
+
+REVISION_FIELD = "wardowl_revision"
+"""The source document's revision, stored on each chunk by `add` and `set_metadata` given `revision`."""
 
 _BATCH = 500
 _MAX_CANDIDATES = 10_000  # Atlas Vector Search's limit for numCandidates (and so for limit)
@@ -209,6 +216,25 @@ def create_text_index(
     _create_index(collection, model, name, wait, timeout)
 
 
+def _newer_than(revision: int) -> dict[str, Any]:
+    """An aggregation expression, true for a stored chunk whose revision is newer than `revision`.
+
+    It compares in BSON order, in which a missing field comes before every number, so a chunk
+    stored without a revision is never newer. `add`, `set_metadata` and the look before them use
+    this one expression, so they agree on which chunks are newer.
+    """
+    return {"$gt": ["$" + REVISION_FIELD, revision]}
+
+
+def _unless_newer(document: dict[str, Any], revision: int) -> list[dict[str, Any]]:
+    """An update pipeline that replaces the stored chunk with `document`, unless the stored one is
+    newer than `revision`, in which case it keeps it exactly as it was. With `upsert`, a chunk not
+    stored is created from `document`. `$literal` keeps the document data: a value that starts with
+    `$` is stored as written, never read as a field path or an operator.
+    """
+    return [{"$replaceWith": {"$cond": [_newer_than(revision), "$$ROOT", {"$literal": document}]}}]
+
+
 class MongoDBBackend:
     """Vector search on MongoDB Atlas Vector Search, with the permission filter applied inside the search.
 
@@ -282,14 +308,28 @@ class MongoDBBackend:
         return document
 
     def add(
-        self, documents: Iterable[Document], embeddings: Iterable[Sequence[float]] | None = None, *, wait: bool = True
+        self,
+        documents: Iterable[Document],
+        embeddings: Iterable[Sequence[float]] | None = None,
+        *,
+        wait: bool = True,
+        revision: int | None = None,
     ) -> None:
         """Insert or replace chunks. Embeddings are computed with `embed` unless given.
 
         With `wait` (the default), returns once the search index shows every chunk as written,
         or raises `TimeoutError` after `wait_timeout` seconds.
+
+        With `revision`, the revision of the source document these chunks were read from, a chunk
+        stored with a newer revision (in `wardowl_revision`) is not replaced, and the call raises
+        `StaleRevision`. The call first looks for such chunks, and if it finds one, writes nothing.
+        Each chunk is then compared and replaced in one atomic update, so a newer write that lands
+        after that look is not replaced either; the call is not one transaction, though, so the
+        other chunks are then written, and it raises once they are searchable. A chunk not stored
+        has no revision, and is written. Without `revision`, the write is unconditional, as
+        before, and replaces the whole document, stored revision included.
         """
-        from pymongo import ReplaceOne
+        from pymongo import ReplaceOne, UpdateOne
 
         docs = list(documents)
         vectors: Sequence[Sequence[float] | None]
@@ -300,44 +340,96 @@ class MongoDBBackend:
         # The last version of each id wins, as it would in sequence; each id is then written once,
         # so every batch's marker stays on all of its chunks.
         latest = list({d.id: (d, v) for d, v in zip(docs, vectors, strict=True)}.values())
+        number = None if revision is None else revision_number(revision)
+        if number is not None:
+            self._refuse_newer([d.id for d, _ in latest], number)
         batches: list[tuple[str, int]] = []
+        refused: list[str] = []
         for start in range(0, len(latest), _BATCH):
             marker = uuid.uuid4().hex
             rows = [self._document(d, v, marker) for d, v in latest[start : start + _BATCH]]
-            self.collection.bulk_write([ReplaceOne({"_id": r["_id"]}, r, upsert=True) for r in rows], ordered=False)
-            batches.append((marker, len(rows)))
+            if number is None:
+                self.collection.bulk_write([ReplaceOne({"_id": r["_id"]}, r, upsert=True) for r in rows], ordered=False)
+                batches.append((marker, len(rows)))
+                continue
+            changes = [
+                UpdateOne({"_id": r["_id"]}, _unless_newer(r | {REVISION_FIELD: number}, number), upsert=True)
+                for r in rows
+            ]
+            result = self.collection.bulk_write(changes, ordered=False)
+            # A kept chunk is left exactly as it was, so it is neither modified nor upserted.
+            written = result.modified_count + result.upserted_count
+            if written < len(rows):
+                refused += self._newer([r["_id"] for r in rows], number)
+            batches.append((marker, written))
         if wait and latest:
             first = latest[0][1]
             probe = [float(x) for x in first] if self.mode == "vector" and first is not None else None
             for marker, expected in batches:
                 self._settle({WRITE_FIELD: marker}, {"in": {"path": WRITE_FIELD, "value": [marker]}}, expected, probe)
+        if number is not None and refused:
+            raise StaleRevision(refused, number)
 
-    def set_metadata(self, metadata: Mapping[str, Mapping[str, Any]], *, wait: bool = True) -> None:
+    def set_metadata(
+        self, metadata: Mapping[str, Mapping[str, Any]], *, wait: bool = True, revision: int | None = None
+    ) -> None:
         """Replace the metadata of stored chunks, keeping their text and vectors. Ids not stored are ignored.
 
         With `wait` (the default), returns once the search index shows the new metadata, or raises
         `TimeoutError` after `wait_timeout` seconds.
+
+        With `revision`, a chunk stored with a newer revision keeps its metadata, and the call
+        raises `StaleRevision`, as `add` does: it writes nothing if it finds such a chunk before
+        writing, and otherwise compares each chunk in the update that writes it. The chunks it
+        writes store `revision`; without one, the stored revision is left as it is.
         """
         from pymongo import UpdateOne
 
         items = list(metadata.items())
+        number = None if revision is None else revision_number(revision)
+        if number is not None:
+            self._refuse_newer([doc_id for doc_id, _ in items], number)
         batches: list[tuple[str, int]] = []
+        refused: list[str] = []
         for start in range(0, len(items), _BATCH):
             marker = uuid.uuid4().hex
-            changes = [
-                UpdateOne(
-                    {"_id": doc_id},
-                    {"$set": {self.metadata_field: dict(new), TERMS_FIELD: _terms(doc_id, new), WRITE_FIELD: marker}},
-                )
-                for doc_id, new in items[start : start + _BATCH]
-            ]
+            part = items[start : start + _BATCH]
+            changes: list[Any] = []
+            for doc_id, new in part:
+                fields = {self.metadata_field: dict(new), TERMS_FIELD: _terms(doc_id, new), WRITE_FIELD: marker}
+                if number is None:
+                    changes.append(UpdateOne({"_id": doc_id}, {"$set": fields}))
+                else:
+                    # The filter matches a chunk only when it is not newer, in the update that writes it.
+                    unless_newer = {"_id": doc_id, "$expr": {"$not": [_newer_than(number)]}}
+                    changes.append(UpdateOne(unless_newer, {"$set": fields | {REVISION_FIELD: number}}))
             result = self.collection.bulk_write(changes, ordered=False)
+            if number is not None and result.matched_count < len(part):
+                refused += self._newer([doc_id for doc_id, _ in part], number)
             if result.matched_count:
                 batches.append((marker, result.matched_count))
         if wait and batches:
             probe = self._probe()
             for marker, expected in batches:
                 self._settle({WRITE_FIELD: marker}, {"in": {"path": WRITE_FIELD, "value": [marker]}}, expected, probe)
+        if number is not None and refused:
+            raise StaleRevision(refused, number)
+
+    def _newer(self, ids: Sequence[str], revision: int) -> list[str]:
+        """The chunks among `ids` stored with a revision newer than `revision`, in the order given."""
+        found: list[str] = []
+        for start in range(0, len(ids), _BATCH):
+            part = list(ids[start : start + _BATCH])
+            query = {"_id": {"$in": part}, "$expr": _newer_than(revision)}
+            newer = {d["_id"] for d in self.collection.find(query, {"_id": 1})}
+            found += [i for i in part if i in newer]
+        return found
+
+    def _refuse_newer(self, ids: Sequence[str], revision: int) -> None:
+        """Raise `StaleRevision`, before anything is written, if a chunk among `ids` is newer."""
+        newer = self._newer(ids, revision)
+        if newer:
+            raise StaleRevision(newer, revision)
 
     def delete(self, ids: Iterable[str], *, wait: bool = True) -> None:
         """Delete chunks by id; with `wait`, returns once the search index no longer returns them."""

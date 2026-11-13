@@ -10,7 +10,7 @@ services:
       retries: 30
 
   opa:
-    image: openpolicyagent/opa:1.22.0-static
+    image: openpolicyagent/opa:1.22.1-static
     command: ["run", "--server", "--addr=0.0.0.0:8181", "--ignore=*_test.rego", "/policies"]
     volumes: ["./policies:/policies:ro"]
 

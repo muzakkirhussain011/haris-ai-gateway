@@ -39,6 +39,10 @@ fails. Each item links to the page with the details.
 - [ ] A permission change at the source reaches the chunks' metadata (`set_metadata`) within your
   revocation target, and you know each source document's chunk ids.
   ([Operations](operations.md#changing-a-documents-permissions))
+- [ ] The writes for each source document (re-indexing and permission sync) happen one after
+  another, so a late write from data read before a revocation cannot undo it; on pgvector and
+  MongoDB, every writer also passes the document's `revision`.
+  ([Operations](operations.md#one-writer-at-a-time-for-each-document))
 
 **The permission service**
 
@@ -68,7 +72,7 @@ fails. Each item links to the page with the details.
   describes.
 - [ ] Capacity is measured on your own data with the load harness in `benchmarks/`
   ([Benchmarks](benchmarks.md#reproduce-it)). In ours, over a million chunks, one 4-CPU machine
-  shared by PostgreSQL and the load generator peaked at 126 requests a second.
+  shared by PostgreSQL and the load generator peaked at 131 requests a second.
 
 ## When something fails
 
