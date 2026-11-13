@@ -8,10 +8,10 @@ HNSW index, so the retriever reports a short result as possibly incomplete. It c
 a filter matches and search exactly on request, so `PermissionedRetriever(short_results=...)` can
 tell a short result's cause and repair it.
 
-Chunks live in one table: `id text`, `content text`, `metadata jsonb`, `embedding vector(n)`.
-Permission metadata is matched with JSON containment, which a GIN (`jsonb_path_ops`) index serves,
-so the filter stays fast on large tables. `create_schema` sets this up. Metadata keys must be
-strings, as JSON's are.
+Chunks live in one table: `id text`, `content text`, `metadata jsonb`, `embedding vector(n)`, and
+`revision bigint`, which only writes given a `revision` read and set. Permission metadata is matched
+with JSON containment, which a GIN (`jsonb_path_ops`) index serves, so the filter stays fast on
+large tables. `create_schema` sets this up. Metadata keys must be strings, as JSON's are.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
+from wardowl.backends._errors import StaleRevision, revision_number
 from wardowl.backends._vectors import document_vectors
 from wardowl.filters import And, Filter, In, Or, _ordered
 from wardowl.types import Document, Hit, Query
@@ -204,6 +205,9 @@ def create_schema(
 ) -> None:
     """Create the extension, table and indexes if they do not exist. `pool` is a psycopg ConnectionPool.
 
+    A new table has a `revision bigint` column, for writes given a `revision`. An existing table is
+    left as it is: add the column with `ALTER TABLE <table> ADD COLUMN revision bigint`.
+
     `text_search` (a text search configuration, such as `"english"`) also creates the full-text GIN
     index that `PgVectorBackend(mode="keyword", text_search=...)` uses; pass the same name to both.
     """
@@ -217,7 +221,7 @@ def create_schema(
         sql.SQL("CREATE EXTENSION IF NOT EXISTS vector"),
         sql.SQL(
             "CREATE TABLE IF NOT EXISTS {t} (id text PRIMARY KEY, content text NOT NULL,"
-            " metadata jsonb NOT NULL DEFAULT '{{}}', embedding vector({d}) NOT NULL)"
+            " metadata jsonb NOT NULL DEFAULT '{{}}', embedding vector({d}) NOT NULL, revision bigint)"
         ).format(t=sql.Identifier(table), d=sql.Literal(dim)),
         sql.SQL("CREATE INDEX IF NOT EXISTS {i} ON {t} USING gin (metadata jsonb_path_ops)").format(
             i=sql.Identifier(f"{table}_metadata_gin"), t=sql.Identifier(table)
@@ -322,8 +326,23 @@ class PgVectorBackend:
 
     # ---- writing -----------------------------------------------------------------------------
 
-    def add(self, documents: Iterable[Document], embeddings: Iterable[Sequence[float]] | None = None) -> None:
-        """Insert or replace chunks. Embeddings are computed with `embed` unless given."""
+    def add(
+        self,
+        documents: Iterable[Document],
+        embeddings: Iterable[Sequence[float]] | None = None,
+        *,
+        revision: int | None = None,
+    ) -> None:
+        """Insert or replace chunks. Embeddings are computed with `embed` unless given.
+
+        With `revision`, the revision of the source document these chunks were read from, a chunk
+        stored with a newer revision is not replaced: the call then raises `StaleRevision` and
+        writes nothing. Each chunk is compared and written by one statement, under its row lock,
+        and the whole call is one transaction. A chunk not stored has no revision, and is written.
+        Without `revision`, the write is unconditional, as before, and leaves stored revisions as
+        they are. The table needs the `revision` column, which `create_schema` creates for a new
+        table; add it to an older one with `ALTER TABLE <table> ADD COLUMN revision bigint`.
+        """
         docs = list(documents)
         vectors = document_vectors(docs, embeddings, self.embed)  # the table stores a vector for every chunk
         rows = [
@@ -331,6 +350,29 @@ class PgVectorBackend:
         ]
 
         from psycopg import sql
+
+        if revision is not None:
+            number = revision_number(revision)
+            # The WHERE leaves a newer row as it is, under the row's lock, and RETURNING then
+            # names no row for it. A chunk not stored has no revision to compare, and is inserted.
+            revised = sql.SQL(
+                "INSERT INTO {t} AS stored (id, content, metadata, embedding, revision)"
+                " VALUES (%(id)s, %(content)s, %(metadata)s::jsonb, %(embedding)s::vector, %(revision)s)"
+                " ON CONFLICT (id) DO UPDATE SET content = EXCLUDED.content, metadata = EXCLUDED.metadata,"
+                " embedding = EXCLUDED.embedding, revision = EXCLUDED.revision"
+                " WHERE stored.revision IS NULL OR stored.revision <= EXCLUDED.revision"
+                " RETURNING id"
+            ).format(t=sql.Identifier(self.table))
+            params: list[dict[str, Any]] = [
+                {"id": i, "content": text, "metadata": m, "embedding": v, "revision": number} for i, text, m, v in rows
+            ]
+
+            def newer(returned: list[tuple[Any, ...]]) -> list[str]:
+                written = {row[0] for row in returned}
+                return [p["id"] for p in params if p["id"] not in written]
+
+            self._write_revised(revised, params, newer, number)
+            return
 
         statement = sql.SQL(
             "INSERT INTO {t} (id, content, metadata, embedding) VALUES (%s, %s, %s::jsonb, %s::vector)"
@@ -340,17 +382,68 @@ class PgVectorBackend:
         with self.pool.connection() as conn, conn.cursor() as cur:
             cur.executemany(statement, rows)
 
-    def set_metadata(self, metadata: Mapping[str, Mapping[str, Any]]) -> None:
-        """Replace the metadata of stored chunks, keeping their text and vectors. Ids not stored are ignored."""
+    def set_metadata(self, metadata: Mapping[str, Mapping[str, Any]], *, revision: int | None = None) -> None:
+        """Replace the metadata of stored chunks, keeping their text and vectors. Ids not stored are ignored.
+
+        With `revision`, a chunk stored with a newer revision keeps its metadata: the call then
+        raises `StaleRevision` and writes nothing, as `add` does. The chunks it writes store
+        `revision`.
+        """
         rows = [(_metadata_json(doc_id, m), doc_id) for doc_id, m in metadata.items()]
         if not rows:
             return
 
         from psycopg import sql
 
+        if revision is not None:
+            number = revision_number(revision)
+            # One statement per chunk compares the stored revision and writes under the row's lock.
+            # A newer row is written back as it was, and RETURNING says it was newer; the whole
+            # transaction is then rolled back. A chunk not stored returns no row: it stays ignored.
+            revised = sql.SQL(
+                "UPDATE {t} SET metadata = CASE WHEN revision > %(revision)s THEN metadata"
+                " ELSE %(metadata)s::jsonb END, revision = GREATEST(revision, %(revision)s)"
+                " WHERE id = %(id)s RETURNING id, revision > %(revision)s"
+            ).format(t=sql.Identifier(self.table))
+            params: list[dict[str, Any]] = [{"id": doc_id, "metadata": m, "revision": number} for m, doc_id in rows]
+
+            def newer(returned: list[tuple[Any, ...]]) -> list[str]:
+                return [row[0] for row in returned if row[1]]
+
+            self._write_revised(revised, params, newer, number)
+            return
+
         statement = sql.SQL("UPDATE {t} SET metadata = %s::jsonb WHERE id = %s").format(t=sql.Identifier(self.table))
         with self.pool.connection() as conn, conn.cursor() as cur:
             cur.executemany(statement, rows)
+
+    def _write_revised(
+        self,
+        statement: Any,
+        params: list[dict[str, Any]],
+        newer: Callable[[list[tuple[Any, ...]]], list[str]],
+        revision: int,
+    ) -> None:
+        """Run `statement` once per chunk in one transaction, and commit only if `newer`, given
+        every row the statements returned, names no chunk stored with a newer revision.
+
+        Chunks are written in the order of their ids, so two calls that write the same chunks lock
+        them in the same order rather than deadlock. The sort is stable: a repeated id is written
+        in the order given, and the last one wins, as without a revision.
+        """
+        if not params:
+            return
+        ordered = sorted(params, key=lambda p: str(p["id"]))
+        returned: list[tuple[Any, ...]] = []
+        with self.pool.connection() as conn, conn.transaction(), conn.cursor() as cur:
+            cur.executemany(statement, ordered, returning=True)
+            while True:
+                returned += cur.fetchall()
+                if not cur.nextset():
+                    break
+            refused = newer(returned)
+            if refused:
+                raise StaleRevision(refused, revision)  # inside the transaction, which rolls back
 
     def delete(self, ids: Iterable[str]) -> None:
         from psycopg import sql

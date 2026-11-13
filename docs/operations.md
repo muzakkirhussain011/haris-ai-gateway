@@ -159,6 +159,33 @@ subject's groups are read at query time. `CachingAuthorizer` keys each decision 
 metadata, so a chunk whose metadata changed is decided again at once, and cached filters expire
 after `ttl`.
 
+### One writer at a time for each document
+
+`add` and `set_metadata` replace what is stored, whenever the data they write was read. When two
+writers handle one document, such as an ingestion queue that re-indexes it and a permission sync
+that writes its sharing, the write that lands last wins. An indexer that read the document before a
+revocation, and writes after the sync wrote the revocation, puts the revoked access back, and
+nothing corrects it until the document changes again. So:
+
+- Run the writes for each source document one after another, each from its read of the source to
+  its write: one queue or worker per document id, or a lock on the document id in every writer.
+  Writes for different documents can run at the same time.
+- On pgvector and MongoDB, also pass the source document's revision to both calls
+  (`add(..., revision=n)` and `set_metadata(..., revision=n)`): a chunk stored with a newer
+  revision is not replaced, and the call raises `StaleRevision`. Read the revision before the data,
+  never after. The comparison is per chunk, and a chunk that is not stored has no revision: a late
+  write to chunks that were deleted meanwhile, or whose ids changed, is written.
+
+| Store | `revision=` | What a refused call leaves written |
+|---|---|---|
+| pgvector | Each chunk compared and written by one statement under its row lock; one transaction per call | Nothing |
+| MongoDB | A look for newer chunks first, then one atomic update per chunk; not one transaction | Nothing when the look finds them. A newer write that lands after the look is kept, and the call writes the other chunks before it raises |
+| Every other backend | Not offered | Running the writes in order is the only protection |
+
+[Google Drive](integrations/google-drive.md#one-writer-at-a-time-for-each-file) shows both for a
+Drive sync, and [pgvector](integrations/pgvector.md#revisions) and
+[MongoDB](integrations/mongodb.md#revisions) the details.
+
 ## Resilience of remote permission services
 
 The HTTP authorizers, `OPAAuthorizer`, `OpenFGAAuthorizer`, `SpiceDBAuthorizer`, `CerbosAuthorizer`

@@ -23,12 +23,17 @@ backend = PgVectorBackend(pool, embed=embed)  # embed: str -> list[float], your 
 `create_schema(pool, dim, table="wardowl_chunks", hnsw=True)` creates, if they do not exist:
 
 - the `vector` extension;
-- a table with `id text PRIMARY KEY`, `content text`, `metadata jsonb` and `embedding vector(dim)`;
+- a table with `id text PRIMARY KEY`, `content text`, `metadata jsonb`, `embedding vector(dim)`
+  and `revision bigint` (see [Revisions](#revisions));
 - a GIN index on `metadata` (`jsonb_path_ops`), which serves the permission filter;
 - an HNSW index on `embedding` with cosine distance (pass `hnsw=False` to create it yourself, for
   example after a bulk load).
 
-To use an existing table, give it those four columns and pass `table=`.
+To use an existing table, give it the first four columns and pass `table=`; it needs `revision`
+only for writes given a revision. A table created by wardowl 2.1 or earlier has no `revision`
+column, and `create_schema` does not change an existing table: add it with
+`ALTER TABLE wardowl_chunks ADD COLUMN revision bigint` before passing a revision. Without it, such
+a write fails with PostgreSQL's error that the column does not exist.
 
 ## Write and delete
 
@@ -42,6 +47,40 @@ backend.delete(["salaries-1"])
 
 `add` inserts or replaces by id, so re-indexing a document after its permissions change is the
 same call.
+
+## Revisions
+
+`add` and `set_metadata` replace what is stored, whenever their data was read, so when an indexer
+and a permission sync write the same document, a late write from data read before a revocation
+undoes it ([One writer at a time for each document](../operations.md#one-writer-at-a-time-for-each-document)).
+Run the writes for each document one after another. Pass `revision=`, a number your source raises
+on every change to the document, to have an older write refused as well:
+
+```python
+from wardowl.backends import StaleRevision
+
+backend.add(chunks, revision=7)  # the indexer, with the revision it read before the document
+try:
+    backend.set_metadata({cid: {**stored[cid], "allowed_users": []} for cid in chunk_ids}, revision=6)
+except StaleRevision as refused:
+    refused.ids, refused.revision  # the chunks stored with a newer revision, and 6
+```
+
+- Each chunk is compared and written by one statement: `INSERT ... ON CONFLICT (id) DO UPDATE ...
+  WHERE stored.revision IS NULL OR stored.revision <= EXCLUDED.revision` for `add`, and an `UPDATE`
+  that keeps a newer row's metadata for `set_metadata`. PostgreSQL holds the row's lock while it
+  compares, so a newer write still in progress is waited for and compared with what it commits.
+- The whole call is one transaction. If any chunk is stored with a newer revision, the call raises
+  `StaleRevision` naming those chunks, and writes nothing, chunks not stored before included.
+  A chunk written at the same revision is replaced, so a retry succeeds.
+- The chunks are written in the order of their ids, so two calls over the same chunks do not
+  deadlock.
+- A chunk that is not stored has no revision to compare with: `add` writes it, and `set_metadata`
+  ignores it, as without a revision.
+- A write without `revision` is not compared with anything, as before, and leaves the stored
+  revision as it is. Once a document's writers pass revisions, have every one of them pass it.
+- Read the revision before the data you write, never after: a revision read after the data can be
+  newer than the data it labels.
 
 ## How the filter becomes SQL
 

@@ -8,6 +8,25 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- `revision=` on `add` and `set_metadata` of `PgVectorBackend` and `MongoDBBackend`, and
+  `wardowl.backends.StaleRevision`. Every backend keeps the write that lands last, so when an
+  indexer and a permission sync write the same document, an indexer that read the document before a
+  revocation and writes after the sync wrote it puts the revoked access back, and nothing corrects
+  it until the document changes again (found in an internal review). With `revision`, the source
+  document's revision read before its data, a chunk stored with a newer revision is not replaced and
+  the call raises `StaleRevision`, naming those chunks. pgvector compares and writes each chunk in
+  one statement under its row lock (`INSERT ... ON CONFLICT ... DO UPDATE ... WHERE`, and an
+  `UPDATE` that keeps a newer row), in one transaction per call, so a refused call writes nothing.
+  MongoDB stores the revision in `wardowl_revision`, looks for newer chunks before writing (and
+  writes nothing when it finds one), then compares and writes each chunk in one atomic update; a
+  newer write that lands after the look is kept, while the other chunks of the call are written. The
+  comparison is per chunk, so a chunk that is not stored is written whatever its revision. It is
+  optional: without `revision`, both backends write exactly as before. `create_schema` creates new
+  tables with a nullable `revision bigint` column and leaves existing tables alone; add the column
+  to a table created by 2.1 or earlier with `ALTER TABLE ... ADD COLUMN revision bigint` before
+  passing a revision. CI tests both against real servers, including a newer pgvector write that
+  commits while a stale one waits for its row. Chroma has no write that compares and writes in one
+  step, so `ChromaBackend` takes no revision.
 - `ChromaBackend(fallback_candidates=...)`, how many chunks a search reads when its filter is too
   large to send to Chroma whole (1,000 by default), and `wardowl.backends.chroma.FilterTooLarge`,
   the `ValueError` that `filter_to_where` raises for such a filter. See Fixed.
@@ -193,6 +212,13 @@ All notable changes are recorded here. The format follows
 
 ### Documentation
 
+- The writes for one source document must happen one after another. Operations has a section on
+  it, with what `revision` does on pgvector and MongoDB and that the other backends have no such
+  check; the Google Drive page shows how a late re-index undoes a revocation that the changes feed
+  never reports again, and how to pass Drive's `version` as the revision (Google does not document
+  whether a change of sharing raises it, and wardowl's tests do not run against Drive, so the page
+  says to check). The threat model adds T18, and the security model, revocation, production
+  checklist, runbook, extending guide and the pgvector, MongoDB and Chroma pages say the same.
 - A 47-second film on the documentation's front page, linked from the README: what wardowl does,
   shown with an AI assistant that many companies share.
 - The README opens with the problem, the runnable quickstart (which a new test runs, checking that

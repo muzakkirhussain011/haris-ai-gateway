@@ -10,9 +10,12 @@ stop as soon as it is withdrawn.
 1. **Where the permission lives.** With permissions on the chunks (`MetadataACLAuthorizer`,
    `TenantAuthorizer`, or an OPA or Cerbos policy that reads chunk metadata), a change takes effect
    when the chunks are updated: `set_metadata`, a re-index, or the next run of a permission sync
-   such as [Google Drive](integrations/google-drive.md). With a permission service (OpenFGA, SpiceDB,
-   Keto, OPA data, Cerbos policies), it takes effect when the service has the change; with an
-   in-process engine (Cedar, Casbin), when the engine in your process has it.
+   such as [Google Drive](integrations/google-drive.md). A re-index from data read before the
+   change that lands after it undoes the change, so the writes for one document must happen one
+   after another ([Operations](operations.md#one-writer-at-a-time-for-each-document)). With a
+   permission service (OpenFGA, SpiceDB, Keto, OPA data, Cerbos policies), it takes effect when the
+   service has the change; with an in-process engine (Cedar, Casbin), when the engine in your
+   process has it.
 2. **The permission service's own consistency.**
    - OpenFGA with `consistency="MINIMIZE_LATENCY"` (its default) may answer from its cache, when one
      is configured; `"HIGHER_CONSISTENCY"` skips it. See [OpenFGA](integrations/openfga.md).
