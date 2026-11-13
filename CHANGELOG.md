@@ -6,7 +6,7 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
-## [2.1.1] - 2026-11-08
+## [2.1.1] - 2026-11-13
 
 A security release for 2.1. It carries two fixes from the main branch and nothing else: Chroma no
 longer receives a filter that can crash the process, and `CachingAuthorizer.invalidate()` no longer
