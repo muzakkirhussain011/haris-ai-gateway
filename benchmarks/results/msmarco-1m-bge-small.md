@@ -1,7 +1,7 @@
 # MS MARCO, a million chunks, bge-small-en-v1.5: load benchmark results
 
-Run on 2026-10-22 with [`kaggle_load.ipynb`](../kaggle_load.ipynb) at commit `910f16b`
-(Kaggle version 4 of the notebook, 1,636 s in total, of which about 930 s reading and embedding).
+Run on 2026-11-08 with [`kaggle_load.ipynb`](../kaggle_load.ipynb) at commit `910f16b`
+(Kaggle version 1 of the notebook, 1,871 s in total, of which 1,022 s reading and embedding).
 The run before it, on 2026-10-16 at `31b8dbc`, did not yet check results under load; its recall
 and request rates were within 4% of these.
 
@@ -24,38 +24,38 @@ checked against the permissions of the subject it was returned to (*Chunks check
 
 ### Load: 1000000 chunks
 
-COPY 35.9 s, GIN index 3.0 s, HNSW index 263.0 s, total size 4071 MB. hnsw.ef_search: default (40).
+COPY 35.8 s, GIN index 2.6 s, HNSW index 264.7 s, total size 4071 MB. hnsw.ef_search: default (40).
 
 ### Recall and latency by selectivity (one query at a time)
 
 | Selectivity | Strategy | Recall@k | Complete | p50 ms | p95 ms | Leaks |
 |---|---|---|---|---|---|---|
-| 0.1% | prefilter | 0.968 | 100% | 10.61 | 78.69 | 0 |
-| 0.1% | postfilter | 0.093 | 0% | 65.52 | 83.24 | 0 |
-| 1.0% | prefilter | 0.927 | 100% | 21.37 | 41.62 | 0 |
-| 1.0% | postfilter | 0.831 | 55% | 59.77 | 77.76 | 0 |
-| 10.0% | prefilter | 0.883 | 100% | 4.35 | 6.47 | 0 |
-| 10.0% | postfilter | 0.916 | 100% | 9.05 | 15.1 | 0 |
-| 100.0% | prefilter | 0.890 | 100% | 3.28 | 4.71 | 0 |
-| 100.0% | postfilter | 0.890 | 100% | 2.73 | 3.47 | 0 |
+| 0.1% | prefilter | 0.973 | 100% | 11.13 | 77.23 | 0 |
+| 0.1% | postfilter | 0.093 | 0% | 63.62 | 80.85 | 0 |
+| 1.0% | prefilter | 0.932 | 100% | 21.06 | 41.76 | 0 |
+| 1.0% | postfilter | 0.834 | 56% | 59.24 | 77.06 | 0 |
+| 10.0% | prefilter | 0.886 | 100% | 4.3 | 6.5 | 0 |
+| 10.0% | postfilter | 0.914 | 100% | 8.83 | 12.58 | 0 |
+| 100.0% | prefilter | 0.886 | 100% | 3.07 | 4.67 | 0 |
+| 100.0% | postfilter | 0.886 | 100% | 2.75 | 3.49 | 0 |
 
 ### Throughput with concurrent users
 
 | Selectivity | Users | Requests/s | p50 ms | p95 ms | p99 ms | Errors | Chunks checked | Leaks |
 |---|---|---|---|---|---|---|---|---|
-| 1.0% | 1 | 42.9 | 22.18 | 42.38 | 44.38 | 0 | 8580 | 0 |
-| 1.0% | 2 | 81.1 | 23.45 | 44.5 | 50.43 | 0 | 16250 | 0 |
-| 1.0% | 4 | 125.9 | 29.63 | 62.76 | 69.62 | 0 | 25220 | 0 |
-| 1.0% | 8 | 118.6 | 61.84 | 131.61 | 179.55 | 0 | 23770 | 0 |
-| 1.0% | 16 | 109.5 | 131.35 | 273.96 | 438.98 | 0 | 22000 | 0 |
+| 1.0% | 1 | 43.5 | 22.09 | 40.65 | 45.28 | 0 | 8700 | 0 |
+| 1.0% | 2 | 83.1 | 23.0 | 41.92 | 49.84 | 0 | 16630 | 0 |
+| 1.0% | 4 | 131.4 | 28.74 | 59.09 | 65.9 | 0 | 26310 | 0 |
+| 1.0% | 8 | 122.2 | 60.96 | 123.24 | 168.03 | 0 | 24500 | 0 |
+| 1.0% | 16 | 114.0 | 127.34 | 261.25 | 409.91 | 0 | 22890 | 0 |
 
 ### Cost of the permission service
 
 | Authorizer | Users | Requests/s | p50 ms | p95 ms | p99 ms | Errors | Chunks checked | Leaks |
 |---|---|---|---|---|---|---|---|---|
-| in-process (MetadataACLAuthorizer) | 1 | 42.0 | 22.13 | 42.77 | 46.17 | 0 | 8410 | 0 |
-| in-process (MetadataACLAuthorizer) | 16 | 111.1 | 131.04 | 270.49 | 405.48 | 0 | 22310 | 0 |
-| Open Policy Agent over HTTP | 1 | 38.6 | 24.33 | 44.38 | 47.06 | 0 | 7720 | 0 |
-| Open Policy Agent over HTTP | 16 | 101.2 | 144.24 | 297.92 | 431.85 | 0 | 20320 | 0 |
-| Open Policy Agent, CachingAuthorizer(ttl=60) | 1 | 40.6 | 22.94 | 42.54 | 47.02 | 0 | 8120 | 0 |
-| Open Policy Agent, CachingAuthorizer(ttl=60) | 16 | 111.2 | 130.02 | 272.24 | 423.79 | 0 | 22340 | 0 |
+| in-process (MetadataACLAuthorizer) | 1 | 42.9 | 21.91 | 39.95 | 44.97 | 0 | 8590 | 0 |
+| in-process (MetadataACLAuthorizer) | 16 | 114.7 | 128.05 | 261.77 | 372.84 | 0 | 23030 | 0 |
+| Open Policy Agent over HTTP | 1 | 39.2 | 24.38 | 41.98 | 47.32 | 0 | 7850 | 0 |
+| Open Policy Agent over HTTP | 16 | 105.6 | 139.78 | 272.48 | 414.37 | 0 | 21210 | 0 |
+| Open Policy Agent, CachingAuthorizer(ttl=60) | 1 | 41.3 | 22.75 | 40.46 | 48.1 | 0 | 8270 | 0 |
+| Open Policy Agent, CachingAuthorizer(ttl=60) | 16 | 114.7 | 128.56 | 262.97 | 354.51 | 0 | 23010 | 0 |
