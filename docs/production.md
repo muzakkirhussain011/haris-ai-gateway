@@ -55,6 +55,10 @@ fails. Each item links to the page with the details.
 
 - [ ] Audit events go to durable storage (`JsonLinesAudit` or your own observer), with an
   `audit_key` from your secret store if you want query fingerprints. ([Operations](operations.md#audit-events))
+- [ ] You have decided what a lost audit event means. Among `observers`, delivery is best-effort
+  and a failure is counted in `wardowl.observer_failures`; an audit log that a control depends on
+  goes in `required_observers`, and then a retrieval it cannot record returns nothing.
+  ([Operations](operations.md#when-an-observer-fails))
 - [ ] `OpenTelemetryMetrics` and `OpenTelemetryObserver` are installed, and the alerts in
   [What to alert on](operations.md#what-to-alert-on) are set up, starting with any increase in
   `wardowl.violations`.
@@ -87,7 +91,10 @@ says why. The table shows what each failure looks like.
 | The shared cache (Redis) is down or slow | Treats it as a miss and asks the permission service | A warning on the `wardowl` logger; higher `wardowl.authorize.duration` |
 | A shared-cache entry is unsigned, tampered with or copied under another key | Ignores it (with `signing_key`) | Nothing: it is a miss |
 | `invalidate()` cannot reach Redis | Raises, because the caller asked for a revocation now | The exception at the caller |
-| An observer raises | Logs it; retrieval is unaffected | An error on the `wardowl` logger |
+| An observer raises | Logs and counts it; retrieval is unaffected | An error on the `wardowl` logger; `observer_failures` and `wardowl.observer_failures` rise |
+| A required observer raises (`required_observers`) | Raises `AuditError`; nothing is returned | As above, and `wardowl.retrievals` with `error.type = AuditError` |
+| A recall sample's count or exact search fails | Logs it; returns the retrieval's hits | `recall_sample = failed`; `wardowl.recall_samples` with that value |
+| Redis answers in RESP2 and its `search-on-timeout` policy is not `fail` | Raises, since a timed-out search would look complete | `SearchError`, with the reason in its `__cause__` |
 
 What to do about each, containment first, is in the [incident runbook](runbook.md).
 

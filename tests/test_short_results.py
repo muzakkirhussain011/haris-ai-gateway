@@ -299,7 +299,10 @@ class Failing(Lossy):
 
 @pytest.mark.parametrize("part", ["count", "exact"])
 def test_an_error_in_the_count_or_the_search_run_again_fails_the_retrieval(part):
-    retriever = PermissionedRetriever(Failing(DOCS, part), MetadataACLAuthorizer(), short_results="exact")
+    # A recall sample catches only its own failures: these come before it, and still fail the call.
+    retriever = PermissionedRetriever(
+        Failing(DOCS, part), MetadataACLAuthorizer(), short_results="exact", recall_sample_rate=1
+    )
     with pytest.raises(SearchError, match=f"^{'count' if part == 'count' else 'search'} failed$") as failure:
         retriever.retrieve("leave", BOB, 5)
     assert isinstance(failure.value.__cause__, ConnectionError)  # the store's own error, for the logs
@@ -349,7 +352,9 @@ def test_a_sampled_retrieval_measures_how_much_of_the_exact_top_k_came_back():
     backend = Lossy(DOCS)
     result = _both(PermissionedRetriever(backend, MetadataACLAuthorizer(), recall_sample_rate=1.0), BOB, 5)
     assert _ids(result) == ["eng-0"] and result.sampled_recall == 0.25  # one of four
-    assert backend.calls == ["search", "exact"] * 2  # the exact hits feed the measure only
+    assert result.recall_sample == "measured"
+    # A count bounds the exact search by max_exact_rows; the exact hits feed the measure only.
+    assert backend.calls == ["search", ("count", 10_001), "exact"] * 2
     # k hits that are not the top k: complete cannot see it, the sample can.
     worst = _both(PermissionedRetriever(Worst(DOCS), MetadataACLAuthorizer(), recall_sample_rate=1), BOB, 2)
     assert _ids(worst) == ["pub-0", "pub-1"] and worst.complete is True and worst.sampled_recall == 0.0
@@ -372,7 +377,9 @@ def test_nothing_is_sampled_where_a_sample_would_say_nothing():
     assert sampled(repaired, recall_sample_rate=1, short_results="exact") is None  # the hits are exact already
     assert repaired.calls == ["search", ("count", 10_001), "exact"] * 2
     nothing = PermissionedRetriever(Lossy(DOCS), MetadataACLAuthorizer(), recall_sample_rate=1)
-    assert _both(nothing, BOB, 5, query="salary").sampled_recall is None  # nothing to find
+    found = _both(nothing, BOB, 5, query="salary")
+    assert (found.sampled_recall, found.recall_sample) == (None, "measured")  # nothing to find
+    assert _both(PermissionedRetriever(Lossy(DOCS), MetadataACLAuthorizer()), BOB, 5).recall_sample is None
 
 
 def test_only_the_sampled_share_runs_an_exact_search(monkeypatch):
@@ -382,6 +389,46 @@ def test_only_the_sampled_share_runs_an_exact_search(monkeypatch):
     assert retriever.retrieve("leave", BOB, 5).sampled_recall is None and backend.calls == ["search"]
     monkeypatch.setattr("wardowl.retriever.random.random", lambda: 0.25)
     assert retriever.retrieve("leave", BOB, 5).sampled_recall == 0.25
+
+
+def test_a_sample_runs_no_exact_search_above_max_exact_rows_or_without_a_count():
+    backend = Lossy(DOCS)
+    bounded = PermissionedRetriever(backend, MetadataACLAuthorizer(), recall_sample_rate=1, max_exact_rows=3)
+    over = _both(bounded, BOB, 5)
+    assert _ids(over) == ["eng-0"] and (over.sampled_recall, over.recall_sample) == (None, "over_limit")
+    assert backend.calls == ["search", ("count", 4)] * 2  # Bob may read four chunks, one more than the bound
+    for uncountable in (Uncounted(DOCS), Keyword(DOCS)):
+        result = _both(PermissionedRetriever(uncountable, MetadataACLAuthorizer(), recall_sample_rate=1), BOB, 5)
+        assert (result.sampled_recall, result.recall_sample) == (None, "unsupported")
+        assert "exact" not in uncountable.calls
+    unbounded = Uncounted(DOCS)
+    retriever = PermissionedRetriever(unbounded, MetadataACLAuthorizer(), recall_sample_rate=1, max_exact_rows=None)
+    result = _both(retriever, BOB, 5)
+    assert (result.sampled_recall, result.recall_sample) == (0.25, "measured")
+    assert unbounded.calls == ["search", "exact"] * 2
+
+
+@pytest.mark.parametrize("part", ["count", "exact"])
+def test_a_failed_sample_is_recorded_and_the_retrieval_returns_its_hits(part, caplog):
+    # On pgvector, an exact search over a broad readable set can outlast statement_timeout: the
+    # sample is monitoring, so its failure must not take the hits already found with it.
+    events = []
+    retriever = PermissionedRetriever(
+        Failing(DOCS, part), MetadataACLAuthorizer(), recall_sample_rate=1, observers=[events.append]
+    )
+    result = _both(retriever, BOB, 5)
+    assert _ids(result) == ["eng-0"] and (result.sampled_recall, result.recall_sample) == (None, "failed")
+    assert [(e.error, e.recall_sample, e.returned_ids) for e in events] == [(None, "failed", ("eng-0",))] * 2
+    assert "recall sample failed" in caplog.text and "store unreachable" in caplog.text
+
+
+def test_a_sample_whose_count_is_not_a_number_is_recorded_as_failed():
+    class Garbled(Lossy):
+        def count(self, filter, limit):
+            return "4"
+
+    result = _both(PermissionedRetriever(Garbled(DOCS), MetadataACLAuthorizer(), recall_sample_rate=1), BOB, 5)
+    assert _ids(result) == ["eng-0"] and result.recall_sample == "failed"
 
 
 # ---- reporting ---------------------------------------------------------------------------------
@@ -407,6 +454,18 @@ def test_events_report_the_shortfall_what_was_done_and_the_time_it_took(run):
     assert (event.shortfall, event.fallback, event.complete, event.searches) == ("missed", "exact", True, 2)
     assert 10 <= event.shortfall_ms <= event.search_ms
     assert event.to_dict()["fallback"] == "exact" and event.sampled_recall is None
+
+
+def test_a_samples_count_is_search_time_not_shortfall_time():
+    events = []
+    retriever = PermissionedRetriever(
+        SlowCount(DOCS, keep=5), MetadataACLAuthorizer(), recall_sample_rate=1, observers=[events.append]
+    )
+    result = retriever.retrieve("leave", BOB, 4)  # Bob's four chunks: a full result, nothing short
+    (event,) = events
+    assert result.shortfall is None and (event.recall_sample, event.sampled_recall) == ("measured", 1.0)
+    assert event.shortfall_ms == 0 and event.search_ms >= 10 and event.searches == 2
+    assert event.to_dict()["recall_sample"] == "measured"
 
 
 def _points(reader):
@@ -444,6 +503,7 @@ def test_opentelemetry_records_short_results_and_sampled_recall():
     assert (first.attributes["wardowl.shortfall"], first.attributes["wardowl.fallback"]) == ("missed", "exact")
     assert first.attributes["wardowl.shortfall.duration_ms"] >= 0 and "wardowl.sampled_recall" not in first.attributes
     assert second.attributes["wardowl.sampled_recall"] == 0.25 and "wardowl.fallback" not in second.attributes
+    assert second.attributes["wardowl.recall_sample"] == "measured" and "wardowl.recall_sample" not in first.attributes
 
     points = _points(reader)
     short = {
@@ -453,6 +513,8 @@ def test_opentelemetry_records_short_results_and_sampled_recall():
     assert short == {("missed", "exact"): 1, ("missed", None): 1}
     (recall,) = points["wardowl.sampled_recall"]
     assert (recall.count, recall.sum) == (1, 0.25) and tuple(recall.explicit_bounds) == RECALL_BUCKETS
+    (sample,) = points["wardowl.recall_samples"]
+    assert (sample.attributes["wardowl.recall_sample"], sample.value) == ("measured", 1)
 
 
 # ---- configuration -----------------------------------------------------------------------------

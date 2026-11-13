@@ -149,6 +149,7 @@ candidate as well. `strategy="postfilter"` does not mean an unfiltered search.
 | `shortfall` | Why a pre-filtered search returned fewer than `k` hits: `exhausted`, `missed` or `unknown` ([Short results](#short-results)); `None` when it did not |
 | `fallback` | What `short_results` did about it: `exact`, `widened`, `over_limit` or `unsupported`; `None` when it did nothing |
 | `sampled_recall` | For a retrieval `recall_sample_rate` sampled, the share of an exact search's top `k` that came back |
+| `recall_sample` | What happened to that sample: `measured`, `over_limit`, `unsupported` or `failed`; `None` when the retrieval was not sampled |
 
 `violations` should always be 0. Anything else means the backend returned chunks outside the
 filter, and deserves an alert: the re-check removed them, but the backend has a bug.
@@ -227,6 +228,17 @@ too, after the first, and reports in `sampled_recall` how much of its top k came
 hits are never returned, and only those the filter matches are counted. A rate of 0.01 costs one
 more search in a hundred; the `wardowl.sampled_recall` histogram then shows how far the index's
 answers are from the true top k for your users and filters.
+
+The exact search is bounded the way `short_results="exact"` is. With `max_exact_rows` set (10,000
+by default), the backend first counts the chunks the filter matches, and the exact search runs
+only when there are no more than that: a subject who may read most of a large store does not set
+off a scan of it on every sampled retrieval (`recall_sample="over_limit"`), and a backend that
+cannot count is not sampled (`"unsupported"`). The measure then covers only retrievals whose
+readable set is within the bound; with `max_exact_rows=None`, every sampled retrieval runs its
+exact search, bounded only by the store's own timeout. The sample is monitoring and
+never fails the retrieval: if its count or exact search raises, a store timeout for one, the
+error is logged on the `wardowl` logger, `recall_sample` is `"failed"`, and the retrieval returns
+the hits it found. `wardowl.recall_samples` counts samples by what happened to them.
 
 OpenSearch takes a similar approach inside the engine: since 3.5, when an approximate filtered
 k-NN search returns fewer than k results, it falls back to an exact search. wardowl does it above

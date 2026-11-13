@@ -10,7 +10,7 @@ import uuid
 
 import pytest
 
-from wardowl import And, Document, In, MetadataACLAuthorizer, Or, PermissionedRetriever, Query, Subject
+from wardowl import And, Document, In, MetadataACLAuthorizer, Or, PermissionedRetriever, Query, SearchError, Subject
 from wardowl.backends import NothingMatches
 from wardowl.backends._engines import TERMS_FIELD, digest, tag, terms
 from wardowl.backends.redis import RedisBackend, create_index, filter_to_query, permission_terms
@@ -86,11 +86,19 @@ class FakePipeline:
 
 
 class FakeClient:
-    def __init__(self, reply=None):
+    """Answers every FT.SEARCH with `reply`, and the timeout policy as a Redis 8 server set to `policy`."""
+
+    def __init__(self, reply=None, policy=b"fail"):
         self.reply = reply if reply is not None else [0]
-        self.commands, self.calls = [], []
+        self.policy = policy
+        self.commands, self.calls, self.asked = [], [], []
 
     def execute_command(self, *args):
+        if args[0] in ("CONFIG", "FT.CONFIG"):
+            self.asked.append(args)
+            if args[0] == "FT.CONFIG" or self.policy is None:
+                raise RuntimeError("ERR unknown command")  # Redis 8 answers CONFIG GET
+            return [b"search-on-timeout", self.policy]
         self.commands.append(args)
         return self.reply
 
@@ -146,6 +154,104 @@ def test_partial_results_after_a_timeout_raise(key):
     }
     with pytest.raises(RuntimeError, match="partial results: Timeout limit was reached"):
         RedisBackend(FakeClient(reply), "idx", EMBED).search("leave", 5)
+
+
+RESP2_REPLY = [1, b"wardowl:a", [b"wardowl_id", b"a", b"metadata", b"{}", b"__wardowl_distance", b"0.3"]]
+RESP3_REPLY = {
+    "total_results": 1,
+    "results": [{"id": "wardowl:a", "extra_attributes": {"wardowl_id": "a", "__wardowl_distance": "0.3"}}],
+    "warning": [],
+}
+
+
+@pytest.mark.parametrize("policy", [b"return", b"return-strict", None])
+def test_a_resp2_answer_is_refused_unless_the_server_fails_searches_that_run_out_of_time(policy):
+    # RESP2 replies carry no timeout warning: under "return" (the default) or "return-strict", a
+    # search that ran out of time looks complete. None: the server would not say.
+    client = FakeClient(RESP2_REPLY, policy)
+    backend = RedisBackend(client, "idx", EMBED)
+    shown = policy.decode() if policy else "unknown"
+    with pytest.raises(RuntimeError, match=f"policy is {shown}, not fail") as refused:
+        backend.search("leave", 5)
+    assert "protocol=3" in str(refused.value) and "check_timeout_policy=False" in str(refused.value)
+    if policy is None:
+        assert isinstance(refused.value.__cause__, RuntimeError)  # what asking raised, for the logs
+    with pytest.raises(RuntimeError):
+        backend.search("leave", 5)  # asked again: the policy can be changed without a restart
+    assert len(client.asked) == (4 if policy is None else 2)
+    client.policy = b"fail"
+    assert [h.id for h in backend.search("leave", 5)] == ["a"]
+    backend = RedisBackend(FakeClient(RESP2_REPLY, policy), "idx", EMBED)
+    retriever = PermissionedRetriever(backend, MetadataACLAuthorizer())
+    with pytest.raises(SearchError, match=r"^search failed$") as failure:
+        retriever.retrieve("leave", Subject("ann", ["hr"]), 5)
+    assert "search-on-timeout" in str(failure.value.__cause__)
+
+
+def test_a_server_that_fails_searches_that_run_out_of_time_is_asked_once():
+    client = FakeClient(RESP2_REPLY)
+    backend = RedisBackend(client, "idx", EMBED)
+    assert [h.id for h in backend.search("leave", 5)] == ["a"]
+    assert [h.id for h in backend.search("leave", 5)] == ["a"]
+    assert client.asked == [("CONFIG", "GET", "search-on-timeout")]
+
+
+def test_redis_stack_is_asked_with_ft_config_and_either_protocols_answer_is_read():
+    class Stack(FakeClient):
+        def execute_command(self, *args):
+            if args[0] == "CONFIG":
+                self.asked.append(args)
+                return []  # Redis Stack has no search-on-timeout setting
+            if args[0] == "FT.CONFIG":
+                self.asked.append(args)
+                return self.policy
+            return super().execute_command(*args)
+
+    for answer in ([[b"ON_TIMEOUT", b"fail"]], {"ON_TIMEOUT": "FAIL"}, [["ON_TIMEOUT", "fail"]]):
+        client = Stack(RESP2_REPLY, answer)
+        assert [h.id for h in RedisBackend(client, "idx", EMBED).search("leave", 5)] == ["a"]
+        assert [a[0] for a in client.asked] == ["CONFIG", "FT.CONFIG"]
+    with pytest.raises(RuntimeError, match="policy is return, not fail"):
+        RedisBackend(Stack(RESP2_REPLY, [[b"ON_TIMEOUT", b"return"]]), "idx", EMBED).search("leave", 5)
+
+
+def test_resp3_answers_and_an_opt_out_ask_nothing():
+    resp3 = FakeClient(RESP3_REPLY, policy=b"return")
+    assert [h.id for h in RedisBackend(resp3, "idx", EMBED).search("leave", 5)] == ["a"]
+    unchecked = FakeClient(RESP2_REPLY, policy=b"return")
+    backend = RedisBackend(unchecked, "idx", EMBED, check_timeout_policy=False)
+    assert [h.id for h in backend.search("leave", 5)] == ["a"]
+    assert resp3.asked == [] and unchecked.asked == []
+
+
+def test_an_answer_that_is_neither_protocols_shape_is_refused():
+    class Parsed:  # what a client that parses FT.SEARCH into its own object would return
+        docs = ()
+
+    with pytest.raises(TypeError, match="answered with Parsed, not the RESP2 list or RESP3 map"):
+        RedisBackend(FakeClient(Parsed()), "idx", EMBED).search("leave", 5)
+
+
+def test_the_async_client_is_asked_for_the_policy_too():
+    class AsyncClient:
+        def __init__(self, policy):
+            self.policy, self.asked = policy, []
+
+        async def execute_command(self, *args):
+            if args[0] in ("CONFIG", "FT.CONFIG"):
+                self.asked.append(args)
+                return [b"search-on-timeout", self.policy]
+            return RESP2_REPLY
+
+    refused = AsyncClient(b"return")
+    backend = RedisBackend(FakeClient(), "idx", EMBED, async_client=refused)
+    with pytest.raises(RuntimeError, match="policy is return, not fail"):
+        asyncio.run(backend.asearch("leave", 5))
+    trusted = AsyncClient(b"fail")
+    backend = RedisBackend(FakeClient(), "idx", EMBED, async_client=trusted)
+    assert [h.id for h in asyncio.run(backend.asearch("leave", 5))] == ["a"]
+    assert [h.id for h in asyncio.run(backend.asearch("leave", 5))] == ["a"]
+    assert trusted.asked == [("CONFIG", "GET", "search-on-timeout")]
 
 
 def test_add_replaces_whole_hashes_with_hex_terms_and_exact_json():
@@ -282,6 +388,8 @@ def test_asearch_uses_the_async_client_or_a_thread():
             self.commands = []
 
         async def execute_command(self, *args):
+            if args[0] == "CONFIG":
+                return [b"search-on-timeout", b"fail"]  # a RESP2 answer is trusted only then
             self.commands.append(args)
             return reply
 
@@ -446,6 +554,31 @@ def test_native_async_search_matches_sync(redis_client):
     async_result, sync_result = asyncio.run(run())
     _drop(redis_client, name)
     assert async_result == sync_result and len(async_result.hits) == 4
+
+
+def test_server_policy_decides_whether_resp2_answers_are_trusted(redis_client):
+    import redis
+
+    from wardowl.backends.redis import _policy
+
+    # The server's own answer, read the way the backend reads it: CI's Redis keeps the default.
+    policy = _policy(redis_client.execute_command("CONFIG", "GET", "search-on-timeout"))
+    assert policy in ("return", "fail", "return-strict")
+    resp2 = redis.Redis.from_url(REDIS_URL, protocol=2)
+    name, _ = _store(redis_client, "FLAT")
+    try:
+        backend = RedisBackend(resp2, name, EMBED, prefix=f"{name}:")
+        backend.add([Document("a", "leave", {"allowed_groups": ["hr"]})])
+        if policy == "fail":
+            assert [h.id for h in backend.search("leave", 5)] == ["a"]
+        else:
+            with pytest.raises(RuntimeError, match=f"policy is {policy}, not fail"):
+                backend.search("leave", 5)
+        unchecked = RedisBackend(resp2, name, EMBED, prefix=f"{name}:", check_timeout_policy=False)
+        assert [h.id for h in unchecked.search("leave", 5)] == ["a"]  # RESP2, read as before
+    finally:
+        _drop(redis_client, name)
+        resp2.close()
 
 
 def test_a_subject_in_ten_thousand_groups(redis_client):

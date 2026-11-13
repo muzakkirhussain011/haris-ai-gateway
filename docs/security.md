@@ -29,7 +29,9 @@ Given an authorizer that answers correctly:
    that were not returned again; an error in either search fails the call.
 5. **Audit events contain no content.** `RetrievalEvent`, `JsonLinesAudit` and the OpenTelemetry
    spans record ids, counts and outcomes, never query text or chunk text. The query appears only as
-   an HMAC, and only when you supply a key. OpenTelemetry metrics record no ids at all.
+   an HMAC, and only when you supply a key. OpenTelemetry metrics record no ids at all. An observer
+   in `required_observers` that cannot record a retrieval makes it raise `AuditError`, with a fixed
+   message, and return nothing; other observers' failures are logged and counted.
 
 ## The invariants and the tests that hold them
 
@@ -46,10 +48,10 @@ services. The tests compare with an oracle written without the library's own fil
 | S4 | Decisions never carry over between requests, users, tenants, threads or tasks; a cancelled call returns nothing. | `test_invariants.py` (threads and asyncio tasks, every hit checked), `test_properties.py` (sync and async agree), `test_mcp.py` (each caller's own token) |
 | S5 | An optimization that fails keeps the guarantees or fails. | A backend that ignores the filter cannot leak, with or without `recheck` (`test_properties.py`), nor in a search run again for a short result (`test_short_results.py`); a failing shared cache only misses (`test_shared_cache.py`) |
 | S6 | Content the subject may not read never reaches a reranker, the model or a tool. | `test_rerank.py`, `test_frameworks.py`, `test_mcp.py` |
-| S7 | An incomplete candidate search is never reported as complete. | `test_core.py` (post-filtering capped; short and empty results from approximate and exact searches), `test_short_results.py` (counts, searches run again, and the conformance kit's checks of both), truncated or deadline-cut lists in `test_openfga.py` and `test_spicedb.py`. `complete` cannot see an approximate index that returns k chunks other than the true top k; `recall_sample_rate` measures it. |
+| S7 | An incomplete candidate search is never reported as complete. | `test_core.py` (post-filtering capped; short and empty results from approximate and exact searches), `test_short_results.py` (counts, searches run again, and the conformance kit's checks of both), truncated or deadline-cut lists in `test_openfga.py` and `test_spicedb.py`, Redis's partial results after a timeout (a RESP3 warning, or a RESP2 answer from a server whose policy is not `fail`) in `test_redis_vector.py`. `complete` cannot see an approximate index that returns k chunks other than the true top k; `recall_sample_rate` measures it. |
 | S8 | The documented defaults keep every protection on. | `recheck=True`, `strategy="auto"`, empty `And`/`Or` and single-string groups refused (`test_core.py`) |
 | S9 | Cached decisions are used for at most `ttl`, and not at all after `invalidate()`; for `source_staleness` seconds after it, no answer about the invalidated subjects is cached, in any replica, so a service that is itself behind cannot refill the cache with a decision from before the change. | `test_caching_events.py`, `test_shared_cache.py` (the hold through a real Redis), `test_revocation.py` (revocation under concurrent retrievals, one and three replicas; a service answering from stale data, sync and async, here and in another replica) |
-| S10 | Errors and telemetry reveal no content, credentials or query text. `AuthorizationError` and `SearchError` messages are fixed: the text of the exception behind one stays in its `__cause__`. | `test_caching_events.py` (events and OpenTelemetry), `test_core.py` (a failing authorizer, redactor, store search or count whose error names a password), `test_frameworks.py` and `test_haystack.py` (the same failure seen through LangChain, LlamaIndex and Haystack), `test_mcp.py` (a failing permission service, store or subject function), each authorizer's tests |
+| S10 | Errors and telemetry reveal no content, credentials or query text. `AuthorizationError`, `SearchError` and `AuditError` messages are fixed: the text of the exception behind one stays in its `__cause__`. | `test_caching_events.py` (events and OpenTelemetry), `test_core.py` (a failing authorizer, redactor, store search or count whose error names a password), `test_frameworks.py` and `test_haystack.py` (the same failure seen through LangChain, LlamaIndex and Haystack), `test_mcp.py` (a failing permission service, store or subject function), each authorizer's tests |
 
 S1 to S10 assume the authorizer answers correctly, the backend returns the metadata it stored, and
 the subject comes from authentication; the next sections cover those assumptions. The test files

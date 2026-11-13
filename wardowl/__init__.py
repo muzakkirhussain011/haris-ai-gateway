@@ -16,7 +16,7 @@ from wardowl.authz import (
 )
 from wardowl.backends.memory import InMemoryBackend
 from wardowl.caching import CachingAuthorizer
-from wardowl.events import JsonLinesAudit, RetrievalEvent
+from wardowl.events import AuditError, JsonLinesAudit, RetrievalEvent
 from wardowl.filters import And, Filter, In, Or, filter_from_dict, filter_to_dict, matches
 from wardowl.fusion import RankFusion
 from wardowl.redaction import PatternRedactor, Redactor, SpanRedactor
@@ -37,6 +37,7 @@ __all__ = [
     "AllOf",
     "And",
     "AnyOf",
+    "AuditError",
     "AuthorizationError",
     "Authorizer",
     "CachingAuthorizer",

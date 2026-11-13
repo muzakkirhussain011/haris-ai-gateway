@@ -48,12 +48,23 @@ CI checks both, exactly on `FLAT`.
 **Timeouts.** By default the Query Engine answers a query that runs out of time with the results
 it found so far, which look complete. In production, make it fail instead: set
 `search-on-timeout fail` in the Redis 8 configuration (`FT.CONFIG SET ON_TIMEOUT FAIL` on Redis
-Stack), and a timed-out search raises. A client using RESP3 (`protocol=3`) also receives a
-warning with such partial results, and the backend raises `RuntimeError` when it sees one; RESP2
-replies carry no warning, so with RESP2 the server setting is the only protection. On the client's
-side, redis-py waits for an answer without limit by default: set `socket_connect_timeout` and
-`socket_timeout`, as in the example above, so that a Redis that hangs raises instead of holding up
-retrievals.
+Stack), and a timed-out search raises. A client using RESP3 also receives a warning with such
+partial results, and the backend raises `RuntimeError` when it sees one. redis-py 8.1, the version
+CI tests with, speaks RESP3 unless given `protocol=2`; `protocol=3` makes sure of it with any
+version.
+
+RESP2 replies carry no such warning, so the backend does not take them on trust. The first time a
+search is answered in RESP2, it reads the server's policy (`CONFIG GET search-on-timeout`, or
+`FT.CONFIG GET ON_TIMEOUT` on Redis Stack) and raises `RuntimeError` unless it is `fail`; the
+retriever reports that as `SearchError`. `return` and `return-strict` both answer with partial
+results, and a policy the client may not read counts as unknown. Once it has read `fail`, the
+backend does not ask again; until then, it asks on each RESP2 answer, so setting the policy takes
+effect without a restart. `RedisBackend(..., check_timeout_policy=False)` accepts RESP2 answers
+without asking, for a server whose policy is set where the client cannot read it.
+
+On the client's side, redis-py waits for an answer without limit by default: set
+`socket_connect_timeout` and `socket_timeout`, as in the example above, so that a Redis that hangs
+raises instead of holding up retrievals.
 
 ## How permissions are indexed
 

@@ -77,6 +77,8 @@ class OpenTelemetryObserver:
             attributes["wardowl.fallback"] = event.fallback
         if event.sampled_recall is not None:
             attributes["wardowl.sampled_recall"] = event.sampled_recall
+        if event.recall_sample:
+            attributes["wardowl.recall_sample"] = event.recall_sample
         if self.record_subject:
             attributes["wardowl.subject.id"] = event.subject_id
         start = int(event.started_at * 1_000_000_000)
@@ -90,9 +92,9 @@ class OpenTelemetryMetrics:
     """Records each `RetrievalEvent` as OpenTelemetry metrics.
 
     `meter` defaults to the `wardowl` meter of the global meter provider. Every instrument is
-    broken down by `wardowl.action` and `wardowl.strategy` only, plus the outcome and
-    `error.type` where they apply. These have a handful of values each, so the metrics stay cheap to
-    store; subjects, queries and chunks are never recorded.
+    broken down by `wardowl.action` and `wardowl.strategy` only, plus the outcome, `error.type`
+    and the attributes named below where they apply. These have a handful of values each, so the
+    metrics stay cheap to store; subjects, queries and chunks are never recorded.
 
     - `gen_ai.client.operation.duration` (histogram, s): each retrieval, with
       `gen_ai.operation.name = "retrieval"`.
@@ -111,6 +113,12 @@ class OpenTelemetryMetrics:
       `wardowl.fallback`.
     - `wardowl.sampled_recall` (histogram, 1): for retrievals `recall_sample_rate` sampled, the
       share of an exact search's top k that came back.
+    - `wardowl.recall_samples` (counter): sampled retrievals by `wardowl.recall_sample`, which is
+      `measured`, `over_limit`, `unsupported` or `failed`.
+    - `wardowl.observer_failures` (counter): events an observer of the retriever raised on, by
+      `wardowl.observer` (the observer's class or function name) and `error.type`. The retriever
+      reports them through `observer_failed`, so this counts the failures of the other observers
+      too, such as a `JsonLinesAudit` that can no longer write.
     """
 
     def __init__(self, meter: Any = None) -> None:
@@ -167,6 +175,24 @@ class OpenTelemetryMetrics:
             description="Share of an exact search's top k that came back, for sampled retrievals.",
             explicit_bucket_boundaries_advisory=list(RECALL_BUCKETS),
         )
+        self._samples = meter.create_counter(
+            "wardowl.recall_samples",
+            unit="{retrieval}",
+            description="Retrievals recall_sample_rate sampled, by what happened to the sample.",
+        )
+        self._observer_failures = meter.create_counter(
+            "wardowl.observer_failures",
+            unit="{event}",
+            description="Retrieval events an observer raised on, so an audit log or exporter may have lost them.",
+        )
+
+    def observer_failed(self, observer: Any, event: RetrievalEvent, error: BaseException) -> None:
+        """Count one event that `observer` raised on. The retriever calls it; see `wardowl.events`."""
+        common: dict[str, str] = {"wardowl.action": event.action}
+        if event.strategy:
+            common["wardowl.strategy"] = event.strategy
+        name = str(getattr(observer, "__qualname__", None) or type(observer).__qualname__)
+        self._observer_failures.add(1, {**common, "wardowl.observer": name, "error.type": type(error).__name__})
 
     def __call__(self, event: RetrievalEvent) -> None:
         common: dict[str, str] = {"wardowl.action": event.action}
@@ -191,3 +217,5 @@ class OpenTelemetryMetrics:
             self._short.add(1, {**common, **why})
         if event.sampled_recall is not None:
             self._recall.record(event.sampled_recall, common)
+        if event.recall_sample:
+            self._samples.add(1, {**common, "wardowl.recall_sample": event.recall_sample})

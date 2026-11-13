@@ -11,6 +11,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from wardowl import (
+    AuditError,
     AuthorizationError,
     CachingAuthorizer,
     Document,
@@ -176,6 +177,117 @@ def test_failures_are_reported_and_still_raised_and_observers_cannot_break_retri
     assert asyncio.run(ok.aretrieve("leave", BOB)).hits[0].id == "handbook"
 
 
+class FullDisk(io.StringIO):
+    """A stream on a volume that has filled up."""
+
+    def write(self, text):
+        raise OSError(28, "No space left on device: /var/log/wardowl/audit.jsonl")
+
+
+def test_observer_failures_are_counted_and_retrieval_goes_on(caplog):
+    events = []
+    retriever = PermissionedRetriever(
+        InMemoryBackend(DOCS), MetadataACLAuthorizer(), observers=[JsonLinesAudit(FullDisk()), events.append]
+    )
+    assert retriever.observer_failures == 0
+    assert [h.id for h in retriever.retrieve("leave", BOB).hits] == ["handbook"]
+    assert [h.id for h in asyncio.run(retriever.aretrieve("leave", BOB)).hits] == ["handbook"]
+    assert retriever.observer_failures == 2  # best-effort by default, but no longer silent
+    assert [e.error for e in events] == [None, None] and "wardowl observer" in caplog.text
+
+
+@pytest.mark.parametrize("run", ["sync", "async"])
+def test_a_required_audit_log_that_cannot_be_written_fails_the_retrieval_closed(run):
+    events = []
+    retriever = PermissionedRetriever(
+        InMemoryBackend(DOCS),
+        MetadataACLAuthorizer(),
+        required_observers=[JsonLinesAudit(FullDisk())],
+        observers=[events.append],
+    )
+    with pytest.raises(AuditError, match=r"^the retrieval could not be recorded, so nothing was returned$") as failure:
+        if run == "sync":
+            retriever.retrieve("leave", BOB)
+        else:
+            asyncio.run(retriever.aretrieve("leave", BOB))
+    assert isinstance(failure.value.__cause__, OSError)  # the path stays out of the message
+    assert isinstance(failure.value, RuntimeError) and retriever.observer_failures == 1
+    (event,) = events  # the other observers hear what the caller got
+    assert (event.error, event.cause, event.returned_ids, event.complete) == ("AuditError", "OSError", (), False)
+    assert event.strategy == "prefilter" and event.examined == 1
+
+
+def test_required_observers_hear_first_and_a_working_one_changes_nothing():
+    heard, stream = [], io.StringIO()
+    audit = JsonLinesAudit(stream)
+    retriever = PermissionedRetriever(
+        InMemoryBackend(DOCS),
+        MetadataACLAuthorizer(),
+        required_observers=[lambda e: heard.append("audit"), audit],
+        observers=[lambda e: heard.append("metrics")],
+    )
+    assert [h.id for h in retriever.retrieve("leave", BOB).hits] == ["handbook"]
+    assert heard == ["audit", "metrics"] and json.loads(stream.getvalue())["returned_ids"] == ["handbook"]
+    assert retriever.observer_failures == 0
+
+
+def test_a_failed_retrieval_raises_its_own_error_whatever_a_required_observer_does():
+    def full(event):
+        raise OSError("disk full")
+
+    authz = FunctionAuthorizer(lambda s, h, a: (_ for _ in ()).throw(ConnectionError("down")))
+    retriever = PermissionedRetriever(InMemoryBackend(DOCS), authz, required_observers=[full])
+    with pytest.raises(AuthorizationError):
+        retriever.retrieve("leave", BOB)
+    with pytest.raises(AuthorizationError):
+        asyncio.run(retriever.aretrieve("leave", BOB))
+    assert retriever.observer_failures == 2
+
+
+def test_an_event_that_cannot_be_built_fails_a_retrieval_that_must_be_recorded(monkeypatch):
+    def broken(query, key):
+        raise RuntimeError("fingerprint bug")
+
+    monkeypatch.setattr("wardowl.retriever.query_fingerprint", broken)
+    events = []
+    retriever = PermissionedRetriever(
+        InMemoryBackend(DOCS), MetadataACLAuthorizer(), required_observers=[events.append], audit_key=KEY
+    )
+    with pytest.raises(AuditError) as failure:
+        retriever.retrieve("leave", BOB)
+    assert isinstance(failure.value.__cause__, RuntimeError) and events == []
+
+
+def test_an_observer_is_required_or_not_and_a_required_one_must_be_callable():
+    audit = JsonLinesAudit(io.StringIO())
+    with pytest.raises(ValueError, match="not both"):
+        PermissionedRetriever(
+            InMemoryBackend(DOCS), MetadataACLAuthorizer(), observers=[audit], required_observers=[audit]
+        )
+    with pytest.raises(TypeError, match="required observer"):
+        PermissionedRetriever(InMemoryBackend(DOCS), MetadataACLAuthorizer(), required_observers=["audit.jsonl"])
+
+
+def test_observers_hear_of_failed_observers_and_a_failure_there_changes_nothing(caplog):
+    heard = []
+
+    class Listener:
+        def __call__(self, event):
+            pass
+
+        def observer_failed(self, observer, event, error):
+            heard.append((observer, event.subject_id, type(error).__name__))
+            raise RuntimeError("listener bug")
+
+    def full(event):
+        raise OSError("disk full")
+
+    retriever = PermissionedRetriever(InMemoryBackend(DOCS), MetadataACLAuthorizer(), observers=[full, Listener()])
+    assert [h.id for h in retriever.retrieve("leave", BOB).hits] == ["handbook"]
+    assert heard == [(full, "bob", "OSError")]
+    assert "failed to record a failed observer" in caplog.text and retriever.observer_failures == 1
+
+
 def test_a_query_with_a_lone_surrogate_is_fingerprinted_not_refused():
     events = []
     retriever = PermissionedRetriever(
@@ -331,6 +443,33 @@ def test_opentelemetry_metrics_count_outcomes_and_never_identify_anyone():
     for metric in points.values():
         for point in metric:
             assert not {"bob", "ann", "leave", "salary"} & {str(v) for v in point.attributes.values()}
+
+
+def test_opentelemetry_metrics_count_the_failures_of_other_observers():
+    pytest.importorskip("opentelemetry.sdk")
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+    from wardowl.otel import OpenTelemetryMetrics
+
+    reader = InMemoryMetricReader()
+    metrics = OpenTelemetryMetrics(MeterProvider(metric_readers=[reader]).get_meter("test"))
+    audit = JsonLinesAudit(FullDisk())
+    best_effort = PermissionedRetriever(InMemoryBackend(DOCS), MetadataACLAuthorizer(), observers=[audit, metrics])
+    best_effort.retrieve("leave", BOB)
+    required = PermissionedRetriever(
+        InMemoryBackend(DOCS), MetadataACLAuthorizer(), required_observers=[audit], observers=[metrics]
+    )
+    with pytest.raises(AuditError):
+        required.retrieve("leave", BOB)
+
+    points = _points(reader)
+    (failed,) = points["wardowl.observer_failures"]  # once best-effort, once required
+    seen = (failed.attributes["wardowl.observer"], failed.attributes["error.type"], failed.value)
+    assert seen == ("JsonLinesAudit", "OSError", 2)
+    retrievals = points["wardowl.retrievals"]
+    outcomes = {(p.attributes["wardowl.outcome"], p.attributes.get("error.type")): p.value for p in retrievals}
+    assert outcomes == {("complete", None): 1, ("error", "AuditError"): 1}
 
 
 def test_a_failed_retrieval_reports_what_the_permission_service_raised():
