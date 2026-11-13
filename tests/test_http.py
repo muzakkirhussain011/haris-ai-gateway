@@ -247,6 +247,10 @@ def test_total_timeout_ends_the_request_in_flight_and_sends_nothing_after_it(ser
     with pytest.raises(AuthorizationError, match="timed out: total_timeout ran out") as cut:
         client.post_json("/x", payload, "test", deadline=deadline)
     assert isinstance(cut.value.__cause__, TimeoutError)
+    # A socket's timeout can fire a little before time.monotonic() reaches the deadline (Windows'
+    # clock is coarse), and a request with time left is still sent: wait until none is left.
+    while time.monotonic() <= deadline:
+        time.sleep(0.01)
     with pytest.raises(AuthorizationError, match="was not sent: total_timeout ran out") as late:
         client.post_json("/x", payload, "test", deadline=deadline)
     assert isinstance(late.value.__cause__, TimeoutError) and len(server.requests) == 2
