@@ -253,6 +253,22 @@ def test_the_async_client_is_asked_for_the_policy_too():
     assert [h.id for h in asyncio.run(backend.asearch("leave", 5))] == ["a"]
     assert trusted.asked == [("CONFIG", "GET", "search-on-timeout")]
 
+    class Unreadable(AsyncClient):
+        async def execute_command(self, *args):
+            if args[0] == "CONFIG":
+                self.asked.append(args)
+                raise PermissionError("NOPERM this user has no permissions to run the 'config' command")
+            if args[0] == "FT.CONFIG":
+                self.asked.append(args)
+                return []  # no such setting
+            return RESP2_REPLY
+
+    unreadable = Unreadable(None)
+    backend = RedisBackend(FakeClient(), "idx", EMBED, async_client=unreadable)
+    with pytest.raises(RuntimeError, match="policy is unknown, not fail") as refused:
+        asyncio.run(backend.asearch("leave", 5))
+    assert isinstance(refused.value.__cause__, PermissionError) and len(unreadable.asked) == 2
+
 
 def test_add_replaces_whole_hashes_with_hex_terms_and_exact_json():
     client = FakeClient()
