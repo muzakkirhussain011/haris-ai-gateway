@@ -46,7 +46,9 @@ The algorithm is written once, as a generator of operations; `retrieve` runs it 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import dataclasses
+import functools
 import logging
 import math
 import random
@@ -300,7 +302,8 @@ class PermissionedRetriever:
     filter cannot leak; with `recheck=False` they are matched against the filter locally instead,
     which needs the backend to return each chunk's metadata as stored (the conformance kit checks
     that). `observers` receive a `RetrievalEvent` for every call, and `audit_key` (at least 16
-    random bytes) adds an HMAC of the query to those events.
+    random bytes) adds an HMAC of the query to those events. `aretrieve` calls the observers in a
+    worker thread, so they may be called from several threads at once.
 
     `reranker` reorders the result after the permission check: the retriever finds the top
     `rerank_depth` hits the subject may read (or k, if larger, and at most `max_candidates`), the
@@ -436,7 +439,8 @@ class PermissionedRetriever:
         """The async form of `retrieve`, with the same arguments and guarantees.
 
         It uses the backend's `asearch` and the authorizer's `afilter_for` and `acheck` when they
-        exist, and runs the sync methods in a thread otherwise. The redactor runs in a thread.
+        exist, and runs the sync methods in a thread otherwise. The redactor runs in a thread, and so
+        do the observers, which have received the event before `aretrieve` returns or raises.
         """
         started, clock, timings = time.time(), time.perf_counter(), _Timings()
         try:
@@ -450,9 +454,13 @@ class PermissionedRetriever:
             except StopIteration as done:
                 result: RetrievalResult = done.value
         except BaseException as exc:  # a cancelled or interrupted call is reported too, then re-raised
-            self._emit(query, subject, k, started, clock, timings, None, exc)
+            event = self._built(query, subject, k, started, clock, timings, None, exc)
+            if isinstance(exc, (Exception, asyncio.CancelledError)):
+                await self._anotify(event)
+            else:  # GeneratorExit, KeyboardInterrupt, SystemExit: nothing more may be awaited
+                self._notify(event)
             raise
-        self._emit(query, subject, k, started, clock, timings, result, None)
+        await self._anotify(self._built(query, subject, k, started, clock, timings, result, None))
         return result
 
     def _emit(
@@ -466,18 +474,52 @@ class PermissionedRetriever:
         result: RetrievalResult | None,
         error: BaseException | None,
     ) -> None:
+        self._notify(self._built(query, subject, k, started, clock, timings, result, error))
+
+    def _built(
+        self,
+        query: str | Query,
+        subject: Subject,
+        k: int,
+        started: float,
+        clock: float,
+        timings: _Timings,
+        result: RetrievalResult | None,
+        error: BaseException | None,
+    ) -> RetrievalEvent | None:
+        """The event for the observers, or None when there are none or it cannot be built."""
         if not self.observers:
-            return
+            return None
         try:
-            event = self._event(query, subject, k, started, clock, timings, result, error)
+            return self._event(query, subject, k, started, clock, timings, result, error)
         except Exception:  # reporting must never replace what retrieval returns or raises
             _log.exception("wardowl could not build the retrieval event")
+            return None
+
+    def _notify(self, event: RetrievalEvent | None) -> None:
+        if event is None:
             return
         for observer in self.observers:
             try:
                 observer(event)
             except Exception:  # an observer must never change what retrieval returns or raises
                 _log.exception("wardowl observer %r failed", observer)
+
+    async def _anotify(self, event: RetrievalEvent | None) -> None:
+        """`_notify` in a worker thread, awaited. An audit sink writes to a file, a socket or a
+        collector, and can block: on the event loop it would hold up every other request."""
+        if event is None:
+            return
+        try:
+            delivered = asyncio.get_running_loop().run_in_executor(
+                None, functools.partial(contextvars.copy_context().run, self._notify, event)
+            )
+        except RuntimeError:  # the executor is shut down, as when the loop closes: deliver here
+            self._notify(event)
+            return
+        # Shielded: a call cancelled while its event is on the way stops waiting, but the event is
+        # still delivered, so every call is reported.
+        await asyncio.shield(delivered)
 
     def _event(
         self,

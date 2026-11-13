@@ -64,7 +64,7 @@ Content-Type: application/json
 | 413 | A body over `max_body_bytes` |
 | 422 | A malformed body, including one with a field the API does not define, or a value over its limit. Also a well-formed query the service cannot search as sent (`InvalidQuery`): `k` over the retriever's `max_candidates`, only a vector for a keyword backend, only text for a backend without an embed function, or a vector of the wrong length where the backend checks it (`FaissBackend`). The answer echoes nothing from the request or the backend |
 | 500 | A fault on the server's side, such as a misconfigured backend or reranker. Nothing is returned, and the error goes to the server's log |
-| 503 | The permission check, or the token's verification, could not be completed: nothing is returned, and the reason goes to the `wardowl` logger, not to the caller |
+| 503 | The permission check, or the token's verification, could not be completed, or the retrieval took longer than `retrieval_timeout`: nothing is returned, and the reason goes to the `wardowl` logger, not to the caller |
 
 A vector of the wrong length for a store that does not check it before searching (pgvector, Qdrant,
 Chroma and the other database clients report it with their own errors) answers 500: only the backend
@@ -181,6 +181,41 @@ authenticate = KeycloakAuthenticator(
 `directory` stands for wherever you map Keycloak's ids to yours; leave `subject` alone if your
 permissions already use Keycloak's ids.
 
+## Time bounds and threads
+
+```python
+app = create_app(retriever, authenticate, retrieval_timeout=10, max_workers=32)
+```
+
+`retrieval_timeout` (seconds) bounds each retrieval. One that takes longer is cancelled and answers
+503, "the retrieval did not finish in time, so nothing was returned": nothing it found reaches the
+caller. The `wardowl` logger records the timeout, and the retrieval's `RetrievalEvent` records
+`error = "CancelledError"`. The bound covers the retrieval, not the token's verification. None, the
+default, sets no bound: a store or permission service that never answers then holds the request
+for as long as it does.
+
+A synchronous store or authorizer call runs in a worker thread, and a thread cannot be stopped from
+outside. After the timeout the call runs on until its own client gives up, holding its thread, and
+its answer is discarded. Give every store and permission service its own timeouts as well
+([pgvector](pgvector.md#timeouts), [the permission services](../operations.md#resilience-of-remote-permission-services)):
+`retrieval_timeout` answers the caller on time, and theirs free the thread.
+
+`aretrieve` runs every synchronous call, the store's search and count, the authorizer's filters and
+checks, a reranker, a redactor and `CachingAuthorizer`'s Redis calls, in the event loop's default
+executor, and the observers too. Unless something replaces it, that executor has CPython's default
+size for a `ThreadPoolExecutor`, `min(32, CPUs + 4)` threads, which bounds how many of those calls
+run at once in each worker process; the rest wait for a free thread, and the wait counts against
+`retrieval_timeout`. `max_workers` replaces the default executor with a pool of that many threads while the
+application's lifespan runs, as it does under uvicorn. A mounted sub-application's lifespan does not
+run, so there, set the executor in your own application's lifespan with
+`asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=...))`. A
+synchronous authenticator runs in Starlette's own thread pool, not in this one.
+
+`GET /healthz` answers that the process is up. It does not touch the retriever, the stores or the
+threads, so it keeps answering while every retrieval is stuck; use it as a liveness probe only. With
+`retrieval_timeout`, stuck retrievals show up as 503 answers from `/v1/retrieve`, which your
+monitoring can count.
+
 ## In production
 
 - Terminate TLS in front of the service, and keep it on a private network with your stores and
@@ -189,6 +224,10 @@ permissions already use Keycloak's ids.
   projects. Keyword search scores can hint at what forbidden chunks contain (threat
   [T17](../threat-model.md)); do not pass them on to end users.
 - Every retrieval produces a `RetrievalEvent` for your observers, as anywhere else
-  ([Operations](../operations.md)); the service logs no query text.
+  ([Operations](../operations.md)); the service logs no query text. The observers run in a worker
+  thread, so an audit sink that blocks delays only the request whose event it is writing, not the
+  others.
+- Set `retrieval_timeout`, and size the thread pool with `max_workers` for the concurrency you
+  expect ([Time bounds and threads](#time-bounds-and-threads)).
 - Scale it out like any stateless web service. With a `CachingAuthorizer`, share its cache across
   replicas through Redis ([Revocation](../revocation.md)).

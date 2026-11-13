@@ -125,6 +125,15 @@ The tool is marked read-only, and returns structured results:
   details, which go to your logs and audit events.
 - Any other failure, such as `subject_for` raising, reaches the model only as a failed call; the
   traceback stays in the server's log.
+- With `add_search_tool(..., retrieval_timeout=10)` (seconds), a search that takes longer is
+  cancelled and ends with a tool error ("the search did not finish in time, so nothing was
+  returned"), and nothing it found reaches the model. The `wardowl` logger records the timeout, and
+  the retrieval's event records `error = "CancelledError"`. None, the default, sets no bound. A
+  synchronous store or authorizer call already running in a worker thread cannot be stopped and runs
+  on until its own client's timeout, so give the stores and permission services their own timeouts
+  too, as for the [HTTP service](http.md#time-bounds-and-threads).
 
-Everything else about retrieval applies as for any caller: the retriever's strategy, caching, audit
-events and metrics.
+The retriever runs synchronous store and authorizer calls, and the observers, in the event loop's
+default executor, which the server's process owns; the [HTTP service](http.md#time-bounds-and-threads)
+page explains its size and how to replace it. Everything else about retrieval applies as for any
+caller: the retriever's strategy, caching, audit events and metrics.

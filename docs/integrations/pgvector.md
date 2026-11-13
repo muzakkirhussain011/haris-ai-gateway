@@ -221,7 +221,9 @@ A statement that times out raises `SearchError` from the retriever, with the dri
 time, so `statement_timeout` cannot help when the statement never reaches it, or its answer never
 comes back. `tcp_user_timeout` and keepalives catch a network that drops packets, but not a peer,
 such as a proxy, that accepts and acknowledges everything and never answers: for that, bound the
-whole retrieval in your application, for example with `asyncio.wait_for` around `aretrieve`.
+whole retrieval in your application, for example with `asyncio.wait_for` around `aretrieve`, or
+with `retrieval_timeout` in the [HTTP service](http.md#time-bounds-and-threads) and the
+[MCP tool](mcp.md#failures).
 
 ## Async
 
