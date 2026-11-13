@@ -63,6 +63,18 @@ chunk between them can leave list fields the update does not know of. Every sear
 checks each hit's JSON copy against the filter, and drops a hit that the filter matches only
 through such a field.
 
+## One writer at a time
+
+`ChromaBackend` takes no `revision`, unlike pgvector and MongoDB: chromadb's `add`, `upsert` and
+`update` take no condition on the stored record, so there is no write that compares a revision and
+writes in one step. Its `add` (a delete, then an add) and its `set_metadata` (a read, then an
+update) are each two calls, and the write that lands last wins. When an indexer and a permission
+sync write the same document, a late write from data read before a revocation undoes it, so run
+the writes for each document one after another
+([One writer at a time for each document](../operations.md#one-writer-at-a-time-for-each-document)).
+`set_metadata` is not made a single call: that would mean reading each chunk's text and vector and
+writing them back, which opens a race of its own with an `add` of new text in between.
+
 ## How the filter becomes `where`
 
 `In(field, values)` becomes an `$or` of `$in` on the scalar field (one per value type, since

@@ -65,7 +65,10 @@ If your policy or your relationship tuples grant too much, wardowl returns too m
 `CerbosAuthorizer` send it to the policy, `OpenFGAAuthorizer` and `SpiceDBAuthorizer` read the
 resource id from it), the permissions copied onto chunks at ingestion time are what get enforced.
 When a document's sharing changes, re-index its chunks. How quickly you do that is your revocation
-delay for those chunks.
+delay for those chunks. The store keeps whichever write lands last, so the writes for one document
+must happen one after another: a re-index from data read before a revocation, landing after the
+revocation was written, undoes it. pgvector and MongoDB can also refuse such a write
+([One writer at a time for each document](operations.md#one-writer-at-a-time-for-each-document)).
 
 **The backend returns the metadata it stored.** The re-check protects against a backend that ignores
 the filter, not against one that returns different metadata than it stored. The pgvector backend

@@ -24,7 +24,8 @@ backend.add(documents)  # waits until the index shows them
 ```
 
 Each chunk is one document: `_id` (the document id), `content`, `metadata`, `embedding`, and two
-fields wardowl maintains, `wardowl_terms` and `wardowl_write`. `create_search_index`
+fields wardowl maintains, `wardowl_terms` and `wardowl_write` (and `wardowl_revision`, for writes
+given a [revision](#revisions)). `create_search_index`
 creates the collection if needed and a `vectorSearch` index named `wardowl`, with the vector
 (cosine similarity by default) and, as filter fields, the permission terms, the write marker and
 `_id`.
@@ -43,6 +44,45 @@ chunk is dropped rather than leaked, but `add` and `delete` close the gap by def
 
 Both raise `TimeoutError` after `wait_timeout` seconds (60 by default). Bulk ingestion that does not
 need to read its own writes can pass `wait=False`.
+
+## Revisions
+
+`add` and `set_metadata` replace what is stored, whenever their data was read, so when an indexer
+and a permission sync write the same document, a late write from data read before a revocation
+undoes it ([One writer at a time for each document](../operations.md#one-writer-at-a-time-for-each-document)).
+Run the writes for each document one after another. Pass `revision=`, a number your source raises
+on every change to the document, to have an older write refused as well:
+
+```python
+from wardowl.backends import StaleRevision
+
+backend.add(chunks, revision=7)  # the indexer, with the revision it read before the document
+try:
+    backend.set_metadata({cid: {**stored[cid], "allowed_users": []} for cid in chunk_ids}, revision=6)
+except StaleRevision as refused:
+    refused.ids, refused.revision  # the chunks stored with a newer revision, and 6
+```
+
+- The revision is stored on each chunk, in `wardowl_revision`, and a chunk stored with a newer one
+  is not replaced. The call raises `StaleRevision` naming those chunks; with `wait`, it first waits
+  for the chunks it did write, as usual.
+- Before writing, the call looks for chunks stored with a newer revision. If it finds one, it
+  writes nothing, chunks not stored before included.
+- Each chunk is then compared and written in one atomic update: for `add`, an update pipeline
+  (`$replaceWith` with `$cond`) that keeps a newer chunk as it was, with `upsert` for chunks not
+  stored; for `set_metadata`, a filter that matches only a chunk that is not newer. A newer write
+  that lands after the look is therefore never replaced either. The call is not one transaction,
+  though: in that case the chunks that are not newer are written, then the call raises.
+- A chunk written at the same revision is replaced, so a retry succeeds. A chunk that is not stored
+  has no revision: `add` writes it, and `set_metadata` ignores it, as without a revision.
+- A write without `revision` is not compared with anything, as before. `set_metadata` then leaves
+  the stored revision as it is; `add` replaces the whole document, so it removes it. Once a
+  document's writers pass revisions, have every one of them pass it.
+- Read the revision before the data you write, never after: a revision read after the data can be
+  newer than the data it labels.
+
+CI runs these cases against `mongodb/mongodb-atlas-local:8.0.30`, including a newer write that the
+look misses. It does not run two writers at once.
 
 ## Tuning
 

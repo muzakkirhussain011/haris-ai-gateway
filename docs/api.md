@@ -178,6 +178,8 @@ An observer is any callable that takes a `RetrievalEvent`.
 
 .. autoexception:: wardowl.backends.NothingMatches
 
+.. autoexception:: wardowl.backends.StaleRevision
+
 .. autoclass:: wardowl.backends.pgvector.PgVectorBackend
    :members: add, set_metadata, delete, search, asearch, count, supports_exact
 
