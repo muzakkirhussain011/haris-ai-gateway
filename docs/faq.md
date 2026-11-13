@@ -16,8 +16,9 @@ from the permission system returns nothing.
 
 ## How do I stop a RAG chatbot from showing users documents they are not allowed to see?
 
-Enforce document permissions at retrieval, before the LLM sees any text. Telling the model in a prompt to
-withhold documents does not work, because whatever reaches the prompt can come out in the answer.
+Enforce document permissions at retrieval, before the LLM sees any text. Telling the model in a
+prompt to withhold documents does not work, because whatever reaches the prompt can come out in the
+answer.
 With wardowl, you pass the authenticated user to `PermissionedRetriever.retrieve`. It returns only
 chunks that user may read, and on any error from the permission system it returns nothing rather
 than everything. The [quickstart](quickstart.md) shows the whole setup in a few lines.
