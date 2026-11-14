@@ -41,8 +41,6 @@ All notable changes are recorded here. The format follows
   since a minor release never weakens a default that keeps a protection on. New sections cover
   tokens without groups and where to find why a token was refused; the MCP page's stdio example and
   the production failure table say the same.
-### Documentation
-
 - What a rise in `violations` can mean. Concepts, the quickstart and the README said it means the
   store ignored the filter, and the runbook looked only for a store bug; it also rises when another
   tool leaves the permission terms stale on the stores that keep them, when MongoDB's index has not
