@@ -63,12 +63,13 @@ Content-Type: application/json
 | 401 | No bearer token, or one that fails verification. The answer is the same whatever the reason; `OIDCAuthenticator` logs the check that failed ([Why a token was refused](#why-a-token-was-refused)) |
 | 413 | A body over `max_body_bytes` |
 | 422 | A malformed body, including one with a field the API does not define, or a value over its limit. Also a well-formed query the service cannot search as sent (`InvalidQuery`): `k` over the retriever's `max_candidates`, only a vector for a keyword backend, only text for a backend without an embed function, or a vector of the wrong length where the backend checks it (`FaissBackend`). The answer echoes nothing from the request or the backend |
-| 500 | A fault on the server's side, such as a misconfigured backend or reranker. Nothing is returned, and the error goes to the server's log |
+| 500 | A fault on the server's side, and nothing is returned. A search or count the store could not complete (`SearchError`: the store unreachable or misconfigured, or refusing the query) answers "the search could not be completed, so nothing was returned", echoing nothing, and the store's error goes to the `wardowl` logger with the traceback. Any other fault, such as a misconfigured reranker, goes to the server's log |
 | 503 | The permission check, or the token's verification, could not be completed, or the retrieval took longer than `retrieval_timeout`: nothing is returned, and the reason goes to the `wardowl` logger, not to the caller |
 
 A vector of the wrong length for a store that does not check it before searching (pgvector, Qdrant,
-Chroma and the other database clients report it with their own errors) answers 500: only the backend
-can tell that the request was at fault, and it says so by raising `wardowl.InvalidQuery`.
+Chroma and the other database clients report it with their own errors) answers 500, as a failed
+search: only the backend can tell that the request was at fault, and it says so by raising
+`wardowl.InvalidQuery`.
 
 ## Who the caller is
 
@@ -215,14 +216,28 @@ if it does so itself.
 ### Mapping a real provider's tokens
 
 What lands in `sub`, `groups` and the tenant claim is set by your identity provider, and the
-defaults rarely match the ids in your permissions. With Keycloak, for example:
+defaults rarely match the ids in your permissions. Whatever the provider:
+
+- **Ids and groups are compared exactly.** `OIDCAuthenticator` passes `sub` and the groups
+  through unchanged, and nothing in wardowl lowercases or trims them, so write them in your
+  permissions exactly as the token carries them. Permissions synced from Google Drive hold
+  lowercased addresses ([Google Drive](google-drive.md#how-drive-sharing-maps-onto-subjects)).
+- **The tenant claim arrives as a string.** `OIDCAuthenticator` refuses a token whose tenant claim
+  is empty or not a string, and stores the claim in the subject's attribute `tenant`. A chunk whose
+  tenant is the number `42` does not match `"42"`, so store tenants as strings, or convert the
+  claim by overriding `subject`, as below ([Tenant isolation](../combining.md#tenant-isolation)).
+
+With Keycloak, for example:
 
 - **`sub` is Keycloak's own user id**, a generated UUID, not the username. Write your permissions
   with that id, or map it to your own ids by overriding `subject`, which receives the verified
   claims. A username or email address is a safe id only if users cannot change it.
 - **Groups come with their full path by default** (`/hr`, `/acme/hr`) from the group membership
   mapper. Write your permissions the same way. Turning "Full group path" off sends `hr`, and then
-  `/acme/hr` and `/globex/hr` arrive as the same group.
+  `/acme/hr` and `/globex/hr` arrive as the same group. Paths such as `/acme/hr` also pass
+  OpenFGA's and SpiceDB's rules for ids; display names with spaces do not, and raise
+  `UnsupportedSubject` when groups are sent to them ([OpenFGA](openfga.md#the-model),
+  [SpiceDB](spicedb.md#the-schema)).
 - **A claim that decides access must be one only administrators can set.** A user attribute
   mapped into the token, such as a tenant, must be declared in the realm's user profile with only
   administrators allowed to edit it; otherwise users can change it in the account console.

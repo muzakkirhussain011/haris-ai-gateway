@@ -104,7 +104,11 @@ authorizer = CachingAuthorizer(openfga, ttl=30, shared=shared, namespace="openfg
   the end of the invalidation's hold (on the wall clock, like entries' expiry times), so every
   replica that reads it keeps nothing for that subject until then, whatever its own
   `source_staleness`. Epochs stay in Redis for `ttl` plus `source_staleness` plus an hour. During a
-  rolling upgrade, replicas of earlier versions ignore the hold. An attacker who can write to your
+  rolling upgrade, replicas of earlier versions ignore the hold. An answer such a replica caches
+  during the hold is used by upgraded replicas too, once the hold ends, until it expires: until
+  every replica holds back, a revocation reported with `invalidate()` is bounded on every replica
+  by `ttl` plus the service's own delay, as without `invalidate()`. Upgrading from 2.1.1 or 2.0.2,
+  which have the hold, avoids it. An attacker who can write to your
   Redis and copies back a signed entry together with its old epoch can extend a decision only until
   that entry's own expiry, at most `ttl` after the permission service gave it.
 - **What an invalidation costs, and where it waits.** For each subject id, `RedisCache` keeps an
@@ -303,7 +307,7 @@ what CI tests:
 
 | Backend | A large `In` | Tested in CI |
 |---|---|---|
-| pgvector | Up to 100 values: one GIN-indexed containment test per value. Above that: two array parameters, so the query stays small and far below PostgreSQL's limit of 65,535 parameters (the GIN index does not serve that clause; the HNSW scan filters as it goes) | a subject in 40,000 groups |
+| pgvector | Up to 100 values: one GIN-indexed containment test per value. Above that: two array parameters, so the query stays small and far below PostgreSQL's limit of 65,535 parameters (the GIN index does not serve that clause; the HNSW scan filters as it goes); an `Or` of hundreds of `In` clauses can still pass that limit ([pgvector](integrations/pgvector.md#how-the-filter-becomes-sql)) | a subject in 40,000 groups |
 | Qdrant | One `MatchAny` per value type | 10,000 groups |
 | Elasticsearch, OpenSearch | One `terms` query, at most `index.max_terms_count` values (65,536 by default) | 10,000 groups |
 | Chroma | `$in`, plus one equality clause per value of a list field, nested 16 to an `$or`: large filters slow every query. A `where` beyond [conservative bounds](integrations/chroma.md#very-large-filters) (about 3,200 groups) is not sent: the backend searches under the part every match must meet, or none, and filters 1,000 candidates itself | a subject in 1,001 groups and in 40,000 |
@@ -317,6 +321,10 @@ groups. To keep filters small:
   irrelevant to retrieval.
 - Use coarser groups where the source allows it: one department rather than its fifty teams.
 - Wrap the authorizer in `CachingAuthorizer`, so a large filter is computed once per `ttl`.
+
+With `RedisCache`, each cached filter is one JSON entry in Redis holding every value of the filter
+(the subject id's index holds only the entry's name), and every replica that uses it reads it again
+after `local_ttl`; `maxsize` counts entries, not bytes, and nothing bounds an entry's size.
 
 ## Audit events
 
@@ -461,7 +469,7 @@ either.
 
 | Signal | Metric | Why |
 |---|---|---|
-| Any violation | `wardowl.violations` increases | The backend returned chunks outside the filter. Nothing leaked, because the re-check caught them, but the backend or its translation has a bug. |
+| Any violation | `wardowl.violations` increases | The store returned chunks that the re-check rejected. Nothing leaked, because the re-check caught them. Causes: a bug in the store or its translation; permission terms another tool left stale; MongoDB's index catching up after `add` or `set_metadata`; an authorizer whose filter selects more than its `check` allows; a permission changed between the filter and the check. The [runbook](runbook.md#the-violations-count-rose) tells them apart. |
 | Authorization failures | `wardowl.retrievals` with `error.type = AuthorizationError` | The permission service is failing. Users are getting errors, which is the safe outcome, but it is an outage. |
 | Incomplete results | Share of `wardowl.outcome = incomplete` | Post-filtering is hitting `max_candidates`: raise it, or move to pre-filtering. Or an approximate index returned fewer than k hits under the permission filter: it stopped early, or the user may read fewer than k matching chunks, and wardowl cannot tell which. Tune the store's filtered search ([pgvector's scan limits](integrations/pgvector.md#iterative-index-scans), [Qdrant's ACORN](integrations/qdrant.md#filters-on-common-values)), or tell the two apart and repair the misses with [`short_results`](concepts.md#short-results). |
 | Index misses | `wardowl.short_results` with `wardowl.shortfall = missed`, and `wardowl.sampled_recall` falling | The index is missing chunks users may read: short results it cut off, or full results that are not the true top k. Raise the store's search limits, or repair short results with `short_results="exact"`. |

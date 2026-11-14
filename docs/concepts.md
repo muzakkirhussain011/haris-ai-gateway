@@ -171,9 +171,6 @@ The others known are:
   storing it ([Writes become searchable shortly after](integrations/mongodb.md#writes-become-searchable-shortly-after)).
   A retrieval in between can match a replaced chunk by its old terms, for example while
   `set_metadata` writes a revocation, and the re-check, which reads the new metadata, rejects it.
-- **Chroma records without wardowl's JSON copy of the metadata**, written by another tool or kept
-  from needtoknow 1.x, which named the copy `needtoknow_metadata`. They can match the filter on
-  their plain fields, and are read as carrying no permissions.
 - **An authorizer whose filter selects more than its `check` allows**: an OPA policy whose filter
   and decisions differ, or chunks whose fields have a shape the policy does not expect, such as a
   list where OpenFGA or SpiceDB expects one resource id, or where a Cerbos rule compares with `==`.

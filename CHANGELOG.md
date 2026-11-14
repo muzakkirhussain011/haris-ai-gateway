@@ -183,6 +183,26 @@ All notable changes are recorded here. The format follows
   `ainvalidate` works in a worker thread while the event loop runs and finishes when cancelled,
   and a subject's entries, epoch and index hash to one cluster slot (by redis-py's slot function;
   Redis Cluster itself is not tested in CI).
+- The HTTP service's `/v1/retrieve` handler answers a search or count the store could not complete
+  (`SearchError`) itself, with the documented 500. It caught `TimedOut`, `AuthorizationError` and
+  `InvalidQuery`, but not `SearchError`, which left the application: Starlette answered 500 and
+  raised it again, uvicorn logged "Exception in ASGI application" and closed the connection, and a
+  client that reused the connection had its next request reset. An acceptance run hit it with a
+  vector of the wrong dimension for a pgvector column (16 numbers for 384), which PostgreSQL
+  refuses: the 500 came back, and the next request on that connection, to `/healthz`, failed with
+  "Connection reset by peer". The handler now logs the error, with the store's exception as its
+  cause, on the `wardowl` logger, and answers "the search could not be completed, so nothing was
+  returned", which echoes nothing from the request or the store. The status stays 500, as the HTTP
+  page documents for this case; U16 in the readiness review notes the same missing handler. Any
+  other exception from the retrieval (an `AuditError` from a required observer, a reranker or
+  redactor that raises) is answered the same way, with "the retrieval failed on the server, so
+  nothing was returned", instead of leaving the application. The
+  MCP tool needed no change: the MCP SDK catches the error, logs it with its traceback, and ends
+  the call with an error that names only the tool ("Error executing tool search"), as the MCP page
+  says. Tests: a store whose search fails and one whose
+  count fails each answer that 500 without the test client raising, log the error with its cause,
+  and the client's next request succeeds. The test client keeps no connection alive, so the reset
+  itself was seen only under uvicorn, in the acceptance run.
 
 ### Documentation
 
@@ -251,8 +271,7 @@ All notable changes are recorded here. The format follows
 - What a rise in `violations` can mean. Concepts, the quickstart and the README said it means the
   store ignored the filter, and the runbook looked only for a store bug; it also rises when another
   tool leaves the permission terms stale on the stores that keep them, when MongoDB's index has not
-  caught up with a write, for Chroma records without wardowl's JSON copy (a collection kept from
-  needtoknow 1.x among them), when an authorizer's filter selects more than its `check` allows, and
+  caught up with a write, when an authorizer's filter selects more than its `check` allows, and
   when a permission changes between the filter and the check. The runbook lists each cause with how
   to tell it and what to do, and shows how to find the rejected chunks; the production page's
   failure table and its identity checklist (ids and groups are compared exactly, never lowercased)
@@ -267,6 +286,32 @@ All notable changes are recorded here. The format follows
   pages say how to keep tenants apart, Combining that a tenant from `OIDCAuthenticator` is a
   string, the MCP page which group names permission services refuse, and the pgvector and
   Cassandra pages what very large filters cost.
+- The HTTP service page and the `wardowl.server` docstring say what a failed search answers: 500
+  with a fixed message, and the store's error on the `wardowl` logger (see Fixed). A vector of the
+  wrong length for a database store answers that way.
+- Operations: the "Any violation" alert names the causes of a rise besides a store bug (permission
+  terms another tool left stale, MongoDB's index catching up after `add` or `set_metadata`, an
+  authorizer whose filter selects more than its `check` allows, a permission changed between the
+  filter and the check) and points to the runbook, which tells them apart.
+- A rolling upgrade from a version without the invalidation hold, such as 2.1.0 (U10 in the
+  readiness review): an answer such a replica caches during the hold is used by upgraded replicas
+  too once the hold ends, until it expires, so until every replica holds back, a revocation
+  reported with `invalidate()` is bounded by `ttl` plus the service's own delay. Operations and step
+  8 of the upgrading guide say so, and that upgrading from 2.1.1 or 2.0.2 avoids it.
+- Subjects in very many groups (U38): on pgvector, an `Or` of hundreds of `In` clauses can still
+  pass PostgreSQL's limit of 65,535 parameters; with `RedisCache`, each cached filter is one entry
+  holding every value of the filter, read again by every replica that uses it after `local_ttl`,
+  and nothing bounds its size.
+- MongoDB (U6): `set_metadata` waits for the search index as `add` does, and a replaced chunk that
+  the index still matches by its old terms is counted in `violations` while the write waits; the
+  wait blocks only the writer.
+- MongoDB, Elasticsearch and Weaviate (U3): as on the Milvus page, recompute the permission terms
+  in the same write as every change to the metadata; terms left stale either raise `violations` or
+  hide the chunk from pre-filtered searches, which nothing reports.
+- HTTP service, mapping a provider's tokens (U15, U27, U37): ids and groups are compared exactly,
+  never lowercased or trimmed; the tenant claim is a string, which a chunk whose tenant is a number
+  does not match; Keycloak's group paths pass OpenFGA's and SpiceDB's rules for ids, and group names
+  with spaces raise `UnsupportedSubject` when groups are sent to them.
 
 ## [3.0.0] - 2026-11-14
 
