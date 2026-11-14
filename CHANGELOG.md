@@ -6,6 +6,120 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-11-14
+
+A major release, because several fixes change documented behaviour that 2.1 code may rely on: a
+failure in the vector store raises `SearchError` instead of the store client's own exception,
+`complete` is False for a short result from an approximate index, `SpiceDBAuthorizer` gives no
+filter when its lookup finds nothing, `RedisBackend` refuses RESP2 answers unless the server fails
+searches that run out of time, and `aretrieve` calls observers in a worker thread. It adds
+`short_results`, which tells why a pre-filtered result came back short and can search again,
+`recall_sample_rate`, `revision` on pgvector and MongoDB writes, `required_observers` for an audit
+log that must record every retrieval, and time bounds for the HTTP service, the MCP tool and the
+HTTP authorizers. The two security fixes, with the additions and the Chroma fix they need, were
+released in 2.1.1 and 2.0.2 too.
+[Upgrading](https://muzakkirhussain011.github.io/wardowl/upgrading.html) lists what to change.
+
+### Changed
+
+- A failure in the backend's search or count, the searches `short_results` runs again included,
+  raises `SearchError` with a fixed message, "search failed" or "count failed", and the store
+  client's exception as its `__cause__`. It reached the caller as the client's own exception, with
+  its own text, which can name hosts (a Qdrant error carries the raw response), while agent
+  frameworks show a tool's error to the model: the guarantee the retriever states for authorizer
+  failures now holds for the store too. `InvalidQuery` from a backend is still raised as it is;
+  any other `ValueError` or `TypeError` a backend raises is now a `SearchError` too, such as a `k`
+  above what Elasticsearch, OpenSearch, MongoDB or Pinecone (10,000) or Cassandra (1,000) return in
+  one query, which only a `max_candidates` above that limit lets through, or a field name the store
+  cannot filter on. Code that caught a store client's exceptions, or such a `ValueError`, around
+  `retrieve` should catch `SearchError` and read `__cause__`. `SearchError` is a `RuntimeError`, not
+  an `AuthorizationError`. `RetrievalEvent.error`, and `error.type` in OpenTelemetry, now say
+  `SearchError`; `RetrievalEvent.cause`, and the span attribute `wardowl.error.cause`, name the store
+  client's exception. Alerts that matched the store client's exception in `error.type` should match
+  `SearchError`. The paper's fault experiment X7 found it: 28,125 failures under store faults
+  surfaced as psycopg, psycopg-pool, qdrant-client and JSON exceptions.
+- `RetrievalResult.complete` is no longer True for a short or empty result from an approximate
+  search. A pre-filtered result with fewer hits than were asked for, an empty one included, is
+  complete only when the backend declares exact search, or when `short_results` (see Added) has
+  the backend count no more chunks matching the filter than came back; post-filtering that runs
+  out of candidates inside a scope is complete only when the backend declares exact search. The
+  acceptance run on Kaggle found pgvector returning no rows at all to least-privileged users who
+  could read several hundred chunks, because its iterative index scan stopped at
+  `hnsw.max_scan_tuples` or at its memory limit, and wardowl reported those empty results as
+  complete. That contradicted the field's documented meaning, "False when wardowl knows
+  results may be missing"; this corrects it. Users who may read fewer than k chunks now get
+  `complete=False` on approximate stores under the default `short_results="report"`, which cannot
+  tell them apart from an index that stopped early. Nothing else changes: the same searches run,
+  the same hits come back, and the safety guarantees are unchanged. Post-filtering without a filter
+  still reads a short candidate list as the end of the store. Alerts on `complete=False`, or on
+  `wardowl.outcome = incomplete`, see these results too; to tell them apart, pass
+  `short_results="count"` on a backend that can count (pgvector and Qdrant in vector mode), which
+  makes a result complete when the count shows the user may read no more, or `"exact"` or
+  `"widen"` to search again after a miss.
+- Backends can declare `exact_search = True` when `search` ranks every chunk that matches the
+  filter, so a result with fewer than k hits proves nothing else matches. It is optional and read
+  with `getattr`, not a required member of the `SearchBackend` protocol, so existing backends still
+  satisfy it. `InMemoryBackend` declares it, and `FaissBackend` does when its index is flat (the
+  default) or an ID map around a flat index. `RankFusion` does not, even over exact backends: it
+  leaves out chunks whose metadata differs between backends after each has filled its list, so a
+  short fused list proves nothing. `QdrantBackend` declares it when its `search_params` force exact
+  search (see Added). No other built-in backend declares it, so their short results are reported
+  with `complete=False`. A subclass of `InMemoryBackend` that drops hits on purpose, to stand in
+  for an approximate index, must now set `exact_search = False`: otherwise the retriever reports
+  its short results as complete, and `check_backend` checks it as exact.
+- `check_backend` checks a backend that declares `exact_search` as exact, whatever `exact=` says,
+  since the retriever takes its short results as proof that nothing else matches. A backend of your
+  own that declares it must return every matching document up to k, or stop declaring it. Where a
+  backend has `count` or declares `supports_exact` (see Added), the kit checks those too, so a
+  backend with a member of either name that means something else fails the kit: rename it.
+- `SpiceDBAuthorizer.filter_for` returns no filter when LookupResources finds no document, so the
+  retriever post-filters and CheckBulkPermissions decides each candidate. The stream has no end
+  marker, so one cut off before its first line by a proxy or a fault read as "nothing is readable",
+  and retrieval returned nothing without an error: under X7's fault that emptied SpiceDB's answers,
+  4,746 retrievals did. Subjects who truly read nothing now cost a post-filtered search, and under
+  `strategy="prefilter"` they raise `ValueError`, as a truncated lookup already did; pass
+  `trust_empty_lookup=True` to keep the earlier behaviour, or use `strategy="auto"`. Code that
+  calls `filter_for` itself gets None for such a subject, where it got an `In` with no values.
+  OpenFGA's ListObjects is unchanged: its answer is one JSON document, which a cut would break, and
+  a deadline-cut list already gives no filter.
+- `OpenFGAAuthorizer` and `SpiceDBAuthorizer` raise `UnsupportedSubject` (see Added) for a subject
+  id or group they cannot send, where OpenFGA raised a plain `AuthorizationError` and SpiceDB's
+  requests failed with one after its HTTP 400 (see Fixed). It is an `AuthorizationError`, so
+  retrieval still fails closed and `except AuthorizationError` still catches it, but it is also a
+  `ValueError`: an `except ValueError` placed before `except AuthorizationError` around `retrieve`
+  now catches it. Catch `AuthorizationError` first.
+- `RedisBackend` no longer takes a RESP2 answer on trust. Under the Query Engine's default
+  `search-on-timeout` policy, `return`, a search that runs out of time answers with the results
+  found so far; a RESP3 answer then carries a warning, on which the backend already raised, but a
+  RESP2 answer carries nothing, and the retriever reported such a result as complete whenever it
+  held k hits (M14 in the readiness review). The first time a search is answered in RESP2, the
+  backend now reads the policy (`CONFIG GET search-on-timeout`, or `FT.CONFIG GET ON_TIMEOUT` on
+  Redis Stack) and raises `RuntimeError`, which the retriever reports as `SearchError`, unless it
+  is `fail`; a server that refuses both commands counts as not `fail`. It asks again on each RESP2
+  answer until it reads `fail`. Clients that speak RESP3, as redis-py 8.1 does by default, and
+  servers set to `fail`, as the Redis page has advised for production, see no change. Otherwise
+  set `search-on-timeout fail`, connect with `protocol=3`, or pass `check_timeout_policy=False`.
+  An FT.SEARCH answer that is neither a RESP2 list nor a RESP3 map, as from a client that parses it
+  into its own object, raises a `TypeError` that names its type, whatever `check_timeout_policy`
+  says: pass a client whose `execute_command` returns the answer as a list or a mapping.
+- `aretrieve` calls the observers in a worker thread of the event loop's default executor, and waits
+  for them before it returns or raises, as before. They ran on the event loop, so an audit sink that
+  blocked on its stream (a full disk, a network mount, a collector that stopped reading) stopped
+  every request the HTTP service or the MCP server was serving until the write returned. Now it
+  delays only the request whose event it writes. The event is still built when the retrieval ends,
+  so its timings do not include the wait for a thread, and a call cancelled while its event is on
+  the way stops waiting, while the event is still delivered. Observers must be thread-safe, as they
+  already had to be for `retrieve` called from several threads; `JsonLinesAudit` and the
+  OpenTelemetry observers are. Context variables are copied into the thread, but no event loop
+  runs there: an observer that hands events to the loop, to an `asyncio.Queue` say, must do it with
+  `loop.call_soon_threadsafe`. `retrieve` still calls observers in the caller's thread. A
+  retrieval closed without finishing (`GeneratorExit`) still calls them in place, since it can
+  await nothing more. Required observers (see Added) run there too, first, and `observer_failures`
+  is counted under a lock.
+- The MCP server's search tool now sets all four MCP tool hints explicitly: besides read-only and
+  closed world, not destructive and idempotent, so a host does not have to assume a default for any
+  of them.
+
 ### Added
 
 - `revision=` on `add` and `set_metadata` of `PgVectorBackend` and `MongoDBBackend`, and
@@ -32,7 +146,8 @@ All notable changes are recorded here. The format follows
   the `ValueError` that `filter_to_where` raises for such a filter. See Fixed.
 - `PermissionedRetriever(short_results=...)` decides what happens when a pre-filtered search on an
   approximate index returns fewer hits than were asked for. `"report"` (the default) returns them
-  with `complete=False`, as before, and runs nothing more. `"count"` asks the backend how many
+  with `complete=False`, as `complete` now reports them (see Changed), and runs nothing more.
+  `"count"` asks the backend how many
   chunks match the filter: no more than came back proves that the user may read no more, and the
   result is complete; more proves that the index missed some. `"exact"` also searches again,
   exactly, under the same filter, when the count shows a miss and is at most `max_exact_rows`
@@ -138,79 +253,6 @@ All notable changes are recorded here. The format follows
   set or documented. None, the default, leaves the executor alone, as before. The HTTP service page
   documents both settings, and that `/healthz` reports liveness only.
 
-### Changed
-
-- `aretrieve` calls the observers in a worker thread of the event loop's default executor, and waits
-  for them before it returns or raises, as before. They ran on the event loop, so an audit sink that
-  blocked on its stream (a full disk, a network mount, a collector that stopped reading) stopped
-  every request the HTTP service or the MCP server was serving until the write returned. Now it
-  delays only the request whose event it writes. The event is still built when the retrieval ends,
-  so its timings do not include the wait for a thread, and a call cancelled while its event is on
-  the way stops waiting, while the event is still delivered. Observers must be thread-safe, as they
-  already had to be for `retrieve` called from several threads; `JsonLinesAudit` and the
-  OpenTelemetry observers are. A retrieval closed without finishing (`GeneratorExit`) still calls
-  them in place, since it can await nothing more. Required observers (see Added) run there too,
-  first, and `observer_failures` is counted under a lock.
-- `RedisBackend` no longer takes a RESP2 answer on trust. Under the Query Engine's default
-  `search-on-timeout` policy, `return`, a search that runs out of time answers with the results
-  found so far; a RESP3 answer then carries a warning, on which the backend already raised, but a
-  RESP2 answer carries nothing, and the retriever reported such a result as complete whenever it
-  held k hits (M14 in the readiness review). The first time a search is answered in RESP2, the
-  backend now reads the policy (`CONFIG GET search-on-timeout`, or `FT.CONFIG GET ON_TIMEOUT` on
-  Redis Stack) and raises `RuntimeError`, which the retriever reports as `SearchError`, unless it
-  is `fail`; it asks again on each RESP2 answer until it reads `fail`. Clients that speak RESP3,
-  as redis-py 8.1 does by default, and servers set to `fail`, as the Redis page has advised for
-  production, see no change. Otherwise set `search-on-timeout fail`, connect with `protocol=3`, or
-  pass `check_timeout_policy=False`. An FT.SEARCH answer that is neither a RESP2 list nor a RESP3
-  map, as from a client that parses it into its own object, raises a `TypeError` that names its
-  type.
-
-- The MCP server's search tool now sets all four MCP tool hints explicitly: besides read-only and
-  closed world, not destructive and idempotent, so a host does not have to assume a default for any
-  of them.
-- `RetrievalResult.complete` is no longer True for a short or empty result from an approximate
-  search. A pre-filtered result with fewer hits than were asked for, an empty one included, is
-  complete only when the backend declares exact search; so is post-filtering that runs out of
-  candidates inside a scope. The acceptance run on Kaggle found pgvector returning no rows at all
-  to least-privileged users who could read several hundred chunks, because its iterative index
-  scan stopped at `hnsw.max_scan_tuples` or at its memory limit, and wardowl reported those empty
-  results as complete. That contradicted the field's documented meaning, "False when wardowl knows
-  results may be missing"; this corrects it. Users who may read fewer than k chunks now get
-  `complete=False` on approximate stores, which cannot tell them apart from an index that stopped
-  early. Nothing else changes: the same searches run, the same hits come back, and the safety
-  guarantees are unchanged. Post-filtering without a filter still reads a short candidate list as
-  the end of the store.
-- Backends can declare `exact_search = True` when `search` ranks every chunk that matches the
-  filter, so a result with fewer than k hits proves nothing else matches. It is optional and read
-  with `getattr`, not a required member of the `SearchBackend` protocol, so existing backends still
-  satisfy it. `InMemoryBackend` declares it, and `FaissBackend` does when its index is flat (the
-  default) or an ID map around a flat index. `RankFusion` does not, even over exact backends: it
-  leaves out chunks whose metadata differs between backends after each has filled its list, so a
-  short fused list proves nothing. `QdrantBackend` declares it when its `search_params` force exact
-  search (see Added). Every other built-in backend searches approximately and does not declare it.
-  A subclass of `InMemoryBackend` that drops hits on purpose should set `exact_search = False`.
-- `check_backend` checks a backend that declares `exact_search` as exact, whatever `exact=` says,
-  since the retriever takes its short results as proof that nothing else matches.
-- A failure in the backend's search or count, the searches `short_results` runs again included,
-  raises `SearchError` with a fixed message, "search failed" or "count failed", and the store
-  client's exception as its `__cause__`. It reached the caller as the client's own exception, with
-  its own text, which can name hosts (a Qdrant error carries the raw response), while agent
-  frameworks show a tool's error to the model: the guarantee the retriever states for authorizer
-  failures now holds for the store too. `InvalidQuery` from a backend is still raised as it is.
-  Code that caught a store client's exceptions around `retrieve` should catch `SearchError` and read
-  `__cause__`. `SearchError` is a `RuntimeError`, not an `AuthorizationError`. The paper's fault
-  experiment X7 found it: 28,125 failures under store faults surfaced as psycopg, psycopg-pool,
-  qdrant-client and JSON exceptions.
-- `SpiceDBAuthorizer.filter_for` returns no filter when LookupResources finds no document, so the
-  retriever post-filters and CheckBulkPermissions decides each candidate. The stream has no end
-  marker, so one cut off before its first line by a proxy or a fault read as "nothing is readable",
-  and retrieval returned nothing without an error: under X7's fault that emptied SpiceDB's answers,
-  4,746 retrievals did. Subjects who truly read nothing now cost a post-filtered search, and under
-  `strategy="prefilter"` they raise `ValueError`, as a truncated lookup already did; pass
-  `trust_empty_lookup=True` to keep the earlier behaviour. OpenFGA's ListObjects is unchanged: its
-  answer is one JSON document, which a cut would break, and a deadline-cut list already gives no
-  filter.
-
 ### Security
 
 - `CachingAuthorizer.invalidate()` no longer lets a permission service that is itself behind refill
@@ -226,9 +268,6 @@ All notable changes are recorded here. The format follows
   on other replicas. With `source_staleness` 0, the default for every authorizer but
   `SpiceDBAuthorizer` without `fullyConsistent`, nothing changes. Replicas of earlier versions
   sharing the cache during an upgrade do not see the hold.
-
-### Security
-
 - `ChromaBackend` no longer sends Chroma a filter that can crash the application. With chromadb
   1.5.9's embedded client, the first search by a subject in 40,000 groups ended the Python process
   with a segmentation fault, without an exception or a message, in 5 of 5 processes (the filter-size
@@ -257,8 +296,6 @@ All notable changes are recorded here. The format follows
   match, which the retriever reports as `complete=False`. `filter_to_where` returns the nested form
   and raises `FilterTooLarge` beyond the bounds. CI searches real Chroma for subjects in 1,001 and
   in 40,000 groups, and checks that Chroma reads nested trees exactly as the reference semantics.
-### Fixed
-
 - `OpenFGAAuthorizer` no longer sends a request OpenFGA refuses whole with HTTP 400, which surfaced
   as `AuthorizationError("OpenFGA batch-check returned HTTP 400")`. A subject in more than 100
   groups (OpenFGA takes at most 100 contextual tuples per check or list), a user longer than 512
@@ -274,14 +311,15 @@ All notable changes are recorded here. The format follows
   HTTP 400. The conformance campaign's users `zoë` and `7.0` made 117 and 124 of 140 SpiceDB runs
   fail that way.
 - `RedisBackend` and `MongoDBBackend` find chunks whose metadata holds a long value. The Redis Query
-  Engine indexes at most 4,096 bytes of a TAG value and a vector-search filter field at most 8,191
-  characters of a string; both cut a longer one short at indexing, while a filter names the whole value, so a
-  pre-filtered search missed such chunks, and a value made of the first part of a longer one
-  matched it (the retriever's re-check dropped those). A permission term longer than that, field
+  Engine indexes at most 4,096 bytes of a TAG value, and a MongoDB vector-search filter field at
+  most 8,191 characters of a string; both cut a longer one short at indexing, while a filter names
+  the whole value, so a pre-filtered search missed such chunks, and a value made of the first part
+  of a longer one matched it (the retriever's re-check dropped those). A permission term longer than that, field
   name and value together (over 2,048 bytes in Redis, whose terms are hex-encoded, and over 8,181
   UTF-16 code units in MongoDB), is now stored and searched as its SHA-256 digest. Terms within the
   limits are unchanged, so nothing needs re-indexing except chunks with such long values, which were
-  not found before either. The conformance campaign found it: 26 Redis and 19 MongoDB runs with
+  not found before either: write them again with `add` or `set_metadata` to make them findable. The
+  conformance campaign found it: 26 Redis and 19 MongoDB runs with
   values of 3,001 to 40,000 characters missed matching chunks.
 
 ### Documentation
@@ -302,7 +340,7 @@ All notable changes are recorded here. The format follows
   shown with an AI assistant that many companies share.
 - The README opens with the problem, the runnable quickstart (which a new test runs, checking that
   it prints what its comments say) and two results from the FiQA benchmark, linked to the results
-  file. The package metadata, shown on PyPI from the next release, adds keywords for more stores
+  file. The package metadata, shown on PyPI from this release, adds keywords for more stores
   and permission systems and the `Framework :: AsyncIO` and `Framework :: FastAPI` classifiers.
 - Corrected what the documentation said about filtered approximate search. Concepts said that
   pgvector's iterative index scans keep a selective filter from cutting results short; they stop
@@ -351,7 +389,7 @@ All notable changes are recorded here. The format follows
 
 ## [2.1.1] - 2026-11-13
 
-A security release from the 2.1 branch. It carries two fixes listed above under [Unreleased] and nothing else: `ChromaBackend` no longer sends Chroma a filter that can crash the process ([GHSA-pxx6-228g-4fw5](https://github.com/muzakkirhussain011/wardowl/security/advisories/GHSA-pxx6-228g-4fw5)), and `CachingAuthorizer.invalidate()` no longer lets a permission service that is itself behind refill the cache ([GHSA-3f2r-rrm4-mhwj](https://github.com/muzakkirhussain011/wardowl/security/advisories/GHSA-3f2r-rrm4-mhwj)), with `SpiceDBAuthorizer.max_staleness` and `CachingAuthorizer(source_staleness=...)`, which that fix needs. `RetrievalResult.complete` keeps its 2.1 meaning there. The full notes are on the [release page](https://github.com/muzakkirhussain011/wardowl/releases/tag/v2.1.1).
+A security release from the 2.1 branch. It carries two fixes listed above under [3.0.0] and nothing else: `ChromaBackend` no longer sends Chroma a filter that can crash the process ([GHSA-pxx6-228g-4fw5](https://github.com/muzakkirhussain011/wardowl/security/advisories/GHSA-pxx6-228g-4fw5)), and `CachingAuthorizer.invalidate()` no longer lets a permission service that is itself behind refill the cache ([GHSA-3f2r-rrm4-mhwj](https://github.com/muzakkirhussain011/wardowl/security/advisories/GHSA-3f2r-rrm4-mhwj)), with `SpiceDBAuthorizer.max_staleness` and `CachingAuthorizer(source_staleness=...)`, which that fix needs. `RetrievalResult.complete` keeps its 2.1 meaning there. The full notes are on the [release page](https://github.com/muzakkirhussain011/wardowl/releases/tag/v2.1.1).
 
 ## [2.0.2] - 2026-11-13
 
@@ -1581,7 +1619,8 @@ needed, in which case it will be announced in a second release candidate. Instal
 - The project is now `wardowl`, a permission-aware retrieval library (ADR 0005). The earlier
   Rampart gateway lives on as an example deployment in `examples/gateway`.
 
-[Unreleased]: https://github.com/muzakkirhussain011/wardowl/compare/v2.1.1...HEAD
+[Unreleased]: https://github.com/muzakkirhussain011/wardowl/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/muzakkirhussain011/wardowl/compare/v2.1.1...v3.0.0
 [2.1.1]: https://github.com/muzakkirhussain011/wardowl/compare/v2.1.0...v2.1.1
 [2.0.2]: https://github.com/muzakkirhussain011/wardowl/compare/v2.0.1...v2.0.2
 [2.1.0]: https://github.com/muzakkirhussain011/wardowl/compare/v2.0.1...v2.1.0

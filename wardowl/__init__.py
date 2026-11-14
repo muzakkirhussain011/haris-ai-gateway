@@ -31,7 +31,7 @@ from wardowl.retriever import (
 )
 from wardowl.types import Document, Hit, InvalidQuery, Query, Subject
 
-__version__ = "2.1.0"
+__version__ = "3.0.0"
 
 __all__ = [
     "AllOf",
