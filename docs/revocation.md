@@ -108,6 +108,7 @@ and put the revocation in the request path of the change itself:
       SpiceDBAuthorizer(SPICEDB_URL, token=SPICEDB_KEY, consistency=latest, max_staleness=0), ttl=30
   )
 
+
   def revoke(user_id, document_id):
       latest.write(lambda: remove_viewer(document_id, user_id))  # returns writtenAt.token
       authorizer.invalidate(user_id)
