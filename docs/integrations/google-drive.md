@@ -129,8 +129,8 @@ if access.expires_at is not None:
     schedule_sync(file_id, at=access.expires_at)  # your scheduler
 ```
 
-Such a job asks the store itself, with its own client: no wardowl backend lists chunks by their
-metadata. The field is text that sorts in time order, so a comparison with the current time,
+A job that looks for expired chunks asks the store itself, with its own client: no wardowl backend
+lists chunks by their metadata. The field is text that sorts in time order, so a comparison with the current time,
 written the same way, finds the chunks whose expiry has passed.
 
 To enforce the expiry inside wardowl as well, add a check of your own to the access lists:
