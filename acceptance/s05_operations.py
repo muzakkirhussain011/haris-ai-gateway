@@ -20,6 +20,8 @@ production happen, and each is checked against what the docs promise:
 4. `JsonLinesAudit` writes one event per retrieval, failures included, with an HMAC fingerprint
    and no query or chunk text; OpenTelemetry spans and metrics (in-memory exporter and reader)
    exist for retrievals and errors, carry no text, and name the subject only when configured.
+   Events and spans record each result's `complete` and `shortfall`, `wardowl.short_results`
+   counts the short ones, and each metric carries only the attributes documented for it.
 5. With a plain `CachingAuthorizer(ttl=...)`, a revoked permission keeps granting at most `ttl`.
 6. 200 retrievals across personas from 16 threads, and 200 from asyncio: no errors, no leaks,
    the same answers as one at a time; p50 and p95 latency are noted.
@@ -146,6 +148,12 @@ EVENT_FIELDS = {
     "error",
     "cause",
     "query_hmac",
+    # Added in 3.0 (docs/upgrading.md, "8. Other changes to check").
+    "shortfall",
+    "fallback",
+    "shortfall_ms",
+    "sampled_recall",
+    "recall_sample",
 }
 METRICS = {
     "gen_ai.client.operation.duration",
@@ -157,7 +165,30 @@ METRICS = {
     "wardowl.chunks.denied",
     "wardowl.violations",
 }
-METRIC_ATTRIBUTES = {"wardowl.action", "wardowl.strategy", "wardowl.outcome", "error.type", "gen_ai.operation.name"}
+# docs/operations.md, "Metrics": every instrument is broken down by wardowl.action and wardowl.strategy,
+# plus the outcome, error.type and the attributes its row names, where they apply, each with a handful
+# of values; subjects, queries and chunks are never recorded. error.type applies to a failed retrieval,
+# counted in wardowl.retrievals (the alerts there read it) and timed in gen_ai.client.operation.duration
+# (the GenAI conventions' instrument), and to wardowl.observer_failures, whose row names it. An
+# instrument not listed here carries only action and strategy.
+BY_ACTION_AND_STRATEGY = {"wardowl.action", "wardowl.strategy"}
+METRIC_ATTRIBUTES = {
+    "gen_ai.client.operation.duration": BY_ACTION_AND_STRATEGY | {"gen_ai.operation.name", "error.type"},
+    "wardowl.retrievals": BY_ACTION_AND_STRATEGY | {"wardowl.outcome", "error.type"},
+    "wardowl.short_results": BY_ACTION_AND_STRATEGY | {"wardowl.shortfall", "wardowl.fallback"},
+    "wardowl.recall_samples": BY_ACTION_AND_STRATEGY | {"wardowl.recall_sample"},
+    "wardowl.observer_failures": BY_ACTION_AND_STRATEGY | {"wardowl.observer", "error.type"},
+}
+# The values those attributes take, where docs/operations.md and docs/concepts.md ("What a result
+# tells you") list them.
+METRIC_VALUES = {
+    "gen_ai.operation.name": {"retrieval"},
+    "wardowl.strategy": {"prefilter", "postfilter"},
+    "wardowl.outcome": {"complete", "incomplete", "error"},
+    "wardowl.shortfall": {"exhausted", "missed", "unknown"},
+    "wardowl.fallback": {"exact", "widened", "over_limit", "unsupported"},
+    "wardowl.recall_sample": {"measured", "over_limit", "unsupported", "failed"},
+}
 
 
 # ---- shared helpers --------------------------------------------------------------------------------
@@ -987,6 +1018,8 @@ class Call:
     texts: list[str]
     error: str | None
     cause: str | None
+    complete: bool = False  # as the result said; False for a failed retrieval, as its event says
+    shortfall: str | None = None
 
 
 def _call(retriever: PermissionedRetriever, question: str, subject: Subject) -> Call:
@@ -995,7 +1028,8 @@ def _call(retriever: PermissionedRetriever, question: str, subject: Subject) -> 
     except AuthorizationError as error:
         cause = type(error.__cause__).__name__ if error.__cause__ else None
         return Call(subject.id, question, None, [], "AuthorizationError", cause)
-    return Call(subject.id, question, [h.id for h in result.hits], [h.text for h in result.hits], None, None)
+    found, texts = [h.id for h in result.hits], [h.text for h in result.hits]
+    return Call(subject.id, question, found, texts, None, None, result.complete, result.shortfall)
 
 
 def audit_and_tracing(run: Run) -> None:
@@ -1057,6 +1091,14 @@ def audit_and_tracing(run: Run) -> None:
     report.check(
         "each event names the subject, the ids returned, the error and its cause", not mismatched, summary(mismatched)
     )
+    # docs/upgrading.md, section 3: a short result's complete=False reaches RetrievalEvent, which says
+    # why in shortfall. Mallory, who may read nothing, gets short results here.
+    recorded = []
+    for event, call in zip(events, calls, strict=False):
+        said = (event.get("complete"), event.get("shortfall"))
+        if said != (call.complete, call.shortfall):
+            recorded.append(f"{call.subject}: event {said}, result {(call.complete, call.shortfall)}")
+    report.check("each event records the result's complete and shortfall", not recorded, summary(recorded))
     plain = {hashlib.sha256(c.question.encode()).hexdigest() for c in calls}
     report.check(
         "the fingerprint is not a plain hash of the query", not any(e.get("query_hmac") in plain for e in events)
@@ -1102,6 +1144,15 @@ def audit_and_tracing(run: Run) -> None:
         not wrong_spans,
         summary(wrong_spans),
     )
+    # docs/operations.md, "Tracing": wardowl.complete as RetrievalResult.complete, and wardowl.shortfall
+    # when a pre-filtered search came back short.
+    span_state = []
+    for span, call in zip(finished, calls, strict=False):
+        attributes = dict(span.attributes or {})
+        said = (attributes.get("wardowl.complete"), attributes.get("wardowl.shortfall"))
+        if not call.error and said != (call.complete, call.shortfall):
+            span_state.append(f"{call.subject}: span {said}, result {(call.complete, call.shortfall)}")
+    report.check("each span records the result's complete and shortfall", not span_state, summary(span_state))
     doc_ids = [s.id for s in run.specs]
     in_spans = sorted(
         {
@@ -1147,17 +1198,30 @@ def audit_and_tracing(run: Run) -> None:
         returned == sum(len(c.ids or []) for c in calls),
         f"{returned}",
     )
-    names = {c.subject for c in calls} | {q for q, _ in QUESTIONS}
-    stray = sorted(
-        {
-            f"{key}={value}"
-            for points_of in points.values()
-            for point in points_of
-            for key, value in (point.attributes or {}).items()
-            if key not in METRIC_ATTRIBUTES or value in names
-        }
+    # docs/operations.md, "Metrics": wardowl.short_results counts the pre-filtered retrievals whose
+    # search came back short, by wardowl.shortfall (here mallory's, with shortfall="unknown").
+    by_shortfall: Counter[str] = Counter()
+    for point in points.get("wardowl.short_results", []):
+        by_shortfall[str(point.attributes.get("wardowl.shortfall"))] += point.value
+    want_short = Counter(c.shortfall for c in calls if c.shortfall)
+    report.check(
+        "wardowl.short_results counts each short pre-filtered retrieval by its shortfall",
+        by_shortfall == want_short and sum(want_short.values()) > 0,
+        f"{dict(by_shortfall)} for {dict(want_short)}",
     )
-    report.check("metric attributes are only action, strategy, outcome and error type", not stray, summary(stray))
+    names = {c.subject for c in calls} | {q for q, _ in QUESTIONS}
+    stray: set[str] = set()
+    for metric, points_of in points.items():
+        allowed = METRIC_ATTRIBUTES.get(metric, BY_ACTION_AND_STRATEGY)
+        for point in points_of:
+            for key, value in (point.attributes or {}).items():
+                if key not in allowed or value not in METRIC_VALUES.get(key, {value}) or value in names:
+                    stray.add(f"{metric}: {key}={value}")
+    report.check(
+        "each instrument carries only its documented attributes and values, none naming a subject or query",
+        not stray,
+        summary(sorted(stray)),
+    )
 
 
 # ---- 5. the revocation bound -------------------------------------------------------------------------------
