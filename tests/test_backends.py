@@ -359,6 +359,64 @@ def test_chroma_never_sends_a_where_too_large_and_applies_the_filter_itself():
     assert collection.queries == [{"where": filter_to_where(few), "n_results": 10}]
 
 
+def test_chroma_records_whose_json_copy_is_not_a_json_object_carry_no_permissions():
+    # A record another tool wrote with a non-JSON wardowl_metadata failed every search that returned
+    # it; like a record without the copy, it is now read as carrying no permissions.
+    from wardowl.backends.chroma import JSON_KEY, ChromaBackend
+
+    collection = SearchableChroma()
+    backend = ChromaBackend(collection, EMBED)
+    everyone = {"allowed_groups": ["*"]}
+    backend.add([Document("a", "doc", everyone)])
+    stored = [{JSON_KEY: "{not json", "allowed_groups::s:*": True}, {JSON_KEY: "[1]", "allowed_groups::s:*": True}]
+    collection.add(ids=["broken", "listed"], documents=["doc", "doc"], metadatas=stored)
+    assert {h.id: h.metadata for h in backend.search(QUERY, 5)} == {"a": everyone, "broken": {}, "listed": {}}
+    # Chroma matches their list keys, but their true metadata cannot be read, so they are dropped.
+    assert [h.id for h in backend.search(QUERY, 5, In("allowed_groups", ["*"]))] == ["a"]
+    for strategy in ("prefilter", "postfilter"):
+        retriever = PermissionedRetriever(backend, MetadataACLAuthorizer(), strategy=strategy)
+        result = retriever.retrieve(QUERY, Subject("ann"), 5)
+        assert [h.id for h in result.hits] == ["a"] and result.violations == 0
+
+
+def test_chroma_records_written_by_needtoknow_1x_raise_instead_of_being_denied_one_by_one():
+    # needtoknow 1.x kept the JSON copy under needtoknow_metadata. Read as records without a copy,
+    # every one was denied, and a pre-filtered search found nothing, with no error.
+    from wardowl.backends.chroma import ChromaBackend
+
+    collection = SearchableChroma()
+    backend = ChromaBackend(collection, EMBED)
+    backend.add([Document("a", "doc", {"allowed_groups": ["hr"]})])
+    legacy = {"needtoknow_metadata": '{"allowed_groups": ["hr"]}', "allowed_groups::s:hr": True}
+    collection.add(ids=["old"], documents=["doc"], metadatas=[legacy])
+    for f in (None, In("allowed_groups", ["hr"])):
+        with pytest.raises(ValueError, match=r"needtoknow 1\.x.*upgrading"):
+            backend.search(QUERY, 5, f)
+    with pytest.raises(SearchError) as raised:
+        PermissionedRetriever(backend, MetadataACLAuthorizer()).retrieve(QUERY, Subject("ann", ["hr"]), 5)
+    assert "needtoknow_metadata" in str(raised.value.__cause__)
+    # A chunk wardowl wrote whose metadata has a key of that name is wardowl's.
+    backend.delete(["old"])
+    backend.add([Document("b", "doc", {"allowed_groups": ["hr"], "needtoknow_metadata": "notes"})])
+    assert {h.id for h in backend.search(QUERY, 5, In("allowed_groups", ["hr"]))} == {"a", "b"}
+
+
+def test_chroma_reads_foreign_and_legacy_records_as_it_returns_them(chroma_factory):
+    # The same two cases against Chroma itself.
+    from wardowl.backends.chroma import JSON_KEY
+
+    backend = chroma_factory([Document("a", "leave plan", {"allowed_groups": ["*"]})])
+    vector = [EMBED("leave plan")]
+    broken = {JSON_KEY: "{not json", "allowed_groups::s:*": True}
+    backend.collection.add(ids=["broken"], documents=["leave plan"], embeddings=vector, metadatas=[broken])
+    assert {h.id: h.metadata for h in backend.search("leave plan", 5)} == {"a": {"allowed_groups": ["*"]}, "broken": {}}
+    assert [h.id for h in backend.search("leave plan", 5, In("allowed_groups", ["*"]))] == ["a"]
+    legacy = {"needtoknow_metadata": '{"allowed_groups": ["*"]}', "allowed_groups::s:*": True}
+    backend.collection.add(ids=["old"], documents=["leave plan"], embeddings=vector, metadatas=[legacy])
+    with pytest.raises(ValueError, match=r"needtoknow 1\.x"):
+        backend.search("leave plan", 5, In("allowed_groups", ["*"]))
+
+
 class RecordedWheres:
     """A Chroma collection that keeps the `where` of every query."""
 

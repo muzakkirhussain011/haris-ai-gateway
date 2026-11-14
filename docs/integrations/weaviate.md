@@ -54,6 +54,16 @@ id. An object written by another tool, without `wardowl_id`, is reached by its U
 exactly as results report it (lower case, with hyphens). An object whose `wardowl_id` is a string,
 the empty string included, holds that id and is never reached by its UUID.
 
+One id never stands for two objects in results. An object written by another tool at the UUID `u`,
+reported as `u`, and a chunk added with the id `u`, stored at `point_id(u)`, would both be reported
+as `u`; so would an object holding `wardowl_id` `x` at a UUID other than `point_id("x")`, next to
+the chunk `x`. When an answer holds an object that is not at `point_id` of the id it would be
+reported under, the search looks up that UUID with one `fetch_objects` call. If the object there
+holds the id, the other object is left out, and the search asks Weaviate again for as many more
+objects as it left out, so leaving objects out never by itself makes a result shorter than k. When
+no chunk holds the id where `add` writes it, the object is reported as before. A collection holding
+only objects that `add` wrote never needs the extra call.
+
 ## How permissions are indexed
 
 The backend uses the same design as [Elasticsearch, OpenSearch](elasticsearch.md#how-permissions-are-indexed),

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
+from types import SimpleNamespace
 
 import pytest
 
@@ -176,6 +177,45 @@ def test_partial_results_raise_instead_of_passing_for_complete_ones(reply):
         assert [h.id for h in backend.search("leave", 3)] == ["a"]
 
 
+class Indices:
+    """An engine's index API with existing indexes: `get_mapping` answers with `answer`, wrapped in a
+    response object with a `body`, as the Elasticsearch client does, or as a plain dict."""
+
+    def __init__(self, answer, wrapped):
+        self.answer, self.wrapped, self.created = answer, wrapped, []
+
+    def exists(self, index):
+        return True
+
+    def get_mapping(self, index):
+        return SimpleNamespace(body=self.answer) if self.wrapped else self.answer
+
+    def create(self, **request):
+        self.created.append(request)
+
+
+LEGACY = {"properties": {"metadata": {"type": "object", "enabled": False}, "needtoknow_terms": {"type": "keyword"}}}
+CURRENT = {"properties": {"metadata": {"type": "object", "enabled": False}, TERMS_FIELD: {"type": "keyword"}}}
+
+
+def test_create_index_refuses_an_index_that_needtoknow_1x_created():
+    # Its mapping has needtoknow_terms and, under dynamic: false, can never index wardowl_terms, so
+    # every pre-filtered search found nothing, with no error.
+    from wardowl.backends import elasticsearch, opensearch
+
+    for module, name, wrapped in ((elasticsearch, "Elasticsearch", True), (opensearch, "OpenSearch", False)):
+        for answer in ({"docs": {"mappings": LEGACY}}, {"docs-a": {"mappings": CURRENT}, "docs": {"mappings": LEGACY}}):
+            client = SimpleNamespace(indices=Indices(answer, wrapped))
+            with pytest.raises(ValueError, match=rf"{name} index 'docs' was created by needtoknow 1\.x.*upgrading"):
+                module.create_index(client, "docs", EMBED.dim)
+        # Indexes wardowl created, empty ones and one that maps both fields are left as they are.
+        both = {"properties": {**LEGACY["properties"], **CURRENT["properties"]}}
+        for mappings in (CURRENT, {}, None, both):
+            client = SimpleNamespace(indices=Indices({"docs": {"mappings": mappings}}, wrapped))
+            module.create_index(client, "docs", EMBED.dim)
+            assert client.indices.created == []
+
+
 # ---- real servers ------------------------------------------------------------------------------
 
 
@@ -188,12 +228,16 @@ def _elasticsearch():
     def write_raw(client, index, doc_id, document):
         client.index(index=index, id=doc_id, document=document, refresh="wait_for")
 
+    def create_raw(client, index, mappings):
+        client.indices.create(index=index, mappings=mappings)
+
     return {
         "client": es.Elasticsearch(ES_URL),
         "backend": ElasticsearchBackend,
         "create": create_index,
         "terms": permission_terms,
         "write_raw": write_raw,
+        "create_raw": create_raw,
         "make_async": lambda: es.AsyncElasticsearch(ES_URL),
     }
 
@@ -207,12 +251,16 @@ def _opensearch():
     def write_raw(client, index, doc_id, document):
         client.index(index=index, id=doc_id, body=document, refresh="wait_for")
 
+    def create_raw(client, index, mappings):
+        client.indices.create(index=index, body={"mappings": mappings})
+
     return {
         "client": opensearchpy.OpenSearch(hosts=[OS_URL]),
         "backend": OpenSearchBackend,
         "create": create_index,
         "terms": permission_terms,
         "write_raw": write_raw,
+        "create_raw": create_raw,
         "make_async": lambda: opensearchpy.AsyncOpenSearch(hosts=[OS_URL]),
     }
 
@@ -241,6 +289,26 @@ def test_server_passes_the_conformance_kit(engine):
         return backend
 
     check_backend(make)
+
+
+def test_server_create_index_refuses_an_index_that_needtoknow_1x_created(engine):
+    client, legacy = engine["client"], f"wo-{uuid.uuid4().hex}"
+    # needtoknow 1.6's mapping without the vector field, which the check does not read.
+    mappings = {"dynamic": False, "properties": {"content": {"type": "text"}, **LEGACY["properties"]}}
+    engine["create_raw"](client, legacy, mappings)
+    current = _new_index(engine)
+    try:
+        # What the check prevents: wardowl_terms is kept in _source but not indexed, so no filter matches.
+        backend = engine["backend"](client, legacy, None, mode="keyword")
+        backend.add([Document("a", "leave policy", {"allowed_groups": ["hr"]})])
+        assert backend.search("leave", 5, In("allowed_groups", ["hr"])) == []
+        assert [h.id for h in backend.search("leave", 5)] == ["a"]
+        with pytest.raises(ValueError, match=r"needtoknow 1\.x"):
+            engine["create"](client, legacy, EMBED.dim)
+        engine["create"](client, current, EMBED.dim)  # an index create_index made passes
+    finally:
+        client.indices.delete(index=legacy)
+        client.indices.delete(index=current)
 
 
 def test_documents_written_by_another_tool_need_their_permission_terms(engine):

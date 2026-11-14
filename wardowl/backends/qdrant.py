@@ -15,7 +15,13 @@ document id, whatever the id looks like, and keeps the original id in the payloa
 else. `set_metadata` and `delete` select points by a filter that also requires `wardowl_id` to be
 the id asked for, so they never change a point that belongs to another id. A point written by
 something else has no `wardowl_id`; it is reached by its own UUID, written exactly as results
-report it.
+report it. A point that would be reported under an id whose own point (the one `add` writes it to)
+holds that id is left out of results, so one id never stands for two points.
+
+needtoknow 1.x stored the id under `needtoknow_id` and derived point ids another way, so its points
+cannot be reached by chunk id. `create_collection`, on an existing collection, and the first `add`,
+`set_metadata` or `delete` of each backend read the collection's first points and raise
+`ValueError` if one of them holds `needtoknow_id` and no `wardowl_id`.
 
 Create the collection with cosine distance, and index the permission fields: `create_collection`
 does both. Without a payload index Qdrant still filters correctly, but slowly on large collections.
@@ -30,9 +36,10 @@ from __future__ import annotations
 
 import asyncio
 import re
+import uuid
 import zlib
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence, Set
 from typing import TYPE_CHECKING, Any
 
 from wardowl.backends._errors import required
@@ -62,6 +69,13 @@ ID_KEY = "wardowl_id"
 SPARSE_NAME = "wardowl_bm25"
 """The sparse vector holding each chunk's BM25 term weights, for `mode="keyword"`."""
 
+_LEGACY_ID_KEY = "needtoknow_id"  # where needtoknow 1.x kept the document id
+_LAYOUT_SAMPLE = 16  # points a layout check reads
+_UPGRADE = (
+    "write the chunks into a new collection with wardowl, switch to it, then drop this one, as the "
+    "upgrading guide says (From needtoknow 1.x to wardowl 2.0, step 2: "
+    "https://muzakkirhussain011.github.io/wardowl/upgrading.html)"
+)
 _PATH_SYNTAX = frozenset('.[]"')
 _BATCH = 256
 _WORDS = re.compile(r"\w+")
@@ -121,6 +135,53 @@ def _addressed(ids: Sequence[str]) -> models.Filter:
         ]
     )
     return models.Filter(should=[own, written_elsewhere])
+
+
+def _at(point: Any, document_id: str) -> bool:
+    """Whether `point` is the point `add` writes `document_id` to."""
+    try:
+        return uuid.UUID(str(point.id)) == uuid.UUID(point_id(document_id))
+    except ValueError:
+        return False  # an integer point id, which add never writes
+
+
+def _reported(point: Any) -> tuple[str, bool]:
+    """The id a point is reported under, and whether the point is the one `add` writes that id to."""
+    doc_id = (point.payload or {}).get(ID_KEY)
+    if isinstance(doc_id, str):
+        return doc_id, _at(point, doc_id)
+    return str(point.id), False
+
+
+def _lookups(points: Iterable[Any]) -> list[str]:
+    """For each point that is not the one `add` writes its reported id to, the point that is."""
+    return list(dict.fromkeys(point_id(doc_id) for doc_id, own in map(_reported, points) if not own))
+
+
+def _held(stored: Iterable[Any]) -> set[str]:
+    """The ids that these points, looked up by `_lookups`, hold where `add` writes them."""
+    held: set[str] = set()
+    for p in stored:
+        doc_id, own = _reported(p)
+        if own:
+            held.add(doc_id)
+    return held
+
+
+def _check_collection(client: Any, name: str) -> None:
+    """Raise `ValueError` if the collection's first points include one written by needtoknow 1.x:
+    `needtoknow_id` and no `wardowl_id`. Unless its chunk id is a UUID, such a point sits at a point
+    id derived another way, so `set_metadata` and `delete` by chunk id would not reach it. Reads
+    only; writes nothing."""
+    points, _ = client.scroll(name, limit=_LAYOUT_SAMPLE, with_payload=[ID_KEY, _LEGACY_ID_KEY], with_vectors=False)
+    for p in points:
+        payload = p.payload or {}
+        if isinstance(payload.get(_LEGACY_ID_KEY), str) and not isinstance(payload.get(ID_KEY), str):
+            raise ValueError(
+                f"Qdrant collection {name!r} holds points written by needtoknow 1.x (payload key "
+                f"{_LEGACY_ID_KEY!r} and no {ID_KEY!r}), which set_metadata and delete do not reach by a "
+                f"chunk id that is not a UUID: {_UPGRADE}"
+            )
 
 
 def _key(metadata_key: str, field: str) -> str:
@@ -207,6 +268,10 @@ def create_collection(
 
     `text_search=True` also creates the sparse vector `wardowl_bm25` with Qdrant's IDF
     modifier, for `mode="keyword"`. Qdrant can add it to an existing collection only by recreating it.
+
+    An existing collection is checked first: if one of its first 16 points (in point id order) was
+    written by needtoknow 1.x (`needtoknow_id` and no `wardowl_id` in its payload), it raises
+    `ValueError` and creates no index. Write such a collection's chunks into a new one.
     """
     from qdrant_client import models
 
@@ -218,6 +283,8 @@ def create_collection(
         client.create_collection(
             name, vectors_config=params if vector_name is None else {vector_name: params}, sparse_vectors_config=sparse
         )
+    else:
+        _check_collection(client, name)
     client.create_payload_index(name, ID_KEY, field_schema=models.PayloadSchemaType.KEYWORD)
     for field in keyword_fields:
         client.create_payload_index(name, _key(metadata_key, field), field_schema=models.PayloadSchemaType.KEYWORD)
@@ -246,6 +313,16 @@ class QdrantBackend:
     better matches. A vector backend writes that sparse vector too when given `text_search=True`,
     so one collection serves both halves of hybrid search. A keyword backend without `embed`
     writes chunks with only the sparse vector, which keyword search finds and vector search does not.
+
+    The first `add`, `set_metadata` or `delete` that has something to write reads the collection's
+    first 16 points and raises `ValueError`, writing nothing, if one was written by needtoknow 1.x
+    (see `create_collection`). Once a check passes, the backend does not check again.
+
+    A search whose answer holds a point that is not where `add` writes its reported id (a point
+    written by another tool, reported under its UUID, or one holding a `wardowl_id` at another
+    point id) looks up the point `add` writes that id to, in one `retrieve` call. If that point
+    holds the id, the other point is left out of the results, which then never report one id twice,
+    and the search asks for more points to make up k.
     """
 
     supports_filters = True
@@ -278,6 +355,13 @@ class QdrantBackend:
         self.metadata_key = metadata_key
         self.vector_name = vector_name
         self.search_params = search_params
+        self._layout_checked = False
+
+    def _check_layout(self) -> None:
+        """Before the first write: refuse a collection written by needtoknow 1.x (see `create_collection`)."""
+        if not self._layout_checked:
+            _check_collection(self.client, self.collection)
+            self._layout_checked = True
 
     @property
     def exact_search(self) -> bool:
@@ -324,6 +408,8 @@ class QdrantBackend:
             )
             for d, v in zip(docs, vectors, strict=True)
         ]
+        if points:
+            self._check_layout()
         for start in range(0, len(points), _BATCH):
             self.client.upsert(self.collection, points=points[start : start + _BATCH], wait=True)
 
@@ -342,6 +428,8 @@ class QdrantBackend:
             )
             for doc_id, new in metadata.items()
         ]
+        if operations:
+            self._check_layout()
         for start in range(0, len(operations), _BATCH):
             self.client.batch_update_points(
                 self.collection, update_operations=operations[start : start + _BATCH], wait=True
@@ -352,6 +440,8 @@ class QdrantBackend:
         from qdrant_client import models
 
         selected = list(dict.fromkeys(ids))
+        if selected:
+            self._check_layout()
         for start in range(0, len(selected), _BATCH):
             chosen = models.FilterSelector(filter=_addressed(selected[start : start + _BATCH]))
             self.client.delete(self.collection, points_selector=chosen, wait=True)
@@ -388,16 +478,20 @@ class QdrantBackend:
             "with_payload": True,
         }
 
-    def _hits(self, points: Iterable[Any]) -> list[Hit]:
+    def _hits(self, points: Iterable[Any], held: Set[str]) -> list[Hit]:
+        """The points as hits, best first, without those reported under an id in `held` (ids whose
+        own point holds them) that are not that point."""
         hits = []
         for p in points:
+            doc_id, own = _reported(p)
+            if not own and doc_id in held:
+                continue  # another point holds this id where add writes it: one id, one point
             payload = p.payload or {}
-            doc_id = payload.get(ID_KEY)
             text = payload.get(self.content_key)
             metadata = payload.get(self.metadata_key)
             hits.append(
                 Hit(
-                    doc_id if isinstance(doc_id, str) else str(p.id),
+                    doc_id,
                     text if isinstance(text, str) else "",
                     float(p.score),
                     # A point without a metadata object carries no permissions: the re-check denies it.
@@ -414,7 +508,20 @@ class QdrantBackend:
         request = self._request(Query.of(query), k, filter, exact)
         if request is None:
             return []
-        return self._hits(self.client.query_points(**request).points)
+        limit = k
+        while True:
+            points = list(self.client.query_points(**(request | {"limit": limit})).points)
+            lookups = _lookups(points)
+            held: Set[str] = frozenset()
+            if lookups:
+                held = _held(
+                    self.client.retrieve(self.collection, ids=lookups, with_payload=[ID_KEY], with_vectors=False)
+                )
+            hits = self._hits(points, held)
+            # Fewer than k after leaving points out, from a full answer: ask for as many more.
+            if len(hits) >= k or len(points) < limit:
+                return hits[:k]
+            limit = k + len(points) - len(hits)
 
     async def asearch(
         self, query: str | Query, k: int, filter: Filter | None = None, *, exact: bool = False
@@ -426,8 +533,21 @@ class QdrantBackend:
         request = await asyncio.to_thread(self._request, Query.of(query), k, filter, exact)
         if request is None:
             return []
-        response = await self.async_client.query_points(**request)
-        return self._hits(response.points)
+        limit = k
+        while True:
+            response = await self.async_client.query_points(**(request | {"limit": limit}))
+            points = list(response.points)
+            lookups = _lookups(points)
+            held: Set[str] = frozenset()
+            if lookups:
+                stored = await self.async_client.retrieve(
+                    self.collection, ids=lookups, with_payload=[ID_KEY], with_vectors=False
+                )
+                held = _held(stored)
+            hits = self._hits(points, held)
+            if len(hits) >= k or len(points) < limit:
+                return hits[:k]
+            limit = k + len(points) - len(hits)
 
     def count(self, filter: Filter, limit: int) -> int | None:
         """How many points the filter admits, counted exactly. Qdrant counts them all, so `limit`
