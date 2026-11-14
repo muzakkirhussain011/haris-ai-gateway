@@ -29,31 +29,6 @@ All notable changes are recorded here. The format follows
 - `OIDCAuthenticator` refuses a `leeway` that is not a finite number with `ValueError`. With NaN,
   every one of PyJWT's time comparisons is false, so an expired token verified; an infinite leeway
   turned the expiry check off. A `datetime.timedelta`, which PyJWT also takes, is still accepted.
-
-### Documentation
-
-- The HTTP service page and the `OIDCAuthenticator` docstring say that `exp`, and `nbf` and `iat`
-  when the token has them, are checked against the service's clock, and that `leeway` applies to
-  all three. With the default leeway of 0, an identity provider whose clock runs ahead of the
-  service's issues tokens that are refused until the service's clock catches up, which shows as
-  401s that come and go (M20). The page recommends a few seconds of leeway where the clocks are not
-  tightly synchronized, at the cost of accepting expired tokens for as long. The default stays 0,
-  since a minor release never weakens a default that keeps a protection on. New sections cover
-  tokens without groups and where to find why a token was refused; the MCP page's stdio example and
-  the production failure table say the same.
-- `CachingAuthorizer.ainvalidate(subject=None)`: `invalidate()` for async code, with the same
-  effect and errors. It drops this process's answers at once, then runs the shared cache's calls in
-  a worker thread with `asyncio.to_thread`, as the other async methods already do for their shared
-  reads and writes, so an `async def` handler that reports a revocation no longer holds up the
-  event loop while Redis is cleared. If the task awaiting it is cancelled, the thread still
-  finishes, and the caller is not told whether it succeeded.
-- `RedisCache.set_many_indexed(entries, ttl, index)` and `RedisCache.delete_indexed(index, prefix)`,
-  which keep and use the index of each subject's entries described under Fixed. A shared cache of
-  your own can have the same two methods; one with only `get_many`, `set_many` and `delete_prefix`
-  works as before.
-
-### Fixed
-
 - `CachingAuthorizer.invalidate(subject)` with `RedisCache` no longer scans the whole Redis
   database (finding M15 of the readiness review). It deleted the subject's entries with `SCAN`
   and a `MATCH` pattern, which visits every key in the database, about 1,000 per round trip, so
@@ -83,6 +58,25 @@ All notable changes are recorded here. The format follows
 
 ### Documentation
 
+- The HTTP service page and the `OIDCAuthenticator` docstring say that `exp`, and `nbf` and `iat`
+  when the token has them, are checked against the service's clock, and that `leeway` applies to
+  all three. With the default leeway of 0, an identity provider whose clock runs ahead of the
+  service's issues tokens that are refused until the service's clock catches up, which shows as
+  401s that come and go (M20). The page recommends a few seconds of leeway where the clocks are not
+  tightly synchronized, at the cost of accepting expired tokens for as long. The default stays 0,
+  since a minor release never weakens a default that keeps a protection on. New sections cover
+  tokens without groups and where to find why a token was refused; the MCP page's stdio example and
+  the production failure table say the same.
+- `CachingAuthorizer.ainvalidate(subject=None)`: `invalidate()` for async code, with the same
+  effect and errors. It drops this process's answers at once, then runs the shared cache's calls in
+  a worker thread with `asyncio.to_thread`, as the other async methods already do for their shared
+  reads and writes, so an `async def` handler that reports a revocation no longer holds up the
+  event loop while Redis is cleared. If the task awaiting it is cancelled, the thread still
+  finishes, and the caller is not told whether it succeeded.
+- `RedisCache.set_many_indexed(entries, ttl, index)` and `RedisCache.delete_indexed(index, prefix)`,
+  which keep and use the index of each subject's entries described under Fixed. A shared cache of
+  your own can have the same two methods; one with only `get_many`, `set_many` and `delete_prefix`
+  works as before.
 - Operations: what each form of `invalidate()` costs and where it waits, what `invalidate(subject)`
   leaves in Redis, and why the Redis behind the cache should not evict keys: an evicted epoch or
   index weakens what an invalidation deletes or refuses. Revocation, the runbook and the security
