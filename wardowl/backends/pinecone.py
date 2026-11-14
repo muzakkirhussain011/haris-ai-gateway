@@ -11,6 +11,8 @@ which Pinecone applies inside the search, so pre-filtering is exact; the terms k
 apart. Pinecone record ids are ASCII of at most 512 characters, so other chunk ids, and ids that
 start with `sha256-`, are stored under their SHA-256: no two chunk ids share a record.
 `set_metadata` and `delete` first fetch the records and leave alone any that holds another chunk id.
+A record whose stored metadata is not a JSON object, as one written by another tool can be, is
+returned with empty metadata: it carries no permissions, so the retriever's re-check denies it.
 
 Pinecone's serverless indexes are eventually consistent. Every write waits, up to `wait` seconds
 (30 by default), until a search sees it, so a permission change or a deletion is in effect when the
@@ -309,6 +311,17 @@ class PineconeBackend:
             meta = match.get("metadata") or {}
             if not isinstance(meta.get(ID_FIELD), str):
                 raise RuntimeError(f"Pinecone returned a record without {ID_FIELD}: {match.get('id')!r}")
-            metadata = json.loads(meta.get(METADATA_FIELD) or "{}")
-            hits.append(Hit(meta[ID_FIELD], meta.get(TEXT_FIELD, ""), float(match["score"]), metadata))
+            try:
+                metadata = json.loads(meta.get(METADATA_FIELD) or "")
+            except (TypeError, ValueError):
+                metadata = None
+            hits.append(
+                Hit(
+                    meta[ID_FIELD],
+                    meta.get(TEXT_FIELD, ""),
+                    float(match["score"]),
+                    # A record without readable metadata carries no permissions: the re-check denies it.
+                    metadata if isinstance(metadata, dict) else {},
+                )
+            )
         return hits

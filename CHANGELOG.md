@@ -8,18 +8,119 @@ All notable changes are recorded here. The format follows
 
 ### Changed
 
-- `MongoDBBackend.exact_search` is True for a vector backend created with `exact=True`, which runs
-  `$vectorSearch` as an ENN search: MongoDB documents that it "exhaustively searches all the
-  indexed vector embeddings", with the permission filter as its pre-filter. The retriever therefore
-  reports a short result from such a backend as complete (`shortfall="exhausted"`), where 3.0
-  reported `complete=False` and `shortfall="unknown"`, and `check_backend` checks it as exact. The
-  hits returned do not change. Only what the index has caught up with counts: a chunk written with
-  `wait=False` or by another tool can be missing from a search made just after it. Keyword mode and
-  `exact=False` are unchanged. CI runs the conformance kit against Atlas Local with `exact=True`
-  (U20 in the readiness review).
+- `VespaBackend` declares `exact_search` when it searches vectors with `approximate=False`, and
+  only then: in keyword mode, and with the default `approximate=True`, it still does not. Vespa's
+  exact nearest-neighbor search computes the distance to every document that matches the query's
+  other conditions, the permission filter among them, so a pre-filtered result with fewer than k
+  hits now reports `complete=True` and `shortfall="exhausted"`, and post-filtering that runs out of
+  candidates inside a scope reports `complete=True`, where both reported `complete=False`; under
+  `short_results="exact"` or `"widen"`, `fallback` is None where it was `"unsupported"`. That is what
+  the fields mean ("False when wardowl knows results may be missing"); the searches and the hits are
+  the same. The conformance kit already checked this configuration as exact against a real Vespa in
+  CI. A query for more hits than the query profile's `maxHits` gets an error from Vespa's search
+  handler rather than fewer hits (read in Vespa's source, not run), and the backend raises it, so a
+  short result is not a cut one.
+
+### Added
+
+- `SpanRedactor(users_field=..., groups_field=..., everyone=...)`, the field names and the
+  everyone marker of a span's readers, as `MetadataACLAuthorizer` takes them. The redactor read
+  `allowed_users`, `allowed_groups` and `"*"` whatever the authorizer was given, so under an
+  authorizer with another marker, a span whose readers were written in the authorizer's form, with
+  `"*"` meaning a group of that name, was shown to everyone. The defaults are the names and marker
+  it read before, so nothing changes without the new arguments.
+- `SpiceDBAuthorizer(consistency=...)` also takes a function of no arguments that returns the
+  consistency requirement, so that every request can carry the ZedToken of the application's latest
+  write (M13 in the readiness review). It is called once for each `check` or `filter_for` that
+  sends SpiceDB a request, before the first, and every request of that call (each
+  CheckBulkPermissions batch, each subject's LookupResources) carries what it returned; a call that
+  sends nothing does not call it. A mapping was the only form, fixed when the authorizer was
+  created, and `atLeastAsFresh` guarantees data at least as fresh as its token and nothing more, so
+  a token passed once covered no later write. The documentation still told operators to declare
+  `max_staleness=0` with it, and a `CachingAuthorizer` told so holds nothing back after
+  `invalidate()`: an answer from before a later revocation could be kept for its whole `ttl`. What
+  the function returns must be exactly one of SpiceDB's four requirements, with a non-empty token
+  for `atLeastAsFresh` and `atExactSnapshot`. Anything else, None or `{}` included, or an exception
+  from the function, raises `AuthorizationError` and nothing is sent, rather than a weaker
+  requirement being used. With a function, `max_staleness` is 11 seconds unless you pass it,
+  whatever the function returns. A mapping is sent as given, unchecked, and declares the same
+  `max_staleness` as before. The tests cover a token per call, one evaluation for a call of several
+  requests, the failures, a mapping, `max_staleness` for both forms, and, against a real SpiceDB, a
+  revocation reported to the cache with the token of its write.
+
+### Deprecated
+
+- A search that returns hits that are not `Hit` objects (any object with `id`, `text`, `score`
+  and `metadata`), or `Hit` objects whose `id` is not a string (an integer, say). The retriever uses
+  them as before, and warns with `DeprecationWarning` once per retriever for each of the two kinds,
+  pointing at the code that called `retrieve` or awaited `aretrieve`; wardowl 4.0 will refuse them
+  with `SearchError`. Return `Hit` objects with string ids, as the built-in backends do.
 
 ### Fixed
 
+- An authorizer's filter or scope nested more than 100 levels deep raises `AuthorizationError`
+  ("authorizer returned a filter nested more than 100 levels deep") before anything is searched,
+  as `filter_from_dict` already refused such a document. With `recheck=False`, and a backend whose
+  search does not recurse into the filter, one deep enough to reach Python's recursion limit made
+  `retrieve` raise a bare `RecursionError`, which its docstring does not list; with the built-in
+  backends, whose translation or matching recurses, it was raised inside the search, as
+  `SearchError`. A filter between 101 levels and that limit was searched, and is refused now.
+  `MetadataACLAuthorizer`, `TenantAuthorizer`, `OpenFGAAuthorizer` and `SpiceDBAuthorizer` build
+  filters one or two levels deep, `AllOf` and `AnyOf` add one level, and OPA's answers are parsed
+  with the same bound, so a filter that deep comes from a Cerbos plan nested that far, an
+  authorizer of your own, or combinations around an answer already near the bound. The retriever
+  walks the filter with a stack of its own, so the check cannot exhaust Python's, and looks at each
+  clause object once, so a clause shared by many parents costs one visit. The threat model's T14
+  said "Filters nest at most 100 deep", which held only for parsed filters until now.
+- A filter that holds something other than `In`, `And` and `Or` anywhere in it fails as the
+  authorizer's fault. `And` and `Or` take any clause, and the retriever checked only the top of the
+  answer, so `Or(In(...), "everything")`, or such an answer from one part of `AllOf` or `AnyOf`,
+  which wrapped each part's answer as it came, reached the backend, whose translation failed on it:
+  the retrieval raised `SearchError`, which blames the store. The retriever now checks the whole
+  tree and raises `AuthorizationError`, as for an answer that is not a filter at all, and so it does
+  for an `And` or `Or` without clauses or a filter that holds itself, which only `object.__setattr__`
+  can make. `AllOf` and `AnyOf` raise it themselves ("an authorizer in AllOf returned str, not a
+  filter") when they join the parts' filters or scopes, so code that calls their `filter_for` or
+  `scope_for` gets it too. A part with no filter still leaves `AllOf.filter_for` without one, as
+  before, whatever the other parts answered.
+- A backend whose search returns something other than hits fails the retrieval with
+  `SearchError("search failed")`, its `__cause__` a `TypeError` that names what was wrong, as when
+  the search raises. The retriever reads at most k hits of the reply and refuses what failed later
+  anyway, outside the backend's errors, or was returned as it was: a reply that is not iterable, a
+  hit without an `id`, `text`, `score` or `metadata` attribute, an id that cannot be hashed (it
+  raised `TypeError` when post-filtering), metadata that is not a mapping (None raised
+  `AttributeError` with `recheck=False`, and `AuthorizationError` from the authorizer otherwise),
+  and a score that is not a number (None raised `TypeError` when post-filtering sorted it, and was
+  returned as it was when pre-filtering; `True` and `False`, which are not relevance scores, were
+  sorted as 1 and 0 and returned). With a reranker it refuses a hit whose id is not a string, and
+  with a redactor a hit that is not a `Hit`: in 3.0.0 such a hit failed the retrieval once it passed
+  the permission check, with `ValueError` ("the reranker returned a chunk it was not given"), since
+  the reranker's hits are matched to the chunks by string id, and with `AuthorizationError`, since
+  a redactor must return `Hit` objects. Other hits that are not `Hit` objects, or whose ids are not
+  strings, worked in 3.0.0 through post-filtering, the re-check, `CachingAuthorizer`, redaction (an
+  integer id), reranking (another class), short results, recall samples and audit events, checked by
+  running them through `retrieve` and `aretrieve` on 3.0.0's code, and they still work (see
+  Deprecated).
+- `VespaBackend`, `PineconeBackend` and `CassandraBackend` return a stored record whose metadata
+  is not a JSON object (an array, a string, a number, `true` or `null`, or text that is not JSON)
+  with empty metadata, as the other backends do. One such record, which a tool other than wardowl
+  could write, failed every retrieval whose search reached it: `AuthorizationError` with the
+  re-check, a bare `AttributeError` with `recheck=False`, and `SearchError` for text that is not
+  JSON. With empty metadata it carries no permissions: the re-check, or the local match with
+  `recheck=False`, denies it, and a pre-filtered one is counted in `violations`; a filter that
+  `CassandraBackend` applies itself, past `max_queries`, leaves it out. `PgVectorBackend` does the
+  same for a `jsonb` value that is not an object, which reached the retrieval under post-filtering
+  without a scope and failed it with `AuthorizationError`. A pre-filtered search does not return
+  such a row, since PostgreSQL's `@>` and `->` find no object key in it (from PostgreSQL's
+  documentation; not run).
+- `MetadataACLAuthorizer` ignores group names that are empty or only whitespace, on the subject and
+  as its `everyone` marker. `Subject` accepts them, as identity providers can send them, and the
+  sync layer refuses only the empty name; a subject with `""` among its groups could read a chunk
+  whose `allowed_groups` listed `""`, and with `everyone=""` such a chunk was readable by every
+  subject. Since the filter no longer holds such names, a chunk's blank names grant nothing either,
+  a group name of only spaces that the sync layer wrote included. `SpanRedactor` reads a span's
+  readers the same way. This only removes access through names that name no group; `Subject` still
+  accepts them, and every other name is matched as before.
 - A store left in needtoknow 1.x's layout now raises `ValueError`, naming the upgrade step that
   writes the chunks into a new collection, instead of misbehaving without an error (U5, U9, U18
   and U21 in the readiness review). The upgrading guide tells 1.x users to index again, and nothing
@@ -103,29 +204,22 @@ All notable changes are recorded here. The format follows
   and the client's next request succeeds. The test client keeps no connection alive, so the reset
   itself was seen only under uvicorn, in the acceptance run.
 
-### Added
-
-- `SpiceDBAuthorizer(consistency=...)` also takes a function of no arguments that returns the
-  consistency requirement, so that every request can carry the ZedToken of the application's latest
-  write (M13 in the readiness review). It is called once for each `check` or `filter_for` that
-  sends SpiceDB a request, before the first, and every request of that call (each
-  CheckBulkPermissions batch, each subject's LookupResources) carries what it returned; a call that
-  sends nothing does not call it. A mapping was the only form, fixed when the authorizer was
-  created, and `atLeastAsFresh` guarantees data at least as fresh as its token and nothing more, so
-  a token passed once covered no later write. The documentation still told operators to declare
-  `max_staleness=0` with it, and a `CachingAuthorizer` told so holds nothing back after
-  `invalidate()`: an answer from before a later revocation could be kept for its whole `ttl`. What
-  the function returns must be exactly one of SpiceDB's four requirements, with a non-empty token
-  for `atLeastAsFresh` and `atExactSnapshot`. Anything else, None or `{}` included, or an exception
-  from the function, raises `AuthorizationError` and nothing is sent, rather than a weaker
-  requirement being used. With a function, `max_staleness` is 11 seconds unless you pass it,
-  whatever the function returns. A mapping is sent as given, unchecked, and declares the same
-  `max_staleness` as before. The tests cover a token per call, one evaluation for a call of several
-  requests, the failures, a mapping, `max_staleness` for both forms, and, against a real SpiceDB, a
-  revocation reported to the cache with the token of its write.
-
 ### Documentation
 
+- Redaction said a span gives its readers "in the same form as `MetadataACLAuthorizer`'s
+  permissions", which held only for the authorizer's default field names and marker, and the
+  redactor needs lists where the authorizer also takes a single string. The page now names the
+  fields and the marker, shows how to give the redactor the authorizer's own, and says how the two
+  differ. The threat model's T14 says where the 100-level bound is enforced.
+- `MongoDBBackend.exact_search` is True for a vector backend created with `exact=True`, which runs
+  `$vectorSearch` as an ENN search: MongoDB documents that it "exhaustively searches all the
+  indexed vector embeddings", with the permission filter as its pre-filter. The retriever therefore
+  reports a short result from such a backend as complete (`shortfall="exhausted"`), where 3.0
+  reported `complete=False` and `shortfall="unknown"`, and `check_backend` checks it as exact. The
+  hits returned do not change. Only what the index has caught up with counts: a chunk written with
+  `wait=False` or by another tool can be missing from a search made just after it. Keyword mode and
+  `exact=False` are unchanged. CI runs the conformance kit against Atlas Local with `exact=True`
+  (U20 in the readiness review).
 - The module docstring, the SpiceDB page and
   [Revocation and consistency](https://muzakkirhussain011.github.io/wardowl/revocation.html) said
   to declare `max_staleness=0` when sending `atLeastAsFresh` with "the token of every change you

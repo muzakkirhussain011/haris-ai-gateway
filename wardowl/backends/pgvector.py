@@ -11,7 +11,9 @@ tell a short result's cause and repair it.
 Chunks live in one table: `id text`, `content text`, `metadata jsonb`, `embedding vector(n)`, and
 `revision bigint`, which only writes given a `revision` read and set. Permission metadata is matched
 with JSON containment, which a GIN (`jsonb_path_ops`) index serves, so the filter stays fast on
-large tables. `create_schema` sets this up. Metadata keys must be strings, as JSON's are.
+large tables. `create_schema` sets this up. Metadata keys must be strings, as JSON's are. A row
+whose `metadata` is not a JSON object, as a row written by another tool can be, is returned with
+empty metadata: it carries no permissions, so the retriever's re-check denies it.
 """
 
 from __future__ import annotations
@@ -569,9 +571,11 @@ class PgVectorBackend:
         return int(row[0])
 
     def _hits(self, rows: Iterable[Sequence[Any]]) -> list[Hit]:
+        # A jsonb value that is not an object (an array, a string, a number, true), as a row written by
+        # another tool can hold, carries no permissions: the re-check denies it.
         if self.mode == "keyword":  # ts_rank_cd: higher is better
-            return [Hit(r[0], r[1], float(r[3]), r[2] or {}) for r in rows]
-        return [Hit(r[0], r[1], 1.0 - float(r[3]), r[2] or {}) for r in rows]
+            return [Hit(r[0], r[1], float(r[3]), r[2] if isinstance(r[2], dict) else {}) for r in rows]
+        return [Hit(r[0], r[1], 1.0 - float(r[3]), r[2] if isinstance(r[2], dict) else {}) for r in rows]
 
     def search(self, query: str | Query, k: int, filter: Filter | None = None, *, exact: bool = False) -> list[Hit]:
         """The k nearest chunks the filter matches; with `exact`, without the HNSW index."""

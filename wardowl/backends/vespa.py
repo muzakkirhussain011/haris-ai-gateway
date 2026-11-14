@@ -10,8 +10,12 @@ metadata value can turn into YQL.
 
 The application package needs a schema with these fields: `schema(dim)` writes one, and
 `examples/vespa` is a complete package. `approximate=True` (the default) searches the HNSW index;
-`approximate=False` compares the query with every chunk the filter admits. Vespa limits a query to
-400 hits unless the query profile raises `maxHits`, as the example package does.
+`approximate=False` compares the query with every chunk the filter admits, and the backend then
+declares `exact_search`. Vespa limits a query to 400 hits unless the query profile raises
+`maxHits`, as the example package does.
+
+A stored document whose metadata is not a JSON object, as one written by another tool can be, is
+returned with empty metadata: it carries no permissions, so the retriever's re-check denies it.
 """
 
 from __future__ import annotations
@@ -167,6 +171,14 @@ class VespaBackend:
         self._owns_client = client is None
         self._client = client if client is not None else _httpx().Client(timeout=timeout)
 
+    @property
+    def exact_search(self) -> bool:
+        """True for a vector search with `approximate=False`: Vespa then computes the distance to
+        every document that matches the filter, so fewer than k hits means that no other document
+        matches. False for the HNSW search and for keyword search, which ranks only documents that
+        contain the query's words."""
+        return self.mode == "vector" and self.approximate is False
+
     def close(self) -> None:
         """Close the HTTP client, if the backend created it."""
         if self._owns_client:
@@ -272,6 +284,17 @@ class VespaBackend:
             fields = child.get("fields", {})
             if not isinstance(fields.get(ID_FIELD), str):
                 raise RuntimeError(f"Vespa returned a hit without {ID_FIELD}: {child.get('id')!r}")
-            metadata = json.loads(fields.get(METADATA_FIELD) or "{}")
-            hits.append(Hit(fields[ID_FIELD], fields.get("text", ""), float(child["relevance"]), metadata))
+            try:
+                metadata = json.loads(fields.get(METADATA_FIELD) or "")
+            except (TypeError, ValueError):
+                metadata = None
+            hits.append(
+                Hit(
+                    fields[ID_FIELD],
+                    fields.get("text", ""),
+                    float(child["relevance"]),
+                    # A document without readable metadata carries no permissions: the re-check denies it.
+                    metadata if isinstance(metadata, dict) else {},
+                )
+            )
         return hits

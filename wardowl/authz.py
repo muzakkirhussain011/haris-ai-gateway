@@ -56,6 +56,11 @@ class UnsupportedSubject(AuthorizationError, ValueError):
     """
 
 
+def _named(value: Any) -> bool:
+    """False for a string that is empty or only whitespace, which names no user or group."""
+    return not isinstance(value, str) or bool(value.strip())
+
+
 def _shown(value: str, limit: int = 64) -> str:
     """`value` for an error message: its repr, cut short after `limit` characters."""
     return repr(value) if len(value) <= limit else f"{value[:limit]!r}... ({len(value):,} characters)"
@@ -93,6 +98,11 @@ class MetadataACLAuthorizer:
     `allowed_groups` contains the `everyone` marker (default `"*"`) is readable by every subject.
     Chunks without either field are readable by nobody: missing permissions mean no access.
 
+    A group name that is empty or only whitespace is no group, wherever it appears: the subject's
+    such groups are left out of the filter, and so is an `everyone` marker of that kind, so a chunk
+    that lists one is never readable through it. `Subject` accepts such names, since identity
+    providers can send them; here they grant nothing.
+
     This is the simplest model and needs no external service. It suits documents whose
     permissions are copied onto the chunks at ingestion time.
     """
@@ -113,10 +123,11 @@ class MetadataACLAuthorizer:
     def filter_for(self, subject: Subject, action: str = "read") -> Filter:
         if action not in self.actions:
             raise AuthorizationError(f"action {action!r} is not supported by this authorizer")
-        return Or(
-            In(self.users_field, {subject.id}),
-            In(self.groups_field, set(subject.groups) | {self.everyone}),
-        )
+        # A blank name is no group: "" in a token's groups must not match "" in a chunk's.
+        groups: set[str | int] = {g for g in subject.groups if _named(g)}
+        if _named(self.everyone):
+            groups.add(self.everyone)
+        return Or(In(self.users_field, {subject.id}), In(self.groups_field, groups))
 
     def check(self, subject: Subject, hits: Sequence[Hit], action: str = "read") -> list[bool]:
         f = self.filter_for(subject, action)
@@ -165,7 +176,17 @@ async def _acall(authorizer: Authorizer, name: str, *args: Any) -> Any:
     return None if method is None else await asyncio.to_thread(method, *args)
 
 
-def _join(op: type[And] | type[Or], filters: list[Filter]) -> Filter:
+def _join(op: type[And] | type[Or], filters: list[Any]) -> Filter:
+    """The parts' filters joined with `op`, once each is checked to be a filter.
+
+    `And` and `Or` take any clause, so a part's answer that is not a filter would otherwise pass
+    inside them as one. The retriever checks the whole tree it is given as well; this check also
+    covers code that calls `filter_for` or `scope_for` itself.
+    """
+    for f in filters:
+        if not isinstance(f, (In, And, Or)):
+            combined = "AllOf" if op is And else "AnyOf"
+            raise AuthorizationError(f"an authorizer in {combined} returned {type(f).__name__}, not a filter")
     return filters[0] if len(filters) == 1 else op(*filters)
 
 
