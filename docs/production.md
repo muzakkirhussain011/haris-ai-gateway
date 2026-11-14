@@ -103,6 +103,8 @@ says why. The table shows what each failure looks like.
 | Post-filtering cannot find `k` readable chunks within `max_candidates` | Returns what it found | `complete = False`; `wardowl.outcome = incomplete` |
 | An approximate index returns fewer than `k` chunks under the filter (it may have stopped early) | Returns what it found | `complete = False`; `wardowl.outcome = incomplete` |
 | A subject has no tenant under `TenantAuthorizer` | Raises `AuthorizationError` | As for a failing authorizer |
+| `OIDCAuthenticator` refuses a token: expired, not yet valid by the service's clock (a provider's clock ahead), or failing another check | Answers 401, the same whatever the reason | An INFO line on the `wardowl` logger naming the check, such as `ImmatureSignatureError` ([HTTP service](integrations/http.md#why-a-token-was-refused)) |
+| A token carries no groups claim | Without `require_groups`, a subject with no groups: 200 with fewer hits; with it, 401 | A DEBUG line on the `wardowl` logger, or the 401's INFO line |
 | The shared cache (Redis) is down or slow | Treats it as a miss and asks the permission service | A warning on the `wardowl` logger; higher `wardowl.authorize.duration` |
 | A shared-cache entry is unsigned, tampered with or copied under another key | Ignores it (with `signing_key`) | Nothing: it is a miss |
 | `invalidate()` cannot reach Redis | Raises, because the caller asked for a revocation now | The exception at the caller |

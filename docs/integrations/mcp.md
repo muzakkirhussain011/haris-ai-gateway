@@ -103,7 +103,12 @@ subject id, and in group names with `group_subjects=True` ([SpiceDB](spicedb.md#
 group ids or paths, such as Keycloak's `/acme/hr`, rather than display names.
 
 The subject then stays the same for the life of the process, after the token expires too, so the
-launcher must stop the process when the user signs out. For a server several people reach, use
+launcher must stop the process when the user signs out. `verify` checks the token as the HTTP
+service does, its times against this machine's clock included: a launcher that starts the server
+just after the token was issued, on a machine whose clock is behind the provider's, gets
+`InvalidToken` unless `leeway` allows for the difference
+([Clock skew and leeway](http.md#clock-skew-and-leeway)); the `wardowl` logger records which check
+failed, at INFO. `require_groups` applies here too. For a server several people reach, use
 Streamable HTTP with a token verifier, as at the top of this page: every request carries the user's
 token, and `subject_for` builds the subject from it each time.
 
