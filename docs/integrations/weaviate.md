@@ -94,3 +94,9 @@ from wardowl.backends.weaviate import permission_terms
 properties["wardowl_terms"] = permission_terms(metadata)
 properties["metadata_json"] = json.dumps(metadata)
 ```
+
+The terms are derived from the metadata: recompute them with `permission_terms` in the same write
+as every change to an object's metadata, as `set_metadata` does. A tool that changes the metadata
+alone leaves the old terms. Terms that grant more than the metadata let the pre-filtered search find
+the object, and the re-check drops it and counts it in `violations`; terms that grant less hide it
+from pre-filtered searches, and nothing reports it.

@@ -35,15 +35,21 @@ creates the collection if needed and a `vectorSearch` index named `wardowl`, wit
 Atlas Vector Search indexes a write a moment after MongoDB stores it, not at once. A retrieval made
 in between would not see a new chunk, and, worse for permissions, could still match a replaced
 chunk by its old permission terms. wardowl's re-check reads the stored metadata, so such a
-chunk is dropped rather than leaked, but `add` and `delete` close the gap by default:
+chunk is dropped rather than leaked, but `add`, `set_metadata` and `delete` close the gap by
+default:
 
 - every `add` writes a fresh value of `wardowl_write` on each chunk, and returns once an exact
   search filtered on that value finds every chunk it wrote. That is also when their new permission
   terms are searchable.
+- every `set_metadata` waits the same way as `add`, with its own value of `wardowl_write`.
 - every `delete` returns once the index no longer returns the deleted ids.
 
-Both raise `TimeoutError` after `wait_timeout` seconds (60 by default). Bulk ingestion that does not
-need to read its own writes can pass `wait=False`.
+All three raise `TimeoutError` after `wait_timeout` seconds (60 by default). Bulk ingestion that
+does not need to read its own writes can pass `wait=False`.
+
+A replaced chunk dropped this way is counted in the result's `violations`, so a revocation written
+with `set_metadata` can raise the count for retrievals made while it waits; the wait blocks only
+the writer ([runbook](../runbook.md#the-violations-count-rose)).
 
 ## Revisions
 
@@ -135,6 +141,12 @@ from wardowl.backends.mongodb import permission_terms
 
 document["wardowl_terms"] = permission_terms(document["metadata"])
 ```
+
+The terms are derived from the metadata: recompute them with `permission_terms` in the same write
+as every change to a document's metadata, as `set_metadata` does. A tool that changes the metadata
+alone leaves the old terms. Terms that grant more than the metadata let the pre-filtered search find
+the document, and the re-check drops it and counts it in `violations`; terms that grant less hide
+it from pre-filtered searches, and nothing reports it.
 
 ## Keyword search and hybrid search
 

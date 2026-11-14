@@ -116,6 +116,12 @@ document[TERMS_FIELD] = permission_terms(document["metadata"])
 and map `wardowl_terms` as `keyword`. A document without a `metadata` object carries no
 permissions, so the re-check denies it.
 
+The terms are derived from the metadata: recompute them with `permission_terms` in the same write
+as every change to a document's metadata, as `set_metadata` does. A tool that changes the metadata
+alone leaves the old terms. Terms that grant more than the metadata let the pre-filtered search find
+the document, and the re-check drops it and counts it in `violations`; terms that grant less hide
+it from pre-filtered searches, and nothing reports it.
+
 ## Indexes created by needtoknow 1.x
 
 needtoknow 1.x mapped its terms as `needtoknow_terms`, with `dynamic: false`, under which a field
