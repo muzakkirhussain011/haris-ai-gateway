@@ -941,12 +941,16 @@ class PermissionedRetriever:
         for hit in hits:
             if not isinstance(hit, Hit):
                 raise TypeError(f"a search returns Hit objects, not {type(hit).__name__}")
-            if not isinstance(hit.id, str):
-                raise TypeError(f"a hit's id is a string, not {type(hit.id).__name__}")
-            if not isinstance(hit.metadata, Mapping):
-                raise TypeError(f"a hit's metadata is a mapping, not {type(hit.metadata).__name__}")
-            if isinstance(hit.score, bool) or not isinstance(hit.score, numbers.Real):
-                raise TypeError(f"a hit's score is a number, not {type(hit.score).__name__}")
+            # As the backend made them, whatever `Hit` declares: a dataclass checks nothing.
+            doc_id: Any = hit.id
+            metadata: Any = hit.metadata
+            score: Any = hit.score
+            if not isinstance(doc_id, str):
+                raise TypeError(f"a hit's id is a string, not {type(doc_id).__name__}")
+            if not isinstance(metadata, Mapping):
+                raise TypeError(f"a hit's metadata is a mapping, not {type(metadata).__name__}")
+            if isinstance(score, bool) or not isinstance(score, numbers.Real):
+                raise TypeError(f"a hit's score is a number, not {type(score).__name__}")
         return hits
 
     @staticmethod
