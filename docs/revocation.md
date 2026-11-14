@@ -116,9 +116,10 @@ and put the revocation in the request path of the change itself:
   `LatestWrite` is a short class shown, with the conditions that make `max_staleness=0` right, in
   [the token of the latest write](integrations/spicedb.md#the-token-of-the-latest-write). A token
   passed once, when the authorizer is created, is not enough: it covers that write and no later
-  one, so declare `max_staleness=0` only with such a function. Keto needs no setting. With Casbin,
-  make the change through the enforcer that serves retrievals, or reload it before you report
-  success; with Cedar, replace the authorizer, or change what its `entities` function returns.
+  one, so declare `max_staleness=0` for `atLeastAsFresh` only with such a function. Keto needs no
+  setting. With Casbin, make the change through the enforcer that serves retrievals, or reload it
+  before you report success; with Cedar, replace the authorizer, or change what its `entities`
+  function returns.
 - **Do not cache, or invalidate before you report success.** Either leave `CachingAuthorizer` out,
   or call `invalidate(user_id)` in the same code that applies the revocation, and only then tell the
   administrator it is done. `invalidate()` raises if it cannot reach Redis.
