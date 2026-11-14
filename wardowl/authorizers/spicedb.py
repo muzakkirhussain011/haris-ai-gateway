@@ -45,8 +45,19 @@ the follower read delay when it reads from replicas. Measured against SpiceDB 1.
 the defaults, it reached 8.7 s, and successive answers moved backwards: a revoked permission granted
 access again after it had stopped. `max_staleness` declares twice the documented bound, 11 s, which
 `CachingAuthorizer` reads; pass `max_staleness=` for a server with other settings. Pass
-`consistency={"fullyConsistent": True}` (`max_staleness` 0), or `{"atLeastAsFresh": {"token":
-zedtoken}}` with the token of the change, for answers that include it.
+`consistency={"fullyConsistent": True}` (`max_staleness` 0) for answers that include every change.
+`{"atLeastAsFresh": {"token": zedtoken}}` gets answers from data at least as fresh as the write the
+token came from, and SpiceDB guarantees nothing more
+(https://authzed.com/docs/spicedb/concepts/consistency): a token fixed when the authorizer is
+created covers no later write. For the token of the latest write, pass `consistency` a function of
+no arguments that returns the requirement. It is called once for each `check` or `filter_for` that
+sends a request, and all the requests of that call use what it returned. It must return exactly one
+of SpiceDB's four requirements, with a non-empty token for `atLeastAsFresh` and `atExactSnapshot`;
+anything else, or an exception, raises `AuthorizationError` before anything is sent. A mapping is
+sent as given, as before. `max_staleness` stays 11 with a function unless you pass it. Declare 0
+only when every request carries a token at least as new as the latest change you report with
+`CachingAuthorizer.invalidate()`, kept before you call it; a token fixed at creation does not do
+that (docs/integrations/spicedb.md, "The token of the latest write").
 """
 
 from __future__ import annotations
@@ -76,6 +87,32 @@ _LOOKUP_HAS = "LOOKUP_PERMISSIONSHIP_HAS_PERMISSION"
 _LOOKUP_CONDITIONAL = "LOOKUP_PERMISSIONSHIP_CONDITIONAL_PERMISSION"
 # ObjectReference.object_id in SpiceDB's API (authzed/api, core.proto), less "*", the subjects' wildcard.
 _OBJECT_ID = re.compile(r"[a-zA-Z0-9/_|\-=+]{1,1024}")
+# The Consistency message in SpiceDB's API (authzed/api, permission_service.proto): a required oneof
+# of two flags that must be true and two ZedTokens, whose token must be at least one byte (core.proto).
+_FLAGS = ("minimizeLatency", "fullyConsistent")
+_AT_TOKEN = ("atLeastAsFresh", "atExactSnapshot")
+
+
+def _requirement(value: object) -> dict[str, Any]:
+    """A fresh copy of `value`, a consistency a function returned, checked to be one SpiceDB accepts.
+
+    Anything else raises `AuthorizationError`, so nothing is sent: None, for one, would go out as no
+    consistency, which SpiceDB answers with its default for checks and lookups, `minimizeLatency`.
+    """
+    if isinstance(value, Mapping) and len(value) == 1:
+        ((option, setting),) = value.items()
+        if option in _FLAGS and setting is True:
+            return {option: True}
+        if option in _AT_TOKEN and isinstance(setting, Mapping) and set(setting) == {"token"}:
+            token = setting["token"]
+            if isinstance(token, str) and token:
+                return {option: {"token": token}}
+    kind = "mapping" if isinstance(value, Mapping) else type(value).__name__
+    raise AuthorizationError(
+        f"consistency returned a {kind}, which is not one SpiceDB consistency: it must hold exactly one of"
+        " minimizeLatency or fullyConsistent set to True, or atLeastAsFresh or atExactSnapshot with a"
+        " non-empty token string"
+    )
 
 
 def _object_id(kind: str, value: str) -> str:
@@ -111,13 +148,26 @@ class SpiceDBAuthorizer:
     None, the default, for no bound) bounds all the requests of one `check` or `filter_for`
     together, so that the call raises `AuthorizationError` once it runs out.
 
-    `max_staleness` is how many seconds old SpiceDB's answers can be: 0 with
-    `{"fullyConsistent": True}`, and otherwise 11 by default, twice the bound SpiceDB documents for
-    its default quantization settings (see the module docstring). Pass it for a server with other
-    settings, or 0 if you send `atLeastAsFresh` with the token of every change you report with
-    `CachingAuthorizer.invalidate()`. `trust_empty_lookup=True` takes a LookupResources answer with
-    no document as "nothing is readable" and returns a filter that matches nothing, as earlier
-    versions did; by default it returns no filter, so the retriever post-filters.
+    `consistency` is the requirement sent with every request: a mapping (by default
+    `{"minimizeLatency": True}`), sent as given; or a function of no arguments that returns one,
+    called once for each `check` or `filter_for` that sends SpiceDB a request, before the first,
+    so that all the requests of the call (every batch, every subject's lookup) use the same one.
+    What the function returns must be exactly one of `{"minimizeLatency": True}`,
+    `{"fullyConsistent": True}`, `{"atLeastAsFresh": {"token": t}}` or
+    `{"atExactSnapshot": {"token": t}}`, with `t` a non-empty string; anything else, or an
+    exception from it, raises `AuthorizationError` and nothing is sent. It is called from the
+    threads that serve retrievals, so what it reads must be safe to share between threads.
+
+    `max_staleness` is how many seconds old SpiceDB's answers can be: 0 with the mapping
+    `{"fullyConsistent": True}`, and otherwise 11 by default, a function included whatever it
+    returns: twice the bound SpiceDB documents for its default quantization settings (see the
+    module docstring). Pass it for a server with other settings, or 0 when every request carries
+    `atLeastAsFresh` with a token at least as new as the latest change you report with
+    `CachingAuthorizer.invalidate()`, kept before you call it. A function can return such a token;
+    a mapping fixed when the authorizer is created cannot. `trust_empty_lookup=True` takes a
+    LookupResources answer with no document as "nothing is readable" and returns a filter that
+    matches nothing, as earlier versions did; by default it returns no filter, so the retriever
+    post-filters.
     """
 
     def __init__(
@@ -132,7 +182,7 @@ class SpiceDBAuthorizer:
         group_type: str = "group",
         group_relation: str = "member",
         group_subjects: bool = False,
-        consistency: Mapping[str, Any] | None = None,
+        consistency: Mapping[str, Any] | Callable[[], Mapping[str, Any]] | None = None,
         max_staleness: float | None = None,
         caveat_context: Callable[[Subject], Mapping[str, Any]] | None = None,
         lookup_limit: int = 1000,
@@ -169,7 +219,11 @@ class SpiceDBAuthorizer:
         self.group_type = group_type
         self.group_relation = group_relation
         self.group_subjects = group_subjects
-        self.consistency = dict(consistency or {"minimizeLatency": True})
+        self.consistency: dict[str, Any] | Callable[[], Mapping[str, Any]]
+        if isinstance(consistency, Mapping) or not callable(consistency):
+            self.consistency = dict(consistency or {"minimizeLatency": True})  # as before
+        else:
+            self.consistency = consistency  # called for each check and filter_for
         self._max_staleness = None if max_staleness is None else _staleness(max_staleness)
         self.caveat_context = caveat_context
         self.lookup_limit = lookup_limit
@@ -178,11 +232,16 @@ class SpiceDBAuthorizer:
 
     @property
     def max_staleness(self) -> float:
-        """How many seconds old SpiceDB's answers can be: as passed, or 0 for `fullyConsistent`
-        and 11 for any other consistency, which may answer from a quantized revision."""
+        """How many seconds old SpiceDB's answers can be: as passed, or 0 for the mapping
+        `{"fullyConsistent": True}` and 11 for any other consistency, which may answer from a
+        quantized revision. A function is never called here: what it returns can change, so it
+        declares 11 whatever it returns now."""
         if self._max_staleness is not None:
             return self._max_staleness
-        return 0.0 if self.consistency.get("fullyConsistent") is True else _DEFAULT_STALENESS
+        consistency = self.consistency
+        if not isinstance(consistency, dict):  # a function
+            return _DEFAULT_STALENESS
+        return 0.0 if consistency.get("fullyConsistent") is True else _DEFAULT_STALENESS
 
     # ---- helpers ---------------------------------------------------------------------------
 
@@ -205,6 +264,18 @@ class SpiceDBAuthorizer:
                 for g in sorted(subject.groups)
             ]
         return refs
+
+    def _consistency(self) -> dict[str, Any]:
+        """The requirement for every request of one call: the mapping as given, or what the
+        function returns now, checked. Raises `AuthorizationError` rather than send a weaker one."""
+        consistency = self.consistency
+        if isinstance(consistency, dict):
+            return consistency
+        try:
+            value = consistency()
+        except Exception as exc:
+            raise AuthorizationError("consistency failed") from exc
+        return _requirement(value)
 
     def _context(self, subject: Subject) -> dict[str, Any]:
         if self.caveat_context is None:
@@ -229,7 +300,10 @@ class SpiceDBAuthorizer:
         unique = sorted({r for r in resources if r is not None})
         context = self._context(subject)
         pairs = [(r, s) for r in unique for s in subjects]
+        if not pairs:
+            return [False] * len(resources)  # no chunk has a resource id to ask about
         allowed = dict.fromkeys(unique, False)
+        consistency = self._consistency()  # one for every batch of this check
         deadline = self._client.deadline()  # one for every batch of this check
         for start in range(0, len(pairs), self.batch_size):
             batch = pairs[start : start + self.batch_size]
@@ -244,7 +318,7 @@ class SpiceDBAuthorizer:
             ]
             answer = self._client.post_json(
                 "/v1/permissions/checkbulk",
-                {"consistency": self.consistency, "items": items},
+                {"consistency": consistency, "items": items},
                 "SpiceDB CheckBulkPermissions",
                 deadline=deadline,
             )
@@ -276,11 +350,13 @@ class SpiceDBAuthorizer:
             return None
         permission = self._permission(action)
         context = self._context(subject)
+        subjects = self._subjects(subject)
         found: set[str] = set()
+        consistency = self._consistency()  # one for every subject's lookup
         deadline = self._client.deadline()  # one for every subject's lookup
-        for s in self._subjects(subject):
+        for s in subjects:
             payload = {
-                "consistency": self.consistency,
+                "consistency": consistency,
                 "resourceObjectType": self.resource_type,
                 "permission": permission,
                 "subject": s,

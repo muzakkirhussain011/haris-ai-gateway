@@ -109,6 +109,16 @@ This matters for large ids from a pandas integer column with a missing value, wh
 floats. Metadata keys must be strings: `add` and `set_metadata` refuse others with `ValueError`,
 since JSON would turn the key `1` into `"1"`, which a filter on the field `"1"` would then match.
 
+Up to `MANY_VALUES` (100) values of one type, each value becomes two bound parameters; above that,
+the values go in two array parameters, however many there are, with the field name twice
+([Subjects in very many groups](../operations.md#subjects-in-very-many-groups)). Integer values
+take two more, for the test above. `And` and `Or` add up the parameters of their clauses, though,
+and PostgreSQL takes at most 65,535 in one statement, so a filter made of very many `In` clauses
+can pass it: an `Or` of 330 clauses of 100 strings each needs 66,000. The search then fails, and
+the retriever raises `SearchError`. The built-in authorizers do not build such filters:
+`MetadataACLAuthorizer` gives two `In` clauses, and `OpenFGAAuthorizer` and `SpiceDBAuthorizer`
+one.
+
 ## Iterative index scans
 
 An HNSW index normally returns a fixed number of nearest rows (`hnsw.ef_search`, 40 by default)

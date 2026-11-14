@@ -8,6 +8,7 @@ import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import MappingProxyType
 
 import pytest
 from helpers import corpora, oracle_top_k, queries, subjects
@@ -228,6 +229,160 @@ def test_max_staleness_follows_the_consistency_unless_it_is_given():
     for bad in (-1, float("nan"), float("inf"), True):
         with pytest.raises(ValueError, match="staleness"):
             SpiceDBAuthorizer("http://127.0.0.1:1", max_staleness=bad)
+    # A function declares 11 s whatever it returns, until the operator declares otherwise, and it is
+    # not called to find out: what it returns can change.
+    writes = _Writes()
+    assert SpiceDBAuthorizer("http://127.0.0.1:1", consistency=writes).max_staleness == 11.0
+    strict = SpiceDBAuthorizer("http://127.0.0.1:1", consistency=lambda: {"fullyConsistent": True})
+    assert strict.max_staleness == 11.0
+    declared = SpiceDBAuthorizer("http://127.0.0.1:1", consistency=writes, max_staleness=0)
+    assert declared.max_staleness == 0.0 and CachingAuthorizer(declared).source_staleness == 0.0
+    assert CachingAuthorizer(SpiceDBAuthorizer("http://127.0.0.1:1", consistency=writes)).source_staleness == 11.0
+    assert writes.calls == 0
+
+
+# ---- consistency as a function ---------------------------------------------------------------
+
+
+class _Writes:
+    """A consistency function as if a write landed before every call: each returns a newer token."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        return {"atLeastAsFresh": {"token": f"t{self.calls}"}}
+
+
+def _both(allowed, *found):
+    """CheckBulkPermissions granting the pairs in `allowed`, and LookupResources finding `found`."""
+    has = "LOOKUP_PERMISSIONSHIP_HAS_PERMISSION"
+    lookup = _lookup(*({"result": {"resourceObjectId": d, "permissionship": has}} for d in found))
+    bulk = _bulk(allowed)
+    return lambda path, payload: (lookup if path.endswith("/resources") else bulk)(path, payload)
+
+
+def _sent(server):
+    return [payload["consistency"] for _, payload, _ in server.requests]
+
+
+def test_a_consistency_function_is_called_once_for_each_call_and_every_request_uses_it(server):
+    server.responder = _both({("d1", "eng#member")}, "d1")
+    writes = _Writes()
+    authz = SpiceDBAuthorizer(server.url, consistency=writes, group_subjects=True, batch_size=1)
+    # 2 resources x 2 subjects, one pair per request: four requests, all with the first call's token.
+    assert authz.check(ANN, HITS) == [True, False, False]
+    assert _sent(server) == [{"atLeastAsFresh": {"token": "t1"}}] * 4 and writes.calls == 1
+    server.requests.clear()
+    # One lookup for the user and one for the group, both with the next call's token.
+    assert authz.filter_for(ANN) == In("doc_id", ["d1"])
+    assert _sent(server) == [{"atLeastAsFresh": {"token": "t2"}}] * 2 and writes.calls == 2
+    server.requests.clear()
+    assert authz.check(ANN, HITS) == [True, False, False]
+    assert _sent(server) == [{"atLeastAsFresh": {"token": "t3"}}] * 4 and writes.calls == 3
+    # A call that sends nothing does not call it.
+    server.requests.clear()
+    assert authz.check(ANN, []) == [] and authz.check(ANN, HITS[2:]) == [False]
+    no_field = SpiceDBAuthorizer(server.url, consistency=writes, resource_field=None)
+    assert no_field.filter_for(ANN) is None
+    assert server.requests == [] and writes.calls == 3
+
+
+@pytest.mark.parametrize(
+    "returned",
+    [
+        {"minimizeLatency": True},
+        {"fullyConsistent": True},
+        {"atLeastAsFresh": {"token": "GhUKEzE2NjE"}},
+        {"atExactSnapshot": {"token": "GhUKEzE2NjE"}},
+    ],
+)
+def test_a_consistency_function_may_return_any_of_spicedbs_four_requirements(server, returned):
+    server.responder = _both({("d1", "ann")}, "d1")
+    authz = SpiceDBAuthorizer(server.url, consistency=lambda: MappingProxyType(returned))
+    assert authz.check(ANN, HITS) == [True, False, False] and authz.filter_for(ANN) == In("doc_id", ["d1"])
+    assert _sent(server) == [returned, returned]  # a plain copy, sent as JSON
+
+
+@pytest.mark.parametrize(
+    "returned",
+    [
+        None,  # SpiceDB would answer a request without a consistency with minimizeLatency
+        {},
+        "fullyConsistent",
+        [("fullyConsistent", True)],
+        {"fullyConsistent": False},
+        {"minimizeLatency": 1},
+        {"fullyConsistent": True, "minimizeLatency": True},
+        {"atleastAsFresh": {"token": "t1"}},  # misspelt
+        {"at_least_as_fresh": {"token": "t1"}},  # the JSON names, as in the documentation, only
+        {"atLeastAsFresh": "t1"},
+        {"atLeastAsFresh": {}},
+        {"atLeastAsFresh": {"token": ""}},  # no token yet
+        {"atLeastAsFresh": {"token": None}},
+        {"atLeastAsFresh": {"token": b"t1"}},
+        {"atExactSnapshot": {"token": "t1", "at": 1}},
+    ],
+)
+def test_a_consistency_function_returning_anything_else_fails_closed_before_sending(server, returned):
+    server.responder = _both({("d1", "ann")}, "d1")
+    authz = SpiceDBAuthorizer(server.url, consistency=lambda: returned)
+    with pytest.raises(AuthorizationError, match="not one SpiceDB consistency"):
+        authz.check(ANN, HITS)
+    with pytest.raises(AuthorizationError, match="not one SpiceDB consistency"):
+        authz.filter_for(ANN)
+    assert server.requests == []  # nothing sent, so no weaker consistency either
+
+
+def test_a_consistency_function_that_raises_fails_closed_before_sending(server):
+    server.responder = _both({("d1", "ann")}, "d1")
+    authz = SpiceDBAuthorizer(server.url, consistency=lambda: 1 / 0)
+    for call in (lambda: authz.check(ANN, HITS), lambda: authz.filter_for(ANN)):
+        with pytest.raises(AuthorizationError, match="consistency failed") as failure:
+            call()
+        assert "division" not in str(failure.value) and isinstance(failure.value.__cause__, ZeroDivisionError)
+    retriever = PermissionedRetriever(InMemoryBackend([Document("c1", "leave", {"doc_id": "d1"})]), authz)
+    with pytest.raises(AuthorizationError):
+        retriever.retrieve("leave", ANN)
+    assert server.requests == []
+
+
+def test_a_mapping_is_sent_as_given_with_every_request_as_before(server):
+    server.responder = _both(set(), "d1")
+    assert SpiceDBAuthorizer(server.url).consistency == {"minimizeLatency": True}
+    assert SpiceDBAuthorizer(server.url, consistency={}).consistency == {"minimizeLatency": True}
+    given = MappingProxyType({"fullyConsistent": True})
+    assert SpiceDBAuthorizer(server.url, consistency=given).consistency == {"fullyConsistent": True}
+    assert SpiceDBAuthorizer(server.url, consistency=[("fullyConsistent", True)]).consistency == dict(given)
+    # Not checked: SpiceDB decides what it accepts, as before.
+    unchecked = {"at_least_as_fresh": {"token": "t1"}}
+    authz = SpiceDBAuthorizer(server.url, consistency=unchecked, group_subjects=True, batch_size=1)
+    authz.check(ANN, HITS)
+    authz.filter_for(ANN)
+    assert _sent(server) == [unchecked] * 6
+    assert authz.consistency == unchecked and authz.consistency is not unchecked
+
+
+def test_with_the_token_of_each_write_a_reported_revocation_is_not_cached(server):
+    # M13. This scripted SpiceDB answers from the oldest revision at least as fresh as the token, as
+    # SpiceDB may: carol may read d1 at revision 1, and her access is revoked at revision 2.
+    def respond(path, payload):
+        revision = payload["consistency"]["atLeastAsFresh"]["token"]
+        return _bulk({("d1", "carol")} if revision == "1" else set())(path, payload)
+
+    server.responder = respond
+    carol, hits = Subject("carol"), HITS[:1]
+    latest = {"atLeastAsFresh": {"token": "1"}}
+    tracking = CachingAuthorizer(SpiceDBAuthorizer(server.url, consistency=lambda: latest, max_staleness=0), ttl=30)
+    fixed = SpiceDBAuthorizer(server.url, consistency={"atLeastAsFresh": {"token": "1"}}, max_staleness=0)
+    assert tracking.check(carol, hits) == [True] and fixed.check(carol, hits) == [True]
+    latest = {"atLeastAsFresh": {"token": "2"}}  # the revocation's token, kept before invalidate()
+    tracking.invalidate("carol")
+    assert tracking.check(carol, hits) == [False]
+    # A token fixed at creation covers no later write: the answer can predate the revocation, and a
+    # cache told that max_staleness is 0 would keep it.
+    assert fixed.check(carol, hits) == [True]
 
 
 @pytest.mark.parametrize(
@@ -464,3 +619,54 @@ def test_a_banned_member_of_a_permitted_group_is_denied_by_default():
         _api("/v1/relationships/delete", {"relationshipFilter": {"resourceType": "document"}})
         _api("/v1/relationships/delete", {"relationshipFilter": {"resourceType": "group"}})
         _api("/v1/schema/write", {"schema": SCHEMA})
+
+
+class LatestWrite:
+    """The example in docs/integrations/spicedb.md: a consistency at least as fresh as the latest
+    SpiceDB write made through `write`."""
+
+    def __init__(self):
+        self._current = {"fullyConsistent": True}  # until the first write
+        self._lock = threading.Lock()  # guards _current
+        self._writing = threading.Lock()  # one write at a time
+
+    def __call__(self):
+        with self._lock:
+            return self._current
+
+    def write(self, apply):
+        """Run `apply()`, which writes to SpiceDB and returns the write's ZedToken, and keep it."""
+        with self._writing:
+            token = apply()
+            with self._lock:
+                self._current = {"atLeastAsFresh": {"token": token}}
+
+
+@needs_spicedb
+def test_spicedb_answers_a_reported_revocation_at_once_with_the_token_of_its_write():
+    _api("/v1/schema/write", {"schema": SCHEMA})
+    _api("/v1/relationships/delete", {"relationshipFilter": {"resourceType": "document"}})
+    viewer = {
+        "resource": {"objectType": "document", "objectId": "wo-zed"},
+        "relation": "viewer",
+        "subject": _user("carol"),
+    }
+
+    def written(operation):
+        answer = _api("/v1/relationships/write", {"updates": [{"operation": operation, "relationship": viewer}]})
+        return answer["writtenAt"]["token"]
+
+    latest = LatestWrite()
+    spicedb = SpiceDBAuthorizer(SPICEDB_URL, SPICEDB_TOKEN, consistency=latest, max_staleness=0)
+    authorizer = CachingAuthorizer(spicedb, ttl=30)
+    carol, hits = Subject("carol"), [Hit("c1", "t", 1.0, {"doc_id": "wo-zed"})]
+    assert authorizer.check(carol, hits) == [False]  # under fullyConsistent, before any write
+    for _ in range(10):  # grant and revoke, asking straight after each write
+        latest.write(lambda: written("OPERATION_TOUCH"))
+        authorizer.invalidate("carol")
+        assert authorizer.check(carol, hits) == [True]
+        assert spicedb.filter_for(carol) == In("doc_id", ["wo-zed"])
+        latest.write(lambda: written("OPERATION_DELETE"))
+        authorizer.invalidate("carol")
+        assert authorizer.check(carol, hits) == [False]
+        assert spicedb.filter_for(carol) is None  # nothing found, so no filter

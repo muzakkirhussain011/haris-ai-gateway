@@ -157,16 +157,106 @@ SpiceDB 1.56.2 on Postgres with those defaults, revocations took a median 3.3 se
 an older revision than the one before.
 
 `SpiceDBAuthorizer` declares this as `max_staleness`: 11 seconds, twice the documented bound, for
-any consistency but `fullyConsistent`, which declares 0. Pass `max_staleness=` for a server with
-other settings (twice the interval times one plus the percentage, plus any follower read delay), or
-0 if you send `atLeastAsFresh` with the token of every change you report to the cache.
+any consistency but the mapping `{"fullyConsistent": True}`, which declares 0. Pass
+`max_staleness=` for a server with other settings (twice the interval times one plus the
+percentage, plus any follower read delay), or 0 under the conditions in
+[the token of the latest write](#the-token-of-the-latest-write).
 
-For fresher answers pass `consistency={"fullyConsistent": True}`, or `{"atLeastAsFresh": {"token":
-zedtoken}}` with the ZedToken from your last write. Combined with `CachingAuthorizer`, the
-revocation bound is the cache's `ttl` plus the staleness. After `invalidate()`, the cache reads
-`max_staleness` and, for that long, keeps no answer for the subject, so one from the stale snapshot
-is not held for `ttl`; the bound is then the staleness alone, plus `local_ttl` on other replicas
+For fresher answers pass `consistency={"fullyConsistent": True}`, which SpiceDB answers from the
+latest data, bypassing its caches, at a cost in latency
+([SpiceDB consistency](https://authzed.com/docs/spicedb/concepts/consistency)); or
+`{"atLeastAsFresh": {"token": zedtoken}}`, which it answers from data at least as fresh as the
+write that returned the ZedToken. Combined with `CachingAuthorizer`, the revocation bound is the
+cache's `ttl` plus the staleness. After `invalidate()`, the cache reads `max_staleness` and, for
+that long, keeps no answer for the subject, so one from the stale snapshot is not held for `ttl`;
+the bound is then the staleness alone, plus `local_ttl` on other replicas
 ([Revocation and consistency](../revocation.md#bounded-staleness)).
+
+### The token of the latest write
+
+SpiceDB returns a ZedToken from every write: `writtenAt` in the answer to WriteRelationships
+(`written_at` in its gRPC API,
+[authzed/api](https://github.com/authzed/api/blob/main/authzed/api/v1/permission_service.proto)).
+`atLeastAsFresh` guarantees data at least as fresh as that token and nothing more, so a mapping
+holding one token, passed when the authorizer is created, covers that write and none after it. A
+revocation written later can still be missing from the answers, and a `CachingAuthorizer` told that
+`max_staleness` is 0 holds nothing back after `invalidate()`, so it keeps such an answer for its
+whole `ttl`.
+
+To send the token of the latest write, pass `consistency` a function of no arguments that returns
+the requirement. It is called once for each `check` or `filter_for` that sends SpiceDB a request,
+before the first one, and every request of that call (each CheckBulkPermissions batch, each
+subject's LookupResources) carries what it returned. A call that sends nothing, such as a check of
+chunks with no resource id, does not call it. It must return exactly one of SpiceDB's four
+requirements, as its API defines them: `{"minimizeLatency": True}`, `{"fullyConsistent": True}`,
+or `atLeastAsFresh` or `atExactSnapshot` with `{"token": ...}` holding a non-empty string. If it
+raises, or returns anything else (None, `{}`, a misspelt name, an empty token), the call raises
+`AuthorizationError` and sends nothing; it never falls back to a weaker requirement. Sent without
+one, a check or a lookup would get SpiceDB's default, `minimize_latency`. A mapping is sent as
+given, unchecked, as before.
+
+The function runs in the threads that serve retrievals while your code records writes, so what it
+reads must be safe to share between threads. For example:
+
+```python
+import threading
+
+from wardowl import CachingAuthorizer
+from wardowl.authorizers.spicedb import SpiceDBAuthorizer
+
+
+class LatestWrite:
+    """A consistency at least as fresh as the latest SpiceDB write made through `write`."""
+
+    def __init__(self):
+        self._current = {"fullyConsistent": True}  # until the first write
+        self._lock = threading.Lock()  # guards _current
+        self._writing = threading.Lock()  # one write at a time
+
+    def __call__(self):
+        with self._lock:
+            return self._current
+
+    def write(self, apply):
+        """Run `apply()`, which writes to SpiceDB and returns the write's ZedToken, and keep it."""
+        with self._writing:
+            token = apply()
+            with self._lock:
+                self._current = {"atLeastAsFresh": {"token": token}}
+
+
+latest = LatestWrite()
+spicedb = SpiceDBAuthorizer(SPICEDB_URL, token=SPICEDB_KEY, consistency=latest, max_staleness=0)
+authorizer = CachingAuthorizer(spicedb, ttl=30)
+
+
+def revoke(user_id, document_id):
+    latest.write(lambda: remove_viewer(document_id, user_id))
+    authorizer.invalidate(user_id)  # only once the token is kept
+```
+
+`remove_viewer` stands for your own WriteRelationships call; it returns the answer's
+`writtenAt.token`. What this relies on: `_lock` makes reading and replacing `_current` safe between
+threads on any Python build, and `write` replaces the dictionary instead of changing it, so the one
+a call received stays as it was while wardowl copies it. `_writing` lets one write run at a time, so
+the token kept last is always that of the latest write; without it, two writes running together
+could keep their tokens in the wrong order. CI runs a copy of this class against a real SpiceDB,
+granting and revoking ten times and checking straight after each write.
+
+`max_staleness=0` is then right for the revocations made through `revoke`:
+
+- the token is kept before `invalidate()` is called, so every check or lookup that starts after
+  `invalidate()` carries a token at least as new as the revocation;
+- a check that started earlier, with an older token, may answer from before the revocation, and
+  `CachingAuthorizer` does not keep an answer to a call that began before `invalidate()`.
+
+It is not right with a token fixed when the authorizer is created, and covers only the writes the
+function sees. With several processes, each one's function must return the token of the latest
+write any of them made, read for example from your database, where it is stored before
+`invalidate()` is called; `LatestWrite` above sees only its own process's writes. A change the token
+does not cover, such as one made directly in SpiceDB, gets no guarantee from it. Otherwise keep the
+default `max_staleness`, or use `fullyConsistent`. With a function, `max_staleness` is 11 seconds
+unless you pass it, whatever the function returns.
 
 ## Failures
 

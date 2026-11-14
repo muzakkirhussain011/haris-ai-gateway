@@ -28,6 +28,12 @@ One chunk can serve several tenants: store a list, `{"tenant": ["acme", "globex"
 matches the subjects of either, because `In` matches a list field by any of its elements, in the
 check and in every backend's filter. A subject belongs to one tenant at a time.
 
+The comparison keeps types, as every filter does: a chunk whose tenant is the integer `42` does not
+match a subject whose tenant is the string `"42"`. `OIDCAuthenticator` in the
+[HTTP service](integrations/http.md#mapping-a-real-providers-tokens) always gives the tenant claim
+as a string, in the attribute `tenant`, so store tenants as strings there, or convert the attribute
+in an `OIDCAuthenticator.subject` override.
+
 ## AllOf and AnyOf
 
 | | A chunk is readable when | Pre-filter | Scope |
