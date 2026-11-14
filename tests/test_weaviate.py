@@ -110,9 +110,12 @@ class FakeClient:
         return self.handle
 
 
-def _object(doc_id, distance, text="t", metadata='{"level": 1}'):
+def _object(doc_id, distance, text="t", metadata='{"level": 1}', at=None):
+    """An object as a search returns it: by default where `add` writes `doc_id`, or a new UUID for None."""
     properties = {ID_PROPERTY: doc_id, "content": text, "metadata_json": metadata}
-    return SimpleNamespace(uuid=uuid.uuid4(), properties=properties, metadata=SimpleNamespace(distance=distance))
+    if at is None:
+        at = uuid.uuid4() if doc_id is None else uuid.UUID(point_id(doc_id))
+    return SimpleNamespace(uuid=at, properties=properties, metadata=SimpleNamespace(distance=distance))
 
 
 def test_requests_target_the_named_vector_inside_the_filter():
@@ -135,6 +138,40 @@ def test_hits_come_back_best_first_and_without_permissions_when_metadata_is_unre
     assert [h.id for h in hits][1:] == ["a", "b"] and hits[0].id == str(objects[2].uuid)
     assert hits[0].score == pytest.approx(0.9) and hits[1].metadata == {} and hits[1].text == ""
     assert hits[2].metadata == {"level": 1}
+
+
+def test_an_object_is_never_reported_under_an_id_another_object_holds_where_add_writes_it():
+    # An object another tool wrote at the UUID u, and an object at another UUID holding "x", were
+    # reported under the ids of wardowl chunks: one id for two objects, which made the reranker path
+    # raise and could hide the chunk across post-filtering rounds.
+    pytest.importorskip("weaviate")
+    u = str(uuid.uuid4())
+    objects = [
+        _object(u, 0.1, text="mine"),
+        _object(None, 0.1, text="other tool", at=uuid.UUID(u)),
+        _object("x", 0.2, text="x"),
+        _object("x", 0.2, text="copy", at=uuid.UUID(point_id("elsewhere"))),
+        _object(None, 0.3, text="plain"),  # another tool's object, whose UUID no chunk holds
+    ]
+    client = FakeClient(objects=objects, stored={point_id(u): {ID_PROPERTY: u}, point_id("x"): {ID_PROPERTY: "x"}})
+    hits = WeaviateBackend(client, "Docs", EMBED).search("leave", 5)
+    assert sorted(h.text for h in hits) == ["mine", "plain", "x"] and len({h.id for h in hits}) == 3
+    # Short of k after leaving two out, it asked for more; the fake answers with the same five.
+    assert [request["limit"] for request in client.handle.requests] == [5, 7]
+
+    class AsyncHandle:
+        def __init__(self):
+            self.query = SimpleNamespace(near_vector=self.near_vector, fetch_objects=self.fetch_objects)
+
+        async def near_vector(self, **request):
+            return client.handle.near_vector(**request)
+
+        async def fetch_objects(self, **request):
+            return client.handle.fetch_objects(**request)
+
+    async_client = SimpleNamespace(collections=SimpleNamespace(get=lambda name: AsyncHandle()))
+    native = WeaviateBackend(FakeClient(), "Docs", EMBED, async_client=async_client)
+    assert asyncio.run(native.asearch("leave", 5)) == hits
 
 
 def test_add_writes_guarded_terms_and_exact_metadata_in_batches():
@@ -366,6 +403,33 @@ def test_changes_reach_only_the_object_that_holds_the_id(client):
         assert {h.id: h.metadata for h in backend.search("salary", 5)}[other_tool] == {"allowed_groups": ["*"]}
         backend.delete([other_tool, "mine"])
         assert [h.id for h in backend.search("leave board salary", 5)] == ["intruder"]
+    finally:
+        client.collections.delete(name)
+
+
+def test_server_never_reports_one_id_for_two_objects(client):
+    name = _new_collection(client)
+    backend = WeaviateBackend(client, name, EMBED)
+    everyone = {"allowed_groups": ["*"]}
+    u = str(uuid.uuid4())
+    docs = [Document(u, "leave policy", everyone), Document("x", "leave rota", everyone)]
+    docs += [Document(f"d{i}", f"leave note {i}", everyone) for i in range(4)]
+    backend.add(docs)
+    handle = client.collections.get(name)
+    readable = {"metadata_json": '{"allowed_groups": ["*"]}', TERMS_FIELD: permission_terms(everyone)}
+    other_tool = {"content": "other tool", **readable}  # at the UUID u, without wardowl_id
+    handle.data.insert(properties=other_tool, uuid=u, vector={"embedding": EMBED("leave policy")})
+    copy = {ID_PROPERTY: "x", "content": "copy", **readable}  # holds "x" at another object id
+    handle.data.insert(properties=copy, uuid=point_id("elsewhere"), vector={"embedding": EMBED("leave rota")})
+    try:
+        wanted = {d.id: d.text for d in docs}
+        for f in (None, In("allowed_groups", ["*"])):
+            hits = backend.search("leave policy rota", 6, f)
+            assert {h.id: h.text for h in hits} == wanted and len(hits) == 6
+        reversing = PermissionedRetriever(backend, MetadataACLAuthorizer(), reranker=lambda q, hits: hits[::-1])
+        assert sorted(h.id for h in reversing.retrieve("leave", Subject("ann"), k=6).hits) == sorted(wanted)
+        backend.delete(["x"])  # the object at another id is reported under "x" once no chunk holds it
+        assert {h.id: h.text for h in backend.search("leave rota", 6)}["x"] == "copy"
     finally:
         client.collections.delete(name)
 

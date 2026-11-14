@@ -15,15 +15,18 @@ Weaviate object ids are UUIDs: `add` derives one from the SHA-256 of every docum
 (`point_id`) and keeps the original id in the `wardowl_id` property. `set_metadata` and `delete`
 act on an object only when its `wardowl_id` is the id asked for, so they never change an object
 that belongs to another id; an object written by another tool, without `wardowl_id`, is reached by
-its UUID written exactly as results report it. `create_collection` sets up the collection with a
-self-provided cosine vector.
+its UUID written exactly as results report it. An object that would be reported under an id whose
+own object (the one `add` writes it to) holds that id is left out of results, so one id never
+stands for two objects. `create_collection` sets up the collection with a self-provided cosine
+vector.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable, Iterable, Mapping, Sequence
+import uuid
+from collections.abc import Callable, Iterable, Mapping, Sequence, Set
 from typing import Any
 
 from wardowl.backends._engines import _SEP, TERMS_FIELD, tag, terms
@@ -68,6 +71,44 @@ def point_id(document_id: str) -> str:
     Every id is hashed, one that is already a UUID too, so no two document ids share an object.
     """
     return hashed_uuid(document_id, "wardowl weaviate object")
+
+
+def _at(obj: Any, document_id: str) -> bool:
+    """Whether `obj` is the object `add` writes `document_id` to."""
+    try:
+        return uuid.UUID(str(obj.uuid)) == uuid.UUID(point_id(document_id))
+    except ValueError:
+        return False
+
+
+def _reported(obj: Any) -> tuple[str, bool]:
+    """The id an object is reported under, and whether it is the object `add` writes that id to."""
+    doc_id = (obj.properties or {}).get(ID_PROPERTY)
+    if isinstance(doc_id, str):
+        return doc_id, _at(obj, doc_id)
+    return str(obj.uuid), False
+
+
+def _lookups(objects: Iterable[Any]) -> list[str]:
+    """For each object that is not the one `add` writes its reported id to, the object that is."""
+    return list(dict.fromkeys(point_id(doc_id) for doc_id, own in map(_reported, objects) if not own))
+
+
+def _held(stored: Iterable[Any]) -> set[str]:
+    """The ids that these objects, looked up by `_lookups`, hold where `add` writes them."""
+    held: set[str] = set()
+    for obj in stored:
+        doc_id, own = _reported(obj)
+        if own:
+            held.add(doc_id)
+    return held
+
+
+def _by_id(uuids: Sequence[str]) -> dict[str, Any]:
+    """`fetch_objects` arguments for these objects, with their `wardowl_id`."""
+    from weaviate.classes.query import Filter as Where
+
+    return {"filters": Where.by_id().contains_any(list(uuids)), "limit": len(uuids), "return_properties": [ID_PROPERTY]}
 
 
 def filter_to_weaviate(f: Filter) -> Any:
@@ -153,6 +194,12 @@ class WeaviateBackend:
 
     `mode="keyword"` searches the text with Weaviate's BM25 instead, under the same permission
     filter, for hybrid search with `RankFusion`; `embed` may then be None, and scores are BM25's.
+
+    A search whose answer holds an object that is not where `add` writes its reported id (an object
+    written by another tool, reported under its UUID, or one holding a `wardowl_id` at another
+    UUID) looks up the object `add` writes that id to, in one `fetch_objects` call. If that object
+    holds the id, the other object is left out of the results, which then never report one id
+    twice, and the search asks for more objects to make up k.
     """
 
     supports_filters = True
@@ -303,9 +350,8 @@ class WeaviateBackend:
             "return_metadata": MetadataQuery(distance=True),
         }
 
-    def _hit(self, obj: Any) -> Hit:
+    def _hit(self, obj: Any, doc_id: str) -> Hit:
         properties = obj.properties or {}
-        doc_id = properties.get(ID_PROPERTY)
         text = properties.get(self.content_property)
         try:
             metadata = json.loads(properties.get(self.metadata_property) or "")
@@ -318,15 +364,21 @@ class WeaviateBackend:
             distance = obj.metadata.distance if obj.metadata is not None else None
             score = 1.0 - float(distance) if distance is not None else 0.0
         return Hit(
-            doc_id if isinstance(doc_id, str) else str(obj.uuid),
+            doc_id,
             text if isinstance(text, str) else "",
             score,
             # An object without readable metadata carries no permissions: the re-check denies it.
             metadata if isinstance(metadata, dict) else {},
         )
 
-    def _hits(self, response: Any) -> list[Hit]:
-        hits = [self._hit(o) for o in response.objects]
+    def _hits(self, objects: Iterable[Any], held: Set[str]) -> list[Hit]:
+        """The objects as hits, best first, without those reported under an id in `held` (ids whose
+        own object holds them) that are not that object."""
+        hits = []
+        for obj in objects:
+            doc_id, own = _reported(obj)
+            if own or doc_id not in held:  # else another object holds this id where add writes it
+                hits.append(self._hit(obj, doc_id))
         hits.sort(key=lambda h: (-h.score, h.id))
         return hits
 
@@ -337,7 +389,19 @@ class WeaviateBackend:
         if request is None:
             return []
         query_api = self.client.collections.get(self.collection).query
-        return self._hits((query_api.bm25 if self.mode == "keyword" else query_api.near_vector)(**request))
+        run = query_api.bm25 if self.mode == "keyword" else query_api.near_vector
+        limit = k
+        while True:
+            objects = list(run(**(request | {"limit": limit})).objects)
+            lookups = _lookups(objects)
+            held: Set[str] = frozenset()
+            if lookups:
+                held = _held(query_api.fetch_objects(**_by_id(lookups)).objects)
+            hits = self._hits(objects, held)
+            # Fewer than k after leaving objects out, from a full answer: ask for as many more.
+            if len(hits) >= k or len(objects) < limit:
+                return hits[:k]
+            limit = k + len(objects) - len(hits)
 
     async def asearch(self, query: str | Query, k: int, filter: Filter | None = None) -> list[Hit]:
         if self.async_client is None:
@@ -348,4 +412,15 @@ class WeaviateBackend:
         if request is None:
             return []
         query_api = self.async_client.collections.get(self.collection).query
-        return self._hits(await (query_api.bm25 if self.mode == "keyword" else query_api.near_vector)(**request))
+        run = query_api.bm25 if self.mode == "keyword" else query_api.near_vector
+        limit = k
+        while True:
+            objects = list((await run(**(request | {"limit": limit}))).objects)
+            lookups = _lookups(objects)
+            held: Set[str] = frozenset()
+            if lookups:
+                held = _held((await query_api.fetch_objects(**_by_id(lookups))).objects)
+            hits = self._hits(objects, held)
+            if len(hits) >= k or len(objects) < limit:
+                return hits[:k]
+            limit = k + len(objects) - len(hits)

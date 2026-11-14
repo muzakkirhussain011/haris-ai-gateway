@@ -26,6 +26,16 @@ fields and on `wardowl_id`, which `set_metadata` and `delete` filter on. Without
 still filters correctly, but has to check every point; a collection in strict mode refuses filtered
 updates on a field without an index, so index `wardowl_id` in collections you create yourself.
 
+On a collection that already exists, `create_collection` first reads its first 16 points (in point
+id order, payload keys `wardowl_id` and `needtoknow_id` only) and raises `ValueError`, creating no
+index, if one of them holds `needtoknow_id` and no `wardowl_id`: a point that needtoknow 1.x wrote.
+Such a point sits at a point id derived another way, so `set_metadata` and `delete` by chunk id
+would not reach it, and a revocation would change nothing without saying so. The backend makes the
+same check before its first `add`, `set_metadata` or `delete` that has something to write, and
+writes nothing if it fails; once a check passes it does not check again. Write such a collection's
+chunks into a new one ([Upgrading](../upgrading.md#2-index-your-chunks-again)). The check reads a
+sample, so older points after the first 16 are not found; searches are not checked.
+
 The default `keyword_fields` do not include `tenant`, the field
 [`TenantAuthorizer`](../combining.md#tenant-isolation) filters on. In a collection that holds
 several tenants, add it, so that Qdrant plans the tenant condition with an index:
@@ -53,6 +63,16 @@ every document id (`point_id`), a document id that is already a UUID included, a
 original under `wardowl_id` in the payload. Search results report that id, or the point id for
 points written by something else. A point without a `metadata` object carries no permissions, so
 the re-check denies it.
+
+One id never stands for two points in results. A point written by something else at the UUID `u`,
+reported as `u`, and a chunk added with the id `u`, stored at `point_id(u)`, would both be reported
+as `u`; so would a point holding `wardowl_id` `x` at a point id other than `point_id("x")`, next to
+the chunk `x`. When an answer holds a point that is not at `point_id` of the id it would be reported
+under, the search looks up that point id with one `retrieve` call. If the point there holds the id,
+the other point is left out, and the search asks Qdrant again for as many more points as it left
+out, so leaving points out never by itself makes a result shorter than k. When no chunk holds the
+id where `add` writes it, the point is reported as before. A collection holding only points that
+`add` wrote never needs the extra call.
 
 `set_metadata` and `delete` select points with a filter that also requires `wardowl_id` to equal
 the id asked for, so they never change or remove a point that holds another id. A point written by

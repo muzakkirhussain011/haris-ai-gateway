@@ -241,7 +241,8 @@ class MongoDBBackend:
     `embed` turns text into a vector (your embedding model). `index` names the vector search index.
     `num_candidates` is how many neighbours the approximate search considers (raised to `k`, at
     most 10,000): higher finds more of the true nearest chunks and takes longer. `exact=True`
-    searches every chunk instead. `wait_timeout` bounds how long `add` and `delete` wait for the
+    searches every chunk instead, and makes `exact_search` True in vector mode, so the retriever
+    reports a short result as complete. `wait_timeout` bounds how long `add` and `delete` wait for the
     index. Pass `async_collection` (the same collection from an `AsyncMongoClient`) for a native
     `asearch`; otherwise async calls run `search` in a thread. Without `embed`, search with
     `Query(vector=...)` and pass `embeddings` to `add`.
@@ -292,6 +293,19 @@ class MongoDBBackend:
         self.num_candidates = num_candidates
         self.exact = exact
         self.wait_timeout = wait_timeout
+
+    @property
+    def exact_search(self) -> bool:
+        """True for a vector backend created with `exact=True`: `$vectorSearch` then runs an exact
+        (ENN) search, which scores every indexed vector the filter admits, so fewer than k hits
+        means that the index holds no other matching chunk with a vector.
+
+        Only what the index has caught up with counts. Writes through this backend wait for the
+        index by default; a chunk written with `wait=False`, or by another tool, can be missing
+        from a search made just after it, and a chunk without a vector is never in the vector
+        index.
+        """
+        return self.mode == "vector" and bool(self.exact)
 
     # ---- writing -----------------------------------------------------------------------------
 

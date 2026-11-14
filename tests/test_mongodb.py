@@ -135,6 +135,20 @@ def test_the_pipeline_searches_inside_the_filter_with_enough_candidates():
     assert exact["$vectorSearch"]["index"] == "docs"
 
 
+def test_exact_search_is_declared_for_an_exact_vector_backend_only():
+    # exact=True runs ENN, which scores every indexed vector the filter admits, so the retriever can
+    # take a short result as proof that nothing else matches.
+    assert MongoDBBackend(None, EMBED, exact=True).exact_search is True
+    assert MongoDBBackend(None, EMBED).exact_search is False
+    assert MongoDBBackend(None, mode="keyword", exact=True).exact_search is False  # $search is not ENN
+    collection = FakeCollection([{"_id": "a", "content": "t", "metadata": {"allowed_groups": ["hr"]}, "score": 0.9}])
+    retriever = PermissionedRetriever(MongoDBBackend(collection, EMBED, exact=True), MetadataACLAuthorizer())
+    result = retriever.retrieve("leave", Subject("ann", ["hr"]), 5)
+    assert [h.id for h in result.hits] == ["a"] and (result.complete, result.shortfall) == (True, "exhausted")
+    approximate = PermissionedRetriever(MongoDBBackend(collection, EMBED), MetadataACLAuthorizer())
+    assert approximate.retrieve("leave", Subject("ann", ["hr"]), 5).complete is False
+
+
 def test_hits_come_back_best_first_and_without_permissions_when_metadata_is_missing():
     results = [
         {"_id": "b", "content": "text b", "metadata": {"level": 1}, "score": 0.5},
@@ -358,6 +372,30 @@ def test_server_passes_the_conformance_kit():
 
     try:
         check_backend(make)
+    finally:
+        collection.drop()
+
+
+def test_server_exact_search_passes_the_conformance_kit_as_exact():
+    # exact_search makes the kit check every search as exact, and the retriever take a short result
+    # as complete.
+    collection = _collection()
+    backend, previous = MongoDBBackend(collection, EMBED, exact=True), []
+    assert backend.exact_search is True
+
+    def make(docs):
+        backend.delete(previous)
+        backend.add(docs)
+        previous[:] = [d.id for d in docs]
+        return backend
+
+    try:
+        check_backend(make, examples=10)
+        hr, eng = {"allowed_groups": ["hr"]}, {"allowed_groups": ["eng"]}
+        make([Document("mine", "leave", hr), Document("other", "leave", eng)])
+        retriever = PermissionedRetriever(backend, MetadataACLAuthorizer(), strategy="prefilter")
+        result = retriever.retrieve("leave", Subject("ann", ["hr"]), 5)
+        assert [h.id for h in result.hits] == ["mine"] and (result.complete, result.shortfall) == (True, "exhausted")
     finally:
         collection.drop()
 

@@ -329,6 +329,108 @@ def test_short_results_are_told_apart_and_repaired(any_client):
         any_client.delete_collection(name)
 
 
+def _legacy_point(doc_id, text, metadata):
+    """A point as needtoknow 1.6 wrote it: the id under needtoknow_id, at a point id derived another way."""
+    point = str(uuid.uuid5(uuid.UUID("5e3b1d7c-6b7a-4f0e-9a51-6f1d0c2b8e44"), doc_id))
+    payload = {"needtoknow_id": doc_id, "page_content": text, "metadata": metadata}
+    return models.PointStruct(id=point, vector=EMBED(text), payload=payload)
+
+
+def test_a_collection_written_by_needtoknow_1x_is_refused_before_anything_is_written(any_client):
+    # needtoknow 1.x kept the id under needtoknow_id at a point id derived another way, so a revocation
+    # sent by chunk id reached no point, and nothing said so.
+    name = f"wo_{uuid.uuid4().hex}"
+    hr = {"allowed_groups": ["hr"]}
+    params = models.VectorParams(size=EMBED.dim, distance=models.Distance.COSINE)
+    any_client.create_collection(name, vectors_config=params)
+    try:
+        any_client.upsert(name, points=[_legacy_point("doc-42", "salary bands", hr)], wait=True)
+        with pytest.raises(ValueError, match=r"needtoknow 1\.x.*upgrading"):
+            create_collection(any_client, name, EMBED.dim)
+        backend = QdrantBackend(any_client, name, EMBED)
+        with pytest.raises(ValueError, match=r"needtoknow 1\.x"):
+            backend.set_metadata({"doc-42": {"allowed_groups": []}})
+        with pytest.raises(ValueError, match=r"needtoknow 1\.x"):
+            backend.delete(["doc-42"])
+        with pytest.raises(ValueError, match=r"needtoknow 1\.x"):
+            backend.add([Document("doc-42", "salary bands", {"allowed_groups": []})])
+        (stored,) = any_client.scroll(name, with_payload=True)[0]
+        assert stored.payload["metadata"] == hr and any_client.count(name).count == 1  # nothing was written
+        # Nothing to write, nothing checked; searching is not checked.
+        backend.set_metadata({})
+        backend.delete([])
+        assert [h.metadata for h in backend.search("salary", 5)] == [hr]
+    finally:
+        any_client.delete_collection(name)
+
+
+def test_current_collections_pass_the_layout_check(any_client):
+    name = f"wo_{uuid.uuid4().hex}"
+    create_collection(any_client, name, EMBED.dim)
+    try:
+        create_collection(any_client, name, EMBED.dim)  # empty
+        backend = QdrantBackend(any_client, name, EMBED)
+        backend.add([Document("a", "leave policy", {"allowed_groups": ["hr"]})])
+        foreign = {"page_content": "rota", "metadata": {"allowed_groups": ["hr"]}}  # as LangChain writes it
+        point = models.PointStruct(id=str(uuid.uuid4()), vector=EMBED("rota"), payload=foreign)
+        any_client.upsert(name, points=[point])
+        # A chunk wardowl wrote that also holds a needtoknow_id, written by another tool, is wardowl's.
+        any_client.set_payload(name, payload={"needtoknow_id": "a"}, points=[point_id("a")], wait=True)
+        create_collection(any_client, name, EMBED.dim)
+        fresh = QdrantBackend(any_client, name, EMBED)
+        fresh.set_metadata({"a": {"allowed_groups": ["*"]}})
+        assert {h.id: h.metadata for h in fresh.search("leave", 5)}["a"] == {"allowed_groups": ["*"]}
+    finally:
+        any_client.delete_collection(name)
+
+
+async def _native_asearch(client, name, k, f):
+    async_client = qdrant_client.AsyncQdrantClient(url=URL)
+    try:
+        return await QdrantBackend(client, name, EMBED, async_client=async_client).asearch("leave", k, f)
+    finally:
+        await async_client.close()
+
+
+def test_a_point_is_never_reported_under_an_id_another_point_holds_where_add_writes_it(any_client):
+    # A point written by another tool at the UUID u, and a point at another chunk's point id holding
+    # "x", were both reported under the id of a wardowl chunk: one id for two points, which made the
+    # reranker path raise and could hide the chunk across post-filtering rounds.
+    name = f"wo_{uuid.uuid4().hex}"
+    create_collection(any_client, name, EMBED.dim)
+    everyone = {"allowed_groups": ["*"]}
+    u = str(uuid.uuid4())
+    docs = [Document(u, "leave policy", everyone), Document("x", "leave rota", everyone)]
+    docs += [Document(f"d{i}", f"leave note {i}", everyone) for i in range(4)]
+    backend = QdrantBackend(any_client, name, EMBED)
+    backend.add(docs)
+    other_tool = {"page_content": "other tool", "metadata": everyone}
+    copy = {ID_KEY: "x", "page_content": "copy", "metadata": everyone}
+    shadows = [
+        models.PointStruct(id=u, vector=EMBED("leave policy"), payload=other_tool),
+        models.PointStruct(id=point_id("elsewhere"), vector=EMBED("leave rota"), payload=copy),
+    ]
+    any_client.upsert(name, points=shadows, wait=True)
+    readable = In("allowed_groups", ["*"])
+    try:
+        wanted = {d.id: d.text for d in docs}
+        for f in (None, readable):
+            for exact in (False, True):
+                hits = backend.search("leave policy rota", 6, f, exact=exact)
+                # Every chunk once, with its own text, and k of them: the search asked for more.
+                assert {h.id: h.text for h in hits} == wanted and len(hits) == 6
+        assert {h.id: h.text for h in asyncio.run(backend.asearch("leave", 6))} == wanted
+        reversing = PermissionedRetriever(backend, MetadataACLAuthorizer(), reranker=lambda q, hits: hits[::-1])
+        assert sorted(h.id for h in reversing.retrieve("leave", Subject("ann"), k=6).hits) == sorted(wanted)
+        if URL:  # a native async client needs the server: local mode keeps each client's data apart
+            assert asyncio.run(_native_asearch(any_client, name, 6, readable)) == backend.search("leave", 6, readable)
+        # The point at another chunk's point id is still reported under "x" once no chunk holds "x".
+        backend.delete(["x"])
+        assert {h.id: h.text for h in backend.search("leave rota", 6)}["x"] == "copy"
+    finally:
+        any_client.delete_collection(name)
+
+
 def test_wrong_input_is_rejected():
     with pytest.raises(ValueError):
         QdrantBackend(None, "", EMBED)

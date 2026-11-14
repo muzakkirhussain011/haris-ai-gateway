@@ -116,6 +116,20 @@ document[TERMS_FIELD] = permission_terms(document["metadata"])
 and map `wardowl_terms` as `keyword`. A document without a `metadata` object carries no
 permissions, so the re-check denies it.
 
+## Indexes created by needtoknow 1.x
+
+needtoknow 1.x mapped its terms as `needtoknow_terms`, with `dynamic: false`, under which a field
+the mapping lacks is kept in `_source` but never indexed
+([Elasticsearch](https://www.elastic.co/docs/reference/elasticsearch/mapping-reference/dynamic),
+[OpenSearch](https://docs.opensearch.org/latest/mappings/mapping-parameters/dynamic/)), so no filter
+on `wardowl_terms` can match a document of such an index, whoever wrote the document. Every
+pre-filtered search would come back empty, with no error. `create_index` on an index that exists reads its mapping and raises
+`ValueError` if it maps `needtoknow_terms` and not `wardowl_terms`; for a name that resolves to
+several indexes, such as an alias, it checks each of them. It changes nothing in the index. Write
+such an index's chunks into a new one ([Upgrading](../upgrading.md#2-index-your-chunks-again)).
+The backend itself does not read the mapping, so an application that never calls `create_index`
+is not checked.
+
 ## Limits
 
 Both engines return at most 10,000 hits per search, so a search with `k` above 10,000 raises

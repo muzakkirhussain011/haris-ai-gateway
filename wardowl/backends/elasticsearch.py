@@ -20,7 +20,15 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from wardowl.backends._engines import _MAX_K, TERMS_FIELD, EngineBackend, filter_to_query, mappings, terms
+from wardowl.backends._engines import (
+    _MAX_K,
+    TERMS_FIELD,
+    EngineBackend,
+    check_layout,
+    filter_to_query,
+    mappings,
+    terms,
+)
 
 __all__ = ["TERMS_FIELD", "ElasticsearchBackend", "create_index", "filter_to_query", "permission_terms"]
 
@@ -46,10 +54,15 @@ def create_index(
     Elasticsearch quantizes dense vectors by default (`int8_hnsw` below 384 dimensions, `bbq_hnsw`
     from 384 in 9.1 and later), which saves memory and costs some recall. Pass
     `index_options={"type": "hnsw"}` to keep full-precision vectors.
+
+    An existing index is left as it is, after one check: if its mapping is needtoknow 1.x's
+    (`needtoknow_terms` mapped, `wardowl_terms` not), which no filtered search can match, it raises
+    `ValueError`. Write such an index's chunks into a new one.
     """
     if not isinstance(dim, int) or dim < 1:
         raise ValueError("dim must be a positive integer")
     if client.indices.exists(index=index):
+        check_layout(client, index, "Elasticsearch")
         return
     vector: dict[str, Any] = {"type": "dense_vector", "dims": dim, "index": True, "similarity": "cosine"}
     if index_options is not None:

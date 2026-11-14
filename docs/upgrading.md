@@ -264,6 +264,21 @@ Weaviate also derive every point id from the chunk id's SHA-256 now, a UUID chun
 Write your chunks into a new collection, index or table with wardowl, switch the application to it,
 then drop the old one.
 
+On some stores, an object left in the 1.x layout misbehaved without an error: Qdrant reported point
+UUIDs as chunk ids, and `set_metadata` and `delete` by a chunk id that is not a UUID reached no
+point, so a revocation changed nothing; Elasticsearch and OpenSearch found nothing under a
+pre-filter; and Chroma denied every chunk. From wardowl 3.1 these
+raise `ValueError` instead, pointing here, and write nothing:
+
+| Store | What is checked | When |
+|---|---|---|
+| Qdrant | The collection's first 16 points: one holding `needtoknow_id` and no `wardowl_id` | `create_collection` on an existing collection, and a backend's first `add`, `set_metadata` or `delete` |
+| Elasticsearch, OpenSearch | The index mapping: `needtoknow_terms` mapped and `wardowl_terms` not | `create_index` on an existing index |
+| Chroma | Each record a search returns: `needtoknow_metadata` and no `wardowl_metadata` | Every search (raised from `retrieve` as `SearchError`) |
+
+Other stores, and objects these checks do not read (Qdrant points after the first 16, an
+Elasticsearch index used without calling `create_index`), are not checked.
+
 ### 3. Check the changes that can affect your code
 
 | If you use | What changed | What to do |

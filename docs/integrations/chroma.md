@@ -48,7 +48,17 @@ So the backend stores metadata in a form that bug cannot affect:
 
 Search results are rebuilt from the JSON copy, never from the fields Chroma returns, so the
 retriever's re-check always sees the true permissions. Records written by something other than
-wardowl have no copy and are treated as having no permissions: the re-check denies them.
+wardowl have no copy and are treated as having no permissions: the re-check denies them. So is a
+record whose `wardowl_metadata` is not JSON text for an object, such as one another tool or a
+manual edit wrote; before, such a record failed every search that returned it.
+
+needtoknow 1.x kept the copy under `needtoknow_metadata`. Read as records without a copy, every
+chunk of such a collection would be denied, and a pre-filtered search would find nothing, with no
+error. So a search that returns a record holding `needtoknow_metadata` and no `wardowl_metadata`
+raises `ValueError`, which the retriever raises as `SearchError` with it as the cause. Write such a
+collection's chunks into a new one ([Upgrading](../upgrading.md#2-index-your-chunks-again)). The
+check costs nothing extra: it reads the metadata the search returns. A record of that kind that no
+search returns is not found.
 
 Field names, in metadata and in filters, may not contain `::`, and `wardowl_metadata` is
 reserved: a filter on such a name would test a list field or the JSON copy, and `filter_to_where`

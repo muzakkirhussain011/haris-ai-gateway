@@ -6,6 +6,54 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `MongoDBBackend.exact_search` is True for a vector backend created with `exact=True`, which runs
+  `$vectorSearch` as an ENN search: MongoDB documents that it "exhaustively searches all the
+  indexed vector embeddings", with the permission filter as its pre-filter. The retriever therefore
+  reports a short result from such a backend as complete (`shortfall="exhausted"`), where 3.0
+  reported `complete=False` and `shortfall="unknown"`, and `check_backend` checks it as exact. The
+  hits returned do not change. Only what the index has caught up with counts: a chunk written with
+  `wait=False` or by another tool can be missing from a search made just after it. Keyword mode and
+  `exact=False` are unchanged. CI runs the conformance kit against Atlas Local with `exact=True`
+  (U20 in the readiness review).
+
+### Fixed
+
+- A store left in needtoknow 1.x's layout now raises `ValueError`, naming the upgrade step that
+  writes the chunks into a new collection, instead of misbehaving without an error (U5, U9, U18
+  and U21 in the readiness review). The upgrading guide tells 1.x users to index again, and nothing
+  noticed when that step was skipped. On Qdrant, results reported 1.x points under their UUIDs, and
+  `set_metadata` and `delete` by a chunk id that is not a UUID reached no point, so a revocation
+  changed nothing; `create_collection` on an existing collection, and each backend's first `add`,
+  `set_metadata` or `delete` with something to write, now read the first 16 points and raise if
+  one holds `needtoknow_id` and no `wardowl_id`, before writing anything. On Elasticsearch and
+  OpenSearch, a 1.x index maps `needtoknow_terms` under `dynamic: false`, so `wardowl_terms` is
+  never indexed and every pre-filtered search found nothing; `create_index` on an existing index
+  now reads its mapping and raises if it maps `needtoknow_terms` and not `wardowl_terms`. On
+  Chroma, every 1.x record was denied, as a record without `wardowl_metadata`; a search that
+  returns a record holding `needtoknow_metadata` and no `wardowl_metadata` now raises, which the
+  retriever raises as `SearchError`. Collections, indexes and records in the current layout, empty
+  ones included, pass, and so do points and records written by other tools. The checks read only;
+  objects they do not read (Qdrant points after the first 16, an index used without
+  `create_index`) are not checked, and searches on Qdrant, Elasticsearch and OpenSearch are not
+  checked. No layout version marker is stored: the one layout change so far is told apart by its
+  field names, and a marker would need a write to existing objects and a migration story.
+- `ChromaBackend` reads a record whose `wardowl_metadata` is not JSON text for an object as
+  carrying no permissions, so the re-check denies it, as it does a record without the copy and as
+  the Redis, LanceDB and Weaviate backends do. Such a record, written by another tool or a manual
+  edit, made every search that returned it fail with `SearchError` (U19 in the readiness review).
+- `QdrantBackend` and `WeaviateBackend` never report one id for two points. A point another tool
+  wrote at the UUID `u`, and a chunk added with the id `u` (stored at `point_id(u)`), were both
+  reported as `u`, and so were a point holding `wardowl_id` `x` at another point id and the chunk
+  `x`; with a reranker the retrieval then raised `ValueError`, and post-filtering, which keeps the
+  first copy of an id it sees, could leave out the readable one (U22 in the readiness review).
+  When an answer holds a point that is not where `add` writes the id it would be reported under,
+  the search now looks up that point in one more call (`retrieve` on Qdrant, `fetch_objects` on
+  Weaviate), leaves the other point out when the point there holds the id, and asks for as many
+  more points as it left out. A collection holding only points `add` wrote makes no extra call, and
+  a point that shadows no chunk is reported as before.
+
 ## [3.0.0] - 2026-11-14
 
 A major release, because several fixes change documented behaviour that 2.1 code may rely on: a
