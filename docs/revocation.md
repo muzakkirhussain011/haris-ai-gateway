@@ -24,8 +24,9 @@ stop as soon as it is withdrawn.
      with its defaults; measured against SpiceDB 1.56 on Postgres it reached 8.7 seconds, and a
      revoked permission sometimes granted access again after it had stopped. `SpiceDBAuthorizer`
      therefore declares `max_staleness` of 11 seconds, twice the documented bound.
-     `{"fullyConsistent": True}`, or `{"atLeastAsFresh": {"token": zedtoken}}` with the token from
-     your write, answers from current data. See [SpiceDB](integrations/spicedb.md#consistency-and-revocation).
+     `{"fullyConsistent": True}` answers from current data, and `{"atLeastAsFresh": {"token":
+     zedtoken}}` from data that includes the write the token came from, but not necessarily any
+     later one. See [SpiceDB](integrations/spicedb.md#consistency-and-revocation).
    - OPA and Cerbos answer from the policies and data they have loaded; bundle polling or a policy
      reload adds its interval (Cerbos reloaded a changed policy file in 2.5 seconds, at most 4,
      in the same measurements).
@@ -97,10 +98,27 @@ For access that must stop at once, such as when an account is disabled, make eve
 and put the revocation in the request path of the change itself:
 
 - **Ask the service for current answers:** `OpenFGAAuthorizer(..., consistency="HIGHER_CONSISTENCY")`,
-  or `SpiceDBAuthorizer(..., consistency={"fullyConsistent": True})`, or pass SpiceDB the zedtoken
-  of your write with `atLeastAsFresh`. Keto needs no setting. With Casbin, make the change through
-  the enforcer that serves retrievals, or reload it before you report success; with Cedar, replace
-  the authorizer, or change what its `entities` function returns.
+  or `SpiceDBAuthorizer(..., consistency={"fullyConsistent": True})`, or send SpiceDB, with every
+  request, the zedtoken of the latest write under `atLeastAsFresh`. For that, pass `consistency` a
+  function that returns it, and keep each write's token before you call `invalidate()`:
+
+  ```python
+  latest = LatestWrite()  # holds the latest write's zedtoken, safely across threads
+  authorizer = CachingAuthorizer(
+      SpiceDBAuthorizer(SPICEDB_URL, token=SPICEDB_KEY, consistency=latest, max_staleness=0), ttl=30
+  )
+
+  def revoke(user_id, document_id):
+      latest.write(lambda: remove_viewer(document_id, user_id))  # returns writtenAt.token
+      authorizer.invalidate(user_id)
+  ```
+
+  `LatestWrite` is a short class shown, with the conditions that make `max_staleness=0` right, in
+  [the token of the latest write](integrations/spicedb.md#the-token-of-the-latest-write). A token
+  passed once, when the authorizer is created, is not enough: it covers that write and no later
+  one, so declare `max_staleness=0` only with such a function. Keto needs no setting. With Casbin,
+  make the change through the enforcer that serves retrievals, or reload it before you report
+  success; with Cedar, replace the authorizer, or change what its `entities` function returns.
 - **Do not cache, or invalidate before you report success.** Either leave `CachingAuthorizer` out,
   or call `invalidate(user_id)` in the same code that applies the revocation, and only then tell the
   administrator it is done. `invalidate()` raises if it cannot reach Redis.

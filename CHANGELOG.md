@@ -6,6 +6,40 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `SpiceDBAuthorizer(consistency=...)` also takes a function of no arguments that returns the
+  consistency requirement, so that every request can carry the ZedToken of the application's latest
+  write (M13 in the readiness review). It is called once for each `check` or `filter_for` that
+  sends SpiceDB a request, before the first, and every request of that call (each
+  CheckBulkPermissions batch, each subject's LookupResources) carries what it returned; a call that
+  sends nothing does not call it. A mapping was the only form, fixed when the authorizer was
+  created, and `atLeastAsFresh` guarantees data at least as fresh as its token and nothing more, so
+  a token passed once covered no later write. The documentation still told operators to declare
+  `max_staleness=0` with it, and a `CachingAuthorizer` told so holds nothing back after
+  `invalidate()`: an answer from before a later revocation could be kept for its whole `ttl`. What
+  the function returns must be exactly one of SpiceDB's four requirements, with a non-empty token
+  for `atLeastAsFresh` and `atExactSnapshot`. Anything else, None or `{}` included, or an exception
+  from the function, raises `AuthorizationError` and nothing is sent, rather than a weaker
+  requirement being used. With a function, `max_staleness` is 11 seconds unless you pass it,
+  whatever the function returns. A mapping is sent as given, unchecked, and declares the same
+  `max_staleness` as before. The tests cover a token per call, one evaluation for a call of several
+  requests, the failures, a mapping, `max_staleness` for both forms, and, against a real SpiceDB, a
+  revocation reported to the cache with the token of its write.
+
+### Documentation
+
+- The module docstring, the SpiceDB page and
+  [Revocation and consistency](https://muzakkirhussain011.github.io/wardowl/revocation.html) said
+  to declare `max_staleness=0` when sending `atLeastAsFresh` with "the token of every change you
+  report", and the strict-revocation recipe said to pass "the zedtoken of your write", which a token
+  fixed when the authorizer is created does not do; revocation also said that `atLeastAsFresh`
+  answers from current data. They now say what the token guarantees, and that `max_staleness=0` is
+  right only when every request carries a token at least as new as the latest revocation reported
+  to the cache, kept before `invalidate()` is called. The SpiceDB page shows a thread-safe function
+  that does it, says what it relies on, and says what it does not cover: writes in other processes,
+  unless the token is shared, and changes made directly in SpiceDB.
+
 ## [3.0.0] - 2026-11-14
 
 A major release, because several fixes change documented behaviour that 2.1 code may rely on: a
