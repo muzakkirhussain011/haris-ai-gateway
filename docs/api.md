@@ -7,7 +7,7 @@ modules and need their extra.
 
 ```{eval-rst}
 .. autoclass:: wardowl.PermissionedRetriever
-   :members: retrieve, aretrieve
+   :members: retrieve, aretrieve, observer_failures
 
 .. autoclass:: wardowl.RetrievalResult
    :members:
@@ -161,14 +161,19 @@ See [Google Drive](integrations/google-drive.md).
 
 .. autoclass:: wardowl.JsonLinesAudit
 
+.. autoexception:: wardowl.AuditError
+
 .. autofunction:: wardowl.events.query_fingerprint
 
 .. autoclass:: wardowl.otel.OpenTelemetryObserver
 
 .. autoclass:: wardowl.otel.OpenTelemetryMetrics
+   :members: observer_failed
 ```
 
-An observer is any callable that takes a `RetrievalEvent`.
+An observer is any callable that takes a `RetrievalEvent`. One that also defines
+`observer_failed(observer, event, error)` hears of every observer that raised
+([When an observer fails](operations.md#when-an-observer-fails)).
 
 ## Backends
 

@@ -18,6 +18,11 @@ metadata is stored as JSON in the hash and returned exactly as written, for the 
 with `content_field=`, the chunks' text for keyword search. A write is searchable as soon as it
 returns. `RedisBackend(..., mode="keyword")` searches the text with BM25 under the same permission
 filter; the query's words are passed as parameters, never as query syntax.
+
+A search that runs out of time must not pass for a complete one. Under the server's default policy
+the Query Engine answers it with the results found so far: in RESP3 with a warning, on which the
+backend raises, and in RESP2 with nothing to tell them apart. So the first time a search is
+answered in RESP2, the backend asks the server for its policy and raises unless it is `fail`.
 """
 
 from __future__ import annotations
@@ -50,6 +55,50 @@ _MAX_TAG = 4096
 _SET_IF_STORED = (
     "if redis.call('EXISTS', KEYS[1]) == 1 then redis.call('HSET', KEYS[1], ARGV[1], ARGV[2], ARGV[3], ARGV[4]) end"
 )
+# What the server does with a search that runs out of time: Redis 8's setting, then Redis Stack's.
+_POLICY_COMMANDS = (("CONFIG", "GET", "search-on-timeout"), ("FT.CONFIG", "GET", "ON_TIMEOUT"))
+# The Query Engine's policies (on_timeout_vals in RediSearch's src/config.h). Only "fail" raises;
+# "return" and "return-strict" both answer with the results found so far.
+_POLICIES = frozenset({"fail", "return", "return-strict"})
+
+
+def _policy(reply: Any) -> str | None:
+    """The policy in a CONFIG GET or FT.CONFIG GET reply, in either protocol and with keys and
+    values as bytes or strings; None when it holds no policy, or more than one."""
+    words: set[str] = set()
+    pending = [reply]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, Mapping):
+            pending.extend(item.keys())
+            pending.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            pending.extend(item)
+        else:
+            text = _text(item)
+            if text is not None:
+                words.add(text.lower())
+    found = words & _POLICIES
+    return found.pop() if len(found) == 1 else None
+
+
+def _resp2(reply: Any) -> bool:
+    """Whether an FT.SEARCH reply came in RESP2 (a list) rather than RESP3 (a map)."""
+    if isinstance(reply, Mapping):
+        return False
+    if isinstance(reply, (list, tuple)):
+        return True
+    # A client that parses the reply into its own object, as redis-py's unified responses can.
+    raise TypeError(f"FT.SEARCH answered with {type(reply).__name__}, not the RESP2 list or RESP3 map it sends")
+
+
+def _refusal(policy: str | None) -> RuntimeError:
+    return RuntimeError(
+        "Redis answered in RESP2, which cannot show that a search ran out of time and returned "
+        f"partial results, and the server's search-on-timeout policy is {policy or 'unknown'}, not "
+        "fail. Set search-on-timeout fail (FT.CONFIG SET ON_TIMEOUT FAIL on Redis Stack), connect "
+        "with protocol=3, or pass check_timeout_policy=False to accept RESP2 answers as they are."
+    )
 
 
 def _hex(term: str) -> str:
@@ -156,6 +205,15 @@ class RedisBackend:
     becomes a parameter, so none can act as query syntax, and up to 64 distinct words are kept.
     Scores are Redis's BM25, higher for better matches. Such a backend needs no `embed`: without
     one, `add` writes chunks with no vector, which keyword search still finds.
+
+    A search that ran out of time raises rather than return partial results. A RESP3 answer
+    carries the Query Engine's warning when that happens (redis-py 8.1 speaks RESP3 unless given
+    `protocol=2`; `protocol=3` makes sure of it). A RESP2 answer carries none, so the first time a
+    search is answered in RESP2 the backend reads the server's `search-on-timeout` policy
+    (`ON_TIMEOUT` on Redis Stack) and raises `RuntimeError` unless it is `fail`, under which a
+    timed-out search raises on the server; until it reads `fail`, it asks again on each such
+    search. `check_timeout_policy=False` accepts RESP2 answers without asking, for a server whose
+    policy is set where the client may not read it.
     """
 
     supports_filters = True
@@ -173,6 +231,7 @@ class RedisBackend:
         metadata_field: str = "metadata",
         ef_runtime: int | None = None,
         async_client: Any = None,
+        check_timeout_policy: bool = True,
     ) -> None:
         if not index or not prefix:
             raise ValueError("index and prefix must be non-empty")
@@ -190,6 +249,8 @@ class RedisBackend:
         self.content_field = content_field
         self.metadata_field = metadata_field
         self.ef_runtime = ef_runtime
+        self.check_timeout_policy = check_timeout_policy
+        self._fails_on_timeout = False  # set once the server's policy has been read as "fail"
 
     # ---- writing -----------------------------------------------------------------------------
 
@@ -323,7 +384,10 @@ class RedisBackend:
         command = self._command(Query.of(query), k, filter)
         if command is None:
             return []
-        return self._hits(self.client.execute_command(*command))
+        reply = self.client.execute_command(*command)
+        if _resp2(reply) and self._unchecked():
+            self._remember(*self._read_policy())
+        return self._hits(reply)
 
     async def asearch(self, query: str | Query, k: int, filter: Filter | None = None) -> list[Hit]:
         if self.async_client is None:
@@ -333,4 +397,44 @@ class RedisBackend:
         command = await asyncio.to_thread(self._command, Query.of(query), k, filter)
         if command is None:
             return []
-        return self._hits(await self.async_client.execute_command(*command))
+        reply = await self.async_client.execute_command(*command)
+        if _resp2(reply) and self._unchecked():
+            self._remember(*await self._aread_policy())
+        return self._hits(reply)
+
+    # ---- the server's timeout policy, for RESP2 answers --------------------------------------
+
+    def _unchecked(self) -> bool:
+        """Whether a RESP2 answer still needs the server's policy read before it is trusted."""
+        return self.check_timeout_policy and not self._fails_on_timeout
+
+    def _read_policy(self) -> tuple[str | None, Exception | None]:
+        """The server's policy, or None, with the last error met while asking for it."""
+        error: Exception | None = None
+        for command in _POLICY_COMMANDS:
+            try:
+                policy = _policy(self.client.execute_command(*command))
+            except Exception as exc:  # an unknown command or setting, or one this client may not run
+                error = exc
+                continue
+            if policy is not None:
+                return policy, None
+        return None, error
+
+    async def _aread_policy(self) -> tuple[str | None, Exception | None]:
+        error: Exception | None = None
+        for command in _POLICY_COMMANDS:
+            try:
+                policy = _policy(await self.async_client.execute_command(*command))
+            except Exception as exc:
+                error = exc
+                continue
+            if policy is not None:
+                return policy, None
+        return None, error
+
+    def _remember(self, policy: str | None, error: Exception | None) -> None:
+        """Trust RESP2 answers from now on if the policy is `fail`; raise otherwise."""
+        if policy != "fail":
+            raise _refusal(policy) from error
+        self._fails_on_timeout = True

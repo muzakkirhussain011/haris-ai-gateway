@@ -38,6 +38,8 @@ Guarantees
   still matched against the filter locally, so a backend that ignores the filter cannot leak
   either; only a filter that is itself broader than the authorizer's check goes unnoticed.
 * A `reranker` sees only hits that passed the check, and can only reorder, score or drop them.
+* With `required_observers`, a retrieval that one of them cannot record raises `AuditError`, with a
+  fixed message, and returns nothing.
 
 The algorithm is written once, as a generator of operations; `retrieve` runs it synchronously and
 `aretrieve` runs it with `await`, so both paths share the same security logic.
@@ -52,6 +54,7 @@ import functools
 import logging
 import math
 import random
+import threading
 import time
 from collections.abc import Callable, Generator, Iterator, Sequence
 from contextlib import contextmanager
@@ -59,7 +62,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from wardowl.authz import AuthorizationError, Authorizer
-from wardowl.events import Observer, RetrievalEvent, query_fingerprint
+from wardowl.events import AuditError, Observer, RetrievalEvent, query_fingerprint
 from wardowl.filters import And, Filter, In, Or, matches
 from wardowl.redaction import RedactFunction, Redactor
 from wardowl.types import Hit, InvalidQuery, Query, Subject
@@ -78,6 +81,7 @@ Strategy = Literal["auto", "prefilter", "postfilter"]
 ShortResults = Literal["report", "count", "exact", "widen"]
 Shortfall = Literal["exhausted", "missed", "unknown"]
 Fallback = Literal["exact", "widened", "over_limit", "unsupported"]
+RecallSample = Literal["measured", "over_limit", "unsupported", "failed"]
 
 
 @runtime_checkable
@@ -202,8 +206,21 @@ class RetrievalResult:
     sampled_recall: float | None = None
     """For a pre-filtered retrieval that `recall_sample_rate` sampled, the share of an exact
     search's top k, under the same filter and before redaction and reranking, that came back.
-    None when the retrieval was not sampled, or the exact search found nothing. It measures what
-    `complete` cannot see: k hits from an approximate index that are not the true top k."""
+    None when the retrieval was not sampled, or the exact search found nothing or did not run
+    (see `recall_sample`). It measures what `complete` cannot see: k hits from an approximate index
+    that are not the true top k."""
+    recall_sample: RecallSample | None = None
+    """What happened to a recall sample; None when the retrieval was not sampled. A sample never
+    changes the hits, and never fails the retrieval.
+
+    * `"measured"`: the exact search ran, and `sampled_recall` holds the share, or None when the
+      exact search found nothing.
+    * `"over_limit"`: the backend counted more than `max_exact_rows` chunks matching the filter, so
+      the exact search did not run.
+    * `"unsupported"`: `max_exact_rows` is set and the backend cannot count, so the exact search,
+      which nothing would bound, did not run.
+    * `"failed"`: the count or the exact search raised. The exception is logged on the `wardowl`
+      logger, and the retrieval returns its hits as if it had not been sampled."""
 
 
 # Operations the algorithm asks its driver to perform.
@@ -232,6 +249,8 @@ class _Search:
 class _Count:
     filter: Filter
     limit: int
+    repair: bool = True
+    """Counted for a short result, so its time counts as shortfall time; False for a recall sample."""
 
 
 @dataclass(frozen=True)
@@ -252,6 +271,7 @@ class _Redact:
 
 _Op = _FilterFor | _ScopeFor | _Search | _Count | _Check | _Rerank | _Redact
 _log = logging.getLogger("wardowl")
+_UNRECORDED = "the retrieval could not be recorded, so nothing was returned"
 _Plan = Generator[_Op, Any, RetrievalResult]
 RerankFunction = Callable[[Any, list[Hit]], Sequence[Hit]]
 
@@ -278,7 +298,8 @@ class _Timings:
                     self.shortfall += elapsed
             elif isinstance(op, _Count):
                 self.search += elapsed
-                self.shortfall += elapsed
+                if op.repair:
+                    self.shortfall += elapsed
             elif isinstance(op, _Rerank):
                 self.rerank += elapsed
                 self.reranked += len(op.hits)
@@ -302,8 +323,14 @@ class PermissionedRetriever:
     filter cannot leak; with `recheck=False` they are matched against the filter locally instead,
     which needs the backend to return each chunk's metadata as stored (the conformance kit checks
     that). `observers` receive a `RetrievalEvent` for every call, and `audit_key` (at least 16
-    random bytes) adds an HMAC of the query to those events. `aretrieve` calls the observers in a
-    worker thread, so they may be called from several threads at once.
+    random bytes) adds an HMAC of the query to those events. An observer that raises is logged and
+    counted in `observer_failures`, and retrieval goes on: delivery to `observers` is best-effort.
+    `required_observers`, such as the audit log a compliance control depends on, receive each
+    event first, and must record it: when one raises after a retrieval that found its hits, the
+    retrieval raises `AuditError` and returns nothing, and `observers` then receive an event with
+    that error. A retrieval that failed raises its own error, whatever the observers do.
+    `aretrieve` calls all of them in a worker thread, so they may be called from several threads
+    at once.
 
     `reranker` reorders the result after the permission check: the retriever finds the top
     `rerank_depth` hits the subject may read (or k, if larger, and at most `max_candidates`), the
@@ -332,7 +359,11 @@ class PermissionedRetriever:
     `recall_sample_rate` (0 by default) is the share of pre-filtered retrievals for which a backend
     that can search exactly, but does not always, runs an exact search as well. The exact hits are
     never returned; `RetrievalResult.sampled_recall` reports how much of their top k came back,
-    which measures what `complete` cannot see. Each sampled retrieval costs one more search.
+    which measures what `complete` cannot see. Each sampled retrieval costs one more search, and,
+    with `max_exact_rows` set, a count first: above the bound, or on a backend that cannot count,
+    the exact search does not run. A sample is monitoring: if its count or search fails, the
+    failure is logged and recorded in `RetrievalResult.recall_sample`, and the retrieval returns
+    its hits.
     """
 
     def __init__(
@@ -354,6 +385,7 @@ class PermissionedRetriever:
         max_exact_rows: int | None = 10_000,
         wider: SearchBackend | None = None,
         recall_sample_rate: float = 0.0,
+        required_observers: Sequence[Observer] = (),
     ) -> None:
         if strategy not in ("auto", "prefilter", "postfilter"):
             raise ValueError(f"unknown strategy {strategy!r}")
@@ -390,6 +422,12 @@ class PermissionedRetriever:
         if audit_key is not None and len(audit_key) < 16:
             # As for RedisCache's signing_key: a short key makes the fingerprints of short queries guessable.
             raise ValueError("audit_key should be at least 16 random bytes")
+        observers, required_observers = tuple(observers), tuple(required_observers)
+        if any(o is r for o in observers for r in required_observers):
+            raise ValueError("an observer is given either in observers or in required_observers, not both")
+        if not all(callable(o) for o in required_observers):
+            # Each would fail every retrieval; say so now, not on the first call.
+            raise TypeError("a required observer is a callable that takes a RetrievalEvent")
         self.redactor = redactor
         self.reranker = reranker
         self.rerank_depth = rerank_depth
@@ -401,22 +439,37 @@ class PermissionedRetriever:
         self.max_candidates = max_candidates
         self.recheck = recheck
         self.observers = tuple(observers)
+        self.required_observers = tuple(required_observers)
         self.audit_key = audit_key
         self.short_results: ShortResults = short_results
         self.max_exact_rows = max_exact_rows
         self.wider = wider
         self.recall_sample_rate = recall_sample_rate
+        self._failures = 0
+        self._failures_lock = threading.Lock()
 
     # ---- public API ------------------------------------------------------------------------
+
+    @property
+    def observer_failures(self) -> int:
+        """How many times an observer, required or not, has raised since this retriever was made.
+
+        Each raise is also logged on the `wardowl` logger. A rising count means events are being
+        lost, for example an audit log that can no longer be written; alert on it, or on the
+        `wardowl.observer_failures` metric of `OpenTelemetryMetrics`.
+        """
+        with self._failures_lock:
+            return self._failures
 
     def retrieve(self, query: str | Query, subject: Subject, k: int = 5) -> RetrievalResult:
         """Return at most `k` hits the subject may read, best first.
 
         `query` is text, or a `Query` carrying a vector you computed. Raises `AuthorizationError`
         when the authorizer fails or gives a malformed answer, `SearchError` when the backend's
-        search or count fails, and `ValueError` or `TypeError` for invalid arguments:
-        `InvalidQuery`, a `ValueError`, when the query or `k` is at fault rather than the
-        configuration. Nothing is returned in any of these cases.
+        search or count fails, `AuditError` when one of `required_observers` cannot record the
+        call, and `ValueError` or `TypeError` for invalid arguments: `InvalidQuery`, a
+        `ValueError`, when the query or `k` is at fault rather than the configuration. Nothing is
+        returned in any of these cases.
         """
         started, clock, timings = time.time(), time.perf_counter(), _Timings()
         try:
@@ -424,15 +477,21 @@ class PermissionedRetriever:
             try:
                 op = next(plan)
                 while True:
-                    with timings.measure(op):
-                        value = self._run(op, subject)
-                    op = plan.send(value)
+                    try:
+                        with timings.measure(op):
+                            value = self._run(op, subject)
+                    except Exception as exc:
+                        # The plan decides: only a recall sample catches its own failure, so any
+                        # other is raised again from the plan, as it would have been from here.
+                        op = plan.throw(exc)
+                    else:
+                        op = plan.send(value)
             except StopIteration as done:
                 result: RetrievalResult = done.value
         except BaseException as exc:  # a cancelled or interrupted call is reported too, then re-raised
             self._emit(query, subject, k, started, clock, timings, None, exc)
             raise
-        self._emit(query, subject, k, started, clock, timings, result, None)
+        self._emit(query, subject, k, started, clock, timings, result, None)  # AuditError, if required
         return result
 
     async def aretrieve(self, query: str | Query, subject: Subject, k: int = 5) -> RetrievalResult:
@@ -448,19 +507,24 @@ class PermissionedRetriever:
             try:
                 op = next(plan)
                 while True:
-                    with timings.measure(op):
-                        value = await self._arun(op, subject)
-                    op = plan.send(value)
+                    try:
+                        with timings.measure(op):
+                            value = await self._arun(op, subject)
+                    except Exception as exc:  # as in retrieve: the plan decides
+                        op = plan.throw(exc)
+                    else:
+                        op = plan.send(value)
             except StopIteration as done:
                 result: RetrievalResult = done.value
         except BaseException as exc:  # a cancelled or interrupted call is reported too, then re-raised
             event = self._built(query, subject, k, started, clock, timings, None, exc)
             if isinstance(exc, (Exception, asyncio.CancelledError)):
-                await self._anotify(event)
+                await self._adeliver(event, succeeded=False)
             else:  # GeneratorExit, KeyboardInterrupt, SystemExit: nothing more may be awaited
-                self._notify(event)
+                self._deliver(event, succeeded=False)
             raise
-        await self._anotify(self._built(query, subject, k, started, clock, timings, result, None))
+        event = self._built(query, subject, k, started, clock, timings, result, None)  # AuditError, if required
+        self._unrecorded(await self._adeliver(event, succeeded=True))  # and here
         return result
 
     def _emit(
@@ -474,7 +538,10 @@ class PermissionedRetriever:
         result: RetrievalResult | None,
         error: BaseException | None,
     ) -> None:
-        self._notify(self._built(query, subject, k, started, clock, timings, result, error))
+        """Give the event to the observers in this thread. Raises `AuditError` only after a retrieval
+        that found its hits (`error` is None), when a required observer could not record it."""
+        event = self._built(query, subject, k, started, clock, timings, result, error)
+        self._unrecorded(self._deliver(event, succeeded=error is None))
 
     def _built(
         self,
@@ -487,39 +554,86 @@ class PermissionedRetriever:
         result: RetrievalResult | None,
         error: BaseException | None,
     ) -> RetrievalEvent | None:
-        """The event for the observers, or None when there are none or it cannot be built."""
-        if not self.observers:
+        """The event for the observers, or None when there are none or it cannot be built. After a
+        retrieval that found its hits, an event that cannot be built for required observers raises
+        `AuditError` instead."""
+        if not self.observers and not self.required_observers:
             return None
         try:
             return self._event(query, subject, k, started, clock, timings, result, error)
-        except Exception:  # reporting must never replace what retrieval returns or raises
+        except Exception as exc:  # reporting must never replace what retrieval returns or raises
             _log.exception("wardowl could not build the retrieval event")
+            if self.required_observers and error is None:
+                # ... but nothing returns when the record a required observer must keep cannot be made.
+                raise AuditError(_UNRECORDED) from exc
             return None
 
-    def _notify(self, event: RetrievalEvent | None) -> None:
-        if event is None:
-            return
-        for observer in self.observers:
-            try:
-                observer(event)
-            except Exception:  # an observer must never change what retrieval returns or raises
-                _log.exception("wardowl observer %r failed", observer)
+    @staticmethod
+    def _unrecorded(failure: Exception | None) -> None:
+        """Raise `AuditError` for what a required observer raised, if it raised."""
+        if failure is not None:
+            raise AuditError(_UNRECORDED) from failure
 
-    async def _anotify(self, event: RetrievalEvent | None) -> None:
-        """`_notify` in a worker thread, awaited. An audit sink writes to a file, a socket or a
+    def _deliver(self, event: RetrievalEvent | None, *, succeeded: bool) -> Exception | None:
+        """Give `event` to the required observers, then to the others, and tell those that define
+        `observer_failed` about each that raised. Returns what the first required observer raised
+        when the retrieval `succeeded`, for the caller to raise as `AuditError`, and None otherwise:
+        a retrieval that failed raises its own error, so this never raises."""
+        if event is None:
+            return None
+        failures: list[tuple[Observer, RetrievalEvent, Exception]] = []
+        for observer in self.required_observers:
+            failure = self._tell(observer, event)
+            if failure is not None:
+                failures.append((observer, event, failure))
+        unrecorded = failures[0][2] if failures and succeeded else None
+        if unrecorded is not None:
+            # The other observers hear what the caller gets: an AuditError and no chunks.
+            event = dataclasses.replace(
+                event, returned_ids=(), complete=False, error=AuditError.__name__, cause=type(unrecorded).__name__
+            )
+        for observer in self.observers:
+            failure = self._tell(observer, event)
+            if failure is not None:
+                failures.append((observer, event, failure))
+        for failed, seen, failure in failures:
+            for listener in (*self.required_observers, *self.observers):
+                hook = getattr(listener, "observer_failed", None)
+                if hook is None:
+                    continue
+                try:
+                    hook(failed, seen, failure)
+                except Exception:
+                    _log.exception("wardowl observer %r failed to record a failed observer", listener)
+        return unrecorded
+
+    def _tell(self, observer: Observer, event: RetrievalEvent) -> Exception | None:
+        """Give `event` to `observer`; what it raised, logged and counted, or None."""
+        try:
+            observer(event)
+        except Exception as exc:  # never raised from here: the caller decides what a failure changes
+            _log.exception("wardowl observer %r failed", observer)
+            with self._failures_lock:  # observers run in several worker threads at once under aretrieve
+                self._failures += 1
+            return exc
+        return None
+
+    async def _adeliver(self, event: RetrievalEvent | None, *, succeeded: bool) -> Exception | None:
+        """`_deliver` in a worker thread, awaited. An audit sink writes to a file, a socket or a
         collector, and can block: on the event loop it would hold up every other request."""
         if event is None:
-            return
+            return None
         try:
             delivered = asyncio.get_running_loop().run_in_executor(
-                None, functools.partial(contextvars.copy_context().run, self._notify, event)
+                None, functools.partial(contextvars.copy_context().run, self._deliver, event, succeeded=succeeded)
             )
         except RuntimeError:  # the executor is shut down, as when the loop closes: deliver here
-            self._notify(event)
-            return
+            return self._deliver(event, succeeded=succeeded)
         # Shielded: a call cancelled while its event is on the way stops waiting, but the event is
-        # still delivered, so every call is reported.
-        await asyncio.shield(delivered)
+        # still delivered, so every call is reported. Such a call raises CancelledError, whatever a
+        # required observer then does.
+        unrecorded: Exception | None = await asyncio.shield(delivered)
+        return unrecorded
 
     def _event(
         self,
@@ -559,6 +673,7 @@ class PermissionedRetriever:
             fallback=result.fallback if result else None,
             shortfall_ms=round(timings.shortfall * 1000, 3),
             sampled_recall=result.sampled_recall if result else None,
+            recall_sample=result.recall_sample if result else None,
         )
 
     # ---- the algorithm (shared by both drivers) --------------------------------------------
@@ -656,7 +771,7 @@ class PermissionedRetriever:
             kept = [h for h, ok in zip(hits, decisions[: len(hits)], strict=True) if ok]
             violations = decisions.count(False)
             examined = len(candidates) if self.recheck else 0
-        recall = yield from self._sampled_recall(query, k, f, kept, fallback)
+        recall, sample = yield from self._sampled_recall(query, k, f, kept, fallback)
         return RetrievalResult(
             kept,
             "prefilter",
@@ -667,6 +782,7 @@ class PermissionedRetriever:
             shortfall=shortfall,
             fallback=fallback,
             sampled_recall=recall,
+            recall_sample=sample,
         )
 
     def _count_limit(self, k: int) -> int:
@@ -710,20 +826,36 @@ class PermissionedRetriever:
 
     def _sampled_recall(
         self, query: str | Query, k: int, f: Filter, kept: list[Hit], fallback: Fallback | None
-    ) -> Generator[_Op, Any, float | None]:
-        """For a sampled share of retrievals, the share of an exact search's top k found in `kept`."""
+    ) -> Generator[_Op, Any, tuple[float | None, RecallSample | None]]:
+        """For a sampled share of retrievals, the share of an exact search's top k found in `kept`,
+        and what happened to the sample (see `RetrievalResult.recall_sample`)."""
         if fallback == "exact" or not self._samples():
-            return None  # nothing to sample, or the hits already come from an exact search
+            return None, None  # nothing to sample, or the hits already come from an exact search
         # A sample for a metric: nothing secret depends on the choice.
         if random.random() >= self.recall_sample_rate:  # noqa: S311
-            return None
-        exact: list[Hit] = yield _Search(query, k, f, "exact")
-        # The exact search's hits are never returned, and only those the filter matches are counted.
-        best = [h.id for h in list(exact)[:k] if matches(f, h.metadata)]
+            return None, None
+        # A sample is monitoring: whatever its count or search raises is recorded, and the hits found
+        # so far are returned as if it had not run. The driver throws a failed operation in here.
+        try:
+            if self.max_exact_rows is not None:
+                # The bound that keeps short_results="exact" from scanning a large readable set.
+                if getattr(self.backend, "count", None) is None:
+                    return None, "unsupported"
+                matching: int | None = yield _Count(f, self.max_exact_rows + 1, repair=False)
+                if matching is None:
+                    return None, "unsupported"
+                if matching > self.max_exact_rows:
+                    return None, "over_limit"
+            exact: list[Hit] = yield _Search(query, k, f, "exact")
+            # The exact search's hits are never returned, and only those the filter matches are counted.
+            best = [h.id for h in list(exact)[:k] if matches(f, h.metadata)]
+        except Exception:
+            _log.warning("wardowl's recall sample failed; the retrieval returns its hits", exc_info=True)
+            return None, "failed"
         if not best:
-            return None  # there was nothing to find
+            return None, "measured"  # there was nothing to find
         found = {h.id for h in kept}
-        return sum(i in found for i in best) / len(best)
+        return sum(i in found for i in best) / len(best), "measured"
 
     def _postfilter(self, query: str | Query, k: int, scope: Filter | None = None) -> _Plan:
         fetch = min(k * self.overfetch, self.max_candidates)

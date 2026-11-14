@@ -55,7 +55,16 @@ All notable changes are recorded here. The format follows
   retrievals on a backend that can search exactly, the exact search runs too, and
   `RetrievalResult.sampled_recall` reports how much of its top k came back, which `complete` cannot
   see. The exact hits are never returned. `OpenTelemetryMetrics` records it in the
-  `wardowl.sampled_recall` histogram.
+  `wardowl.sampled_recall` histogram. The exact search is bounded by `max_exact_rows`, as
+  `short_results="exact"` is: the backend counts the chunks the filter matches first, and above the
+  bound, or on a backend that cannot count, the exact search does not run. A sample never fails
+  the retrieval: if its count or exact search raises (a store timeout on a broad readable set, for
+  one), the error is logged on the `wardowl` logger and the retrieval returns its hits.
+  `RetrievalResult.recall_sample` and `RetrievalEvent.recall_sample` say what happened to the
+  sample: `"measured"`, `"over_limit"`, `"unsupported"` or `"failed"`. `OpenTelemetryObserver`
+  records it as `wardowl.recall_sample`, and `OpenTelemetryMetrics` counts samples by it in
+  `wardowl.recall_samples`. The readiness review found that a failed or timed-out sample raised
+  `SearchError` and discarded the permitted hits the retrieval had already found (M16).
 - Backends can offer `count(filter, limit)` (and `acount`), and declare `supports_exact = True`
   when `search` and `asearch` accept `exact=True`. Both are optional and read with `getattr`; the
   retriever passes `exact` only to a backend that declares it, so existing backends work unchanged.
@@ -98,6 +107,22 @@ All notable changes are recorded here. The format follows
   now runs in a transaction of its own for it. None, the default, sets nothing.
 - `SpiceDBAuthorizer(trust_empty_lookup=True)` takes a LookupResources answer with no document as
   "nothing is readable", as before; see Changed.
+- `PermissionedRetriever(required_observers=[...])`, for an audit log that a control depends on.
+  A required observer receives each event before `observers`, and when it raises after a retrieval
+  that found its hits, the retrieval raises `wardowl.AuditError` and returns nothing; the other
+  observers then receive an event with `error="AuditError"` and no chunk ids. `AuditError` is a
+  `RuntimeError` with a fixed message and the observer's exception as its `__cause__`. A retrieval
+  that failed for another reason still raises its own error. Without `required_observers` nothing
+  changes: delivery to `observers` stays best-effort.
+- `PermissionedRetriever.observer_failures` counts the times an observer has raised, and each raise
+  is still logged on the `wardowl` logger. An observer that defines
+  `observer_failed(observer, event, error)` hears of every observer that raised; with it,
+  `OpenTelemetryMetrics` counts them in `wardowl.observer_failures`, by observer and `error.type`.
+  The readiness review found that a `JsonLinesAudit` on a full disk left only a log line per
+  retrieval, with no metric to alert on and no way to stop returning chunks that were not
+  recorded (M17).
+- `RedisBackend(check_timeout_policy=False)` accepts RESP2 answers without reading the server's
+  timeout policy, as before; see Changed.
 - `create_app(retrieval_timeout=...)` and `add_search_tool(retrieval_timeout=...)`, in seconds,
   bound each retrieval of the HTTP service and the MCP tool. A retrieval that takes longer is
   cancelled, answers 503 or ends with a tool error, and returns nothing; the `wardowl` logger
@@ -124,7 +149,21 @@ All notable changes are recorded here. The format follows
   the way stops waiting, while the event is still delivered. Observers must be thread-safe, as they
   already had to be for `retrieve` called from several threads; `JsonLinesAudit` and the
   OpenTelemetry observers are. A retrieval closed without finishing (`GeneratorExit`) still calls
-  them in place, since it can await nothing more.
+  them in place, since it can await nothing more. Required observers (see Added) run there too,
+  first, and `observer_failures` is counted under a lock.
+- `RedisBackend` no longer takes a RESP2 answer on trust. Under the Query Engine's default
+  `search-on-timeout` policy, `return`, a search that runs out of time answers with the results
+  found so far; a RESP3 answer then carries a warning, on which the backend already raised, but a
+  RESP2 answer carries nothing, and the retriever reported such a result as complete whenever it
+  held k hits (M14 in the readiness review). The first time a search is answered in RESP2, the
+  backend now reads the policy (`CONFIG GET search-on-timeout`, or `FT.CONFIG GET ON_TIMEOUT` on
+  Redis Stack) and raises `RuntimeError`, which the retriever reports as `SearchError`, unless it
+  is `fail`; it asks again on each RESP2 answer until it reads `fail`. Clients that speak RESP3,
+  as redis-py 8.1 does by default, and servers set to `fail`, as the Redis page has advised for
+  production, see no change. Otherwise set `search-on-timeout fail`, connect with `protocol=3`, or
+  pass `check_timeout_policy=False`. An FT.SEARCH answer that is neither a RESP2 list nor a RESP3
+  map, as from a client that parses it into its own object, raises a `TypeError` that names its
+  type.
 
 - The MCP server's search tool now sets all four MCP tool hints explicitly: besides read-only and
   closed world, not destructive and idempotent, so a host does not have to assume a default for any
@@ -247,6 +286,11 @@ All notable changes are recorded here. The format follows
 
 ### Documentation
 
+- Compliance, operations, production and the security model say that delivery to `observers` is
+  best-effort, how to make an audit log required with `required_observers`, and what to alert on
+  when events are lost or recall samples fail. The compliance page offered the event stream as the
+  audit control without saying that a sink that cannot write loses events (M17). The Redis page
+  describes the RESP2 check and `check_timeout_policy`.
 - The writes for one source document must happen one after another. Operations has a section on
   it, with what `revision` does on pgvector and MongoDB and that the other backends have no such
   check; the Google Drive page shows how a late re-index undoes a revocation that the changes feed

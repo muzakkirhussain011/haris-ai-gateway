@@ -8,10 +8,20 @@ an `audit_key`, the event carries an HMAC-SHA256 of the query, which lets you ma
 without storing them; without a key there is no fingerprint at all, because a plain hash of a short
 query can be reversed by guessing.
 
-An observer that raises is logged on the `wardowl` logger and does not affect retrieval.
-`retrieve` calls observers in the caller's thread; `aretrieve` calls them in a worker thread, off
-the event loop, and waits for them before it returns or raises. Observers may therefore be called
-from several threads at once.
+An observer that raises is logged on the `wardowl` logger, counted in the retriever's
+`observer_failures`, and does not affect retrieval: delivery to `observers` is best-effort. An
+observer given in `PermissionedRetriever(required_observers=[...])` must record every call
+instead: when one raises after a retrieval that found its hits, the retrieval raises `AuditError`
+and returns nothing.
+
+An observer may also define `observer_failed(observer, event, error)`. After every observer has
+had an event, the retriever calls it once for each observer that raised on that event, with that
+observer, the event it was given and the exception. `wardowl.otel.OpenTelemetryMetrics` counts
+them in `wardowl.observer_failures`.
+
+`retrieve` calls observers, required or not, and `observer_failed`, in the caller's thread;
+`aretrieve` calls them in a worker thread, off the event loop, and waits for them before it
+returns or raises. Observers may therefore be called from several threads at once.
 """
 
 from __future__ import annotations
@@ -27,7 +37,16 @@ from typing import IO, Any
 
 from wardowl.types import Query
 
-__all__ = ["JsonLinesAudit", "Observer", "RetrievalEvent", "query_fingerprint"]
+__all__ = ["AuditError", "JsonLinesAudit", "Observer", "RetrievalEvent", "query_fingerprint"]
+
+
+class AuditError(RuntimeError):
+    """A required observer could not record a retrieval, so nothing is returned.
+
+    Raised by `retrieve` and `aretrieve` when an observer given in `required_observers` raises
+    after the retrieval found its hits. Its message is fixed; the observer's exception, which can
+    name a file or a host, stays its `__cause__` for the logs.
+    """
 
 
 @dataclass(frozen=True)
@@ -78,6 +97,9 @@ class RetrievalEvent:
     sampled_recall: float | None = None
     """For a retrieval that `recall_sample_rate` sampled, the share of an exact search's top k that
     came back, as `RetrievalResult.sampled_recall`."""
+    recall_sample: str | None = None
+    """What happened to a recall sample, as `RetrievalResult.recall_sample`: "measured",
+    "over_limit", "unsupported" or "failed". None when the retrieval was not sampled."""
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -107,7 +129,9 @@ def query_fingerprint(query: str | Query, key: bytes) -> str:
 class JsonLinesAudit:
     """Writes one JSON object per retrieval to a text stream (a file, stdout, a socket wrapper).
 
-    It records who asked, what came back and what was denied, never the query or chunk text.
+    It records who asked, what came back and what was denied, never the query or chunk text. A
+    write or flush that fails (a full disk, a closed stream) raises: among `observers` that is
+    logged and counted, and among `required_observers` it fails the retrieval with `AuditError`.
     """
 
     def __init__(self, stream: IO[str]) -> None:

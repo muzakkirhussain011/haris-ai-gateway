@@ -18,7 +18,10 @@ wardowl is the mechanism and where the evidence comes from.
   ([Revocation and consistency](revocation.md)).
 - **An audit trail without content.** A `RetrievalEvent` per call, with ids, counts and outcome,
   never query or chunk text (S10), written by `JsonLinesAudit` or exported with OpenTelemetry
-  ([Operations](operations.md)).
+  ([Operations](operations.md)). Delivery to `observers` is best-effort: a sink that cannot write
+  is logged and counted (`wardowl.observer_failures`), and retrieval goes on. Where an audit control
+  must not have gaps, give its observer in `required_observers`: a retrieval it cannot record then
+  returns nothing ([When an observer fails](operations.md#when-an-observer-fails)).
 
 ## Framework mapping
 
@@ -31,7 +34,7 @@ wardowl is the mechanism and where the evidence comes from.
 | SOC 2 (Trust Services Criteria) | CC7.2 Monitoring | Events, `violations` and `CacheStats` to alert on | Monitoring and incident response ([runbook](runbook.md)) |
 | GDPR | Art. 25 Data protection by design, Art. 32 Security of processing | Personal data in documents reaches only those permitted, and audit events hold no content | Lawful basis, records of processing, data subject requests |
 | HIPAA Security Rule | 45 CFR 164.312(a)(1) Access control, 164.308(a)(4) Information access management | Limits retrieval of ePHI to permitted users | Risk analysis, workforce policies, encryption and transport security |
-| HIPAA Security Rule | 45 CFR 164.312(b) Audit controls | Records each retrieval: who, which chunks, outcome | Retaining and examining the records |
+| HIPAA Security Rule | 45 CFR 164.312(b) Audit controls | Records each retrieval: who, which chunks, outcome; with `required_observers`, returns nothing it could not record | Retaining and examining the records |
 | OWASP Top 10 for LLM Applications 2025 | LLM08 Vector and Embedding Weaknesses | Permission-aware retrieval and tenant partitioning, enforced outside the model, which is the mitigation OWASP recommends | Securing the vector store itself |
 
 The HIPAA rows refer to the Security Rule in force. Proposed amendments have not been finalized.
