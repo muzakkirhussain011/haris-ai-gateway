@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import logging
 import ssl
 import threading
 import time
@@ -567,6 +568,105 @@ def test_a_valid_token_gives_its_subject():
 def test_a_token_failing_any_check_is_invalid(claims):
     with pytest.raises(InvalidToken):
         oidc(tenant_claim="tid")(token(**claims))
+
+
+@pytest.mark.parametrize("claim", ["iat", "nbf"])
+def test_a_token_from_a_clock_ahead_is_refused_without_leeway_and_accepted_within_it(claim):
+    # An identity provider whose clock runs ahead of the service's issues tokens from its future.
+    soon = int(time.time()) + 10
+    with pytest.raises(InvalidToken):
+        oidc()(token(**{claim: soon}))
+    with pytest.raises(InvalidToken):
+        oidc(leeway=2)(token(**{claim: soon}))
+    assert oidc(leeway=60)(token(**{claim: soon})) == Subject("ann", ["eng"])
+    # Times already passed need no leeway.
+    assert oidc()(token(**{claim: int(time.time()) - 5})) == Subject("ann", ["eng"])
+
+
+def test_the_leeway_applies_to_the_expiry_too():
+    expired = token(exp=int(time.time()) - 30)
+    with pytest.raises(InvalidToken):
+        oidc()(expired)
+    with pytest.raises(InvalidToken):
+        oidc(leeway=10)(expired)
+    assert oidc(leeway=60)(expired) == Subject("ann", ["eng"])
+
+
+def wardowl_records(caplog):
+    return [(r.levelno, r.getMessage()) for r in caplog.records if r.name == "wardowl"]
+
+
+@pytest.mark.parametrize(
+    ("bad", "reason"),
+    [
+        (lambda: token(iat=int(time.time()) + 30), "ImmatureSignatureError"),
+        (lambda: token(nbf=int(time.time()) + 30), "ImmatureSignatureError"),
+        (lambda: token(exp=int(time.time()) - 30), "ExpiredSignatureError"),
+        (lambda: token(aud="another-api"), "InvalidAudienceError"),
+        (lambda: token(iss="https://evil.example.com/"), "InvalidIssuerError"),
+        (lambda: token(tid=None), "MissingRequiredClaimError (tid)"),
+        (lambda: token(key=NEW_KEY), "InvalidSignatureError"),
+        (lambda: "not-a-jwt", "DecodeError"),
+        (lambda: token(kid="made-up"), "no key published by the identity provider matches the token's kid"),
+        (lambda: token(groups="eng"), "the token's groups claim is not a list of strings"),
+    ],
+)
+def test_a_refused_token_logs_the_check_it_failed_and_nothing_from_the_token(caplog, bad, reason):
+    refused = bad()
+    with caplog.at_level(logging.INFO, logger="wardowl"), pytest.raises(InvalidToken):
+        oidc(tenant_claim="tid")(refused)
+    assert wardowl_records(caplog) == [(logging.INFO, f"wardowl refused a token: {reason}")]
+    for fragment in (refused, refused.split(".")[-1], "another-api", "evil.example.com"):
+        assert fragment not in caplog.text
+
+
+def test_the_service_tells_the_caller_nothing_about_why_a_token_was_refused(caplog):
+    c = client(authenticate=oidc(require_groups=True))
+    with caplog.at_level(logging.INFO, logger="wardowl"):
+        early = ask(c, {"query": "launch"}, who=token(iat=int(time.time()) + 30))
+        late = ask(c, {"query": "launch"}, who=token(exp=int(time.time()) - 30))
+        groupless = ask(c, {"query": "launch"}, who=token(groups=None))
+    for answer in (early, late, groupless):
+        assert answer.status_code == 401 and answer.json() == {"detail": "a valid bearer token is required"}
+        assert answer.headers["www-authenticate"] == "Bearer"
+    assert [message for _, message in wardowl_records(caplog)] == [
+        "wardowl refused a token: ImmatureSignatureError",
+        "wardowl refused a token: ExpiredSignatureError",
+        "wardowl refused a token: MissingRequiredClaimError (groups)",
+    ]
+
+
+def test_require_groups_refuses_a_token_without_the_claim(caplog):
+    authenticate = oidc(require_groups=True)
+    assert authenticate(token()) == Subject("ann", ["eng"])
+    assert authenticate(token(groups=[])) == Subject("ann")  # an empty list is a claim: no groups
+    with caplog.at_level(logging.DEBUG, logger="wardowl"), pytest.raises(InvalidToken):
+        authenticate(token(groups=None))
+    assert wardowl_records(caplog) == [(logging.INFO, "wardowl refused a token: MissingRequiredClaimError (groups)")]
+    # A renamed claim is the one required.
+    renamed = oidc(require_groups=True, groups_claim="roles")
+    assert renamed(token(groups=None, roles=["eng"])) == Subject("ann", ["eng"])
+    with pytest.raises(InvalidToken):
+        renamed(token())  # it has groups, not roles
+    # `subject`, which a subclass may call with claims of its own, holds to it too.
+    with pytest.raises(InvalidToken):
+        authenticate.subject({"sub": "ann"})
+    assert authenticate.subject({"sub": "ann", "groups": []}) == Subject("ann")
+
+
+def test_without_require_groups_a_token_without_the_claim_has_no_groups_and_says_so_at_debug(caplog):
+    with caplog.at_level(logging.DEBUG, logger="wardowl"):
+        assert oidc()(token(groups=None)) == Subject("ann")
+    assert wardowl_records(caplog) == [
+        (logging.DEBUG, "wardowl found no groups claim in a token; its subject has no groups")
+    ]
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="wardowl"):
+        assert oidc()(token(groups=[])) == Subject("ann")  # present, and empty: nothing to report
+        assert oidc()(token()) == Subject("ann", ["eng"])
+    assert wardowl_records(caplog) == []
+    with pytest.raises(InvalidToken):  # null is not a list of groups, as before
+        oidc().subject({"sub": "ann", "groups": None})
 
 
 def test_a_token_signed_with_a_shared_secret_or_garbage_is_invalid():

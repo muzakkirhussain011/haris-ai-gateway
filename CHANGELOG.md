@@ -6,6 +6,36 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `OIDCAuthenticator(require_groups=True)` refuses a token without the groups claim
+  (`groups_claim`) as invalid, which the HTTP service answers with 401. The claim was read as "no
+  groups" when it was absent, so a token that lost its groups (a group mapper removed, or a
+  provider that leaves a long group list out of the token, as Microsoft Entra ID does for a user in
+  more than 200 groups) quietly stripped the user's group access: 200 with fewer hits, and no log
+  line (M21). An empty list is a claim, and passes. The default, `False`, keeps that reading, and
+  now logs each token without the claim at DEBUG on the `wardowl` logger, naming the claim and
+  nothing else. `subject()` applies the same rule to claims passed to it directly.
+- `OIDCAuthenticator` logs every token it refuses at INFO on the `wardowl` logger, with the check
+  that failed: PyJWT's exception class (such as `ImmatureSignatureError`, `ExpiredSignatureError`
+  or `InvalidAudienceError`, and the claim's name for `MissingRequiredClaimError`) or wardowl's own
+  reason (such as a `kid` that no published key matches). The token, its signature and its claims'
+  values are not logged, and the 401 the HTTP service answers is unchanged, so the caller is still
+  not told why. Every PyJWT error became `InvalidToken` and a 401 with no reason recorded anywhere
+  (M20). `create_app` still logs nothing for a 401 from an authenticator of your own.
+
+### Documentation
+
+- The HTTP service page and the `OIDCAuthenticator` docstring say that `exp`, and `nbf` and `iat`
+  when the token has them, are checked against the service's clock, and that `leeway` applies to
+  all three. With the default leeway of 0, an identity provider whose clock runs ahead of the
+  service's issues tokens that are refused until the service's clock catches up, which shows as
+  401s that come and go (M20). The page recommends a few seconds of leeway where the clocks are not
+  tightly synchronized, at the cost of accepting expired tokens for as long. The default stays 0,
+  since a minor release never weakens a default that keeps a protection on. New sections cover
+  tokens without groups and where to find why a token was refused; the MCP page's stdio example and
+  the production failure table say the same.
+
 ## [3.0.0] - 2026-11-14
 
 A major release, because several fixes change documented behaviour that 2.1 code may rely on: a
