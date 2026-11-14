@@ -199,7 +199,7 @@ retriever = PermissionedRetriever(backend, authorizer, short_results="exact", ma
 
 | `short_results=` | After a short pre-filtered result from an approximate index |
 |---|---|
-| `"report"` (default) | Nothing more runs: `complete=False`, `shortfall="unknown"`, as before |
+| `"report"` (default) | Nothing more runs: `complete=False`, `shortfall="unknown"` |
 | `"count"` | The backend counts the chunks the filter matches. No more than came back: `shortfall="exhausted"` and `complete=True`. More: `shortfall="missed"` and `complete=False` |
 | `"exact"` | Counts; after a miss, searches again exactly under the same filter, if the count is at most `max_exact_rows` (10,000 by default; `None` for no bound). `fallback="exact"`, and the result is complete |
 | `"widen"` | Counts; after a miss, searches again with `wider`, the same store with larger search settings, and keeps the best hits of both searches. `fallback="widened"`; complete only if it found as many as were counted |

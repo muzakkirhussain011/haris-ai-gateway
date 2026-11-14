@@ -107,7 +107,9 @@ wardowl follows [semantic versioning](https://semver.org). The public API is wha
   deprecation period, and the changelog lists it under Security.
 - **Security fixes** reach the latest minor release and, for six months after its successor came
   out, the one before it, as [SECURITY.md](https://github.com/muzakkirhussain011/wardowl/blob/main/SECURITY.md)
-  describes. Each advisory names the fixed versions of both.
+  describes. An end date that SECURITY.md has published is kept when a newer release comes out:
+  2.0.x keeps getting security fixes until 2027-04-24, the date published when 2.1.0 came out. Each
+  advisory names the fixed version of every line that gets the fix.
 - **Python versions** are supported until their upstream end of life; the first minor release after
   that date drops them.
 - **Stores, permission services and frameworks** are supported at the versions in the tables above,

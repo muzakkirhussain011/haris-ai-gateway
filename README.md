@@ -619,7 +619,11 @@ Google Drive. 1.5 added an HTTP service for any language, redaction, the Ory Ket
 authorizers and the FAISS backend. 1.6 added the Vespa and Cassandra backends. 2.0, the first release
 named wardowl, added the Pinecone backend and the fixes from the project's own security audit, some
 of which change behaviour; [Upgrading](https://muzakkirhussain011.github.io/wardowl/upgrading.html)
-lists them. Next, in rough order: permission sync from SharePoint and Confluence, and an Azure AI
+lists them. 2.1 added acceptance scenarios that run the documentation against real servers, with
+the fixes they found. 3.0 reports a short result from an approximate index as possibly incomplete,
+tells why and can search again, raises `SearchError` for a failing vector store, and adds write
+revisions, time bounds and audit observers that must record every retrieval; Upgrading lists what
+changes. Next, in rough order: permission sync from SharePoint and Confluence, and an Azure AI
 Search backend. Contributions are welcome; see
 [CONTRIBUTING.md](https://github.com/muzakkirhussain011/wardowl/blob/main/CONTRIBUTING.md).
 

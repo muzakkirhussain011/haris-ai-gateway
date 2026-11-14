@@ -163,6 +163,15 @@ published as advisory
 | October 2026 | Chroma refused one large write, so loading a big corpus failed | 2.1.0 |
 | October 2026 | Chroma refused every search by a subject in about 1,000 groups, and the first search by a subject in 40,000 groups ended the Python process ([GHSA-pxx6-228g-4fw5](https://github.com/muzakkirhussain011/wardowl/security/advisories/GHSA-pxx6-228g-4fw5)) | 2.0.2, 2.1.1 |
 | October 2026 | After `invalidate()`, a permission service still answering from a stale snapshot refilled the cache for its whole `ttl` ([GHSA-3f2r-rrm4-mhwj](https://github.com/muzakkirhussain011/wardowl/security/advisories/GHSA-3f2r-rrm4-mhwj)) | 2.0.2, 2.1.1 |
+| October 2026 | A pre-filtered result that an approximate index cut short, an empty one included, was reported as complete: pgvector returned nothing to users who could read hundreds of chunks | 3.0.0 |
+| October 2026 | A failing vector store's own exception, whose text can name hosts, reached callers and, through agent tools, models | 3.0.0 |
+| October 2026 | A SpiceDB lookup cut off before its first line read as "nothing is readable", so retrievals returned nothing without an error | 3.0.0 |
+| October 2026 | Redis and MongoDB missed chunks whose permission values were longer than the store indexes whole | 3.0.0 |
+| November 2026 | A Redis search that ran out of time, answered in RESP2, passed for complete results | 3.0.0 |
+| November 2026 | An audit sink that could not write lost events with only a log line: no metric, and no way to stop returning chunks it had not recorded | 3.0.0 |
+| November 2026 | Under `aretrieve`, an observer that blocked held up every request of the HTTP service and the MCP server | 3.0.0 |
+| November 2026 | The HTTP service and the MCP tool had no bound on a retrieval's time, and an HTTP authorizer's check none on its batches together | 3.0.0 |
+| November 2026 | pgvector and MongoDB had no way to refuse a write older than the one stored, so a late re-index could put back access a permission sync had revoked | 3.0.0 |
 
 ## Reporting
 

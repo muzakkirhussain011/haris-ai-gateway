@@ -45,12 +45,14 @@ searched some other way (Chroma is the exception: it falls back to the collectio
 function).
 
 A query vector with the wrong number of dimensions makes the retrieval raise, and nothing is
-returned. `FaissBackend` checks the length itself and raises `ValueError` before searching. Vespa
-and Pinecone refuse the query, and their backends raise `RuntimeError` with the store's message.
-Every other backend hands the vector to its store's client, and the store's own error comes back
-unchanged (an exception from psycopg, redis-py, the Qdrant client and so on), since the retriever
-does not catch errors from a backend. The same holds when `embed` returns vectors of another
-model's size.
+returned. `FaissBackend` checks the length itself and raises `InvalidQuery` (a `ValueError`)
+before searching, which the retriever raises as it is. Every other backend hands the vector to its
+store, which refuses it: Vespa's and Pinecone's backends raise `RuntimeError` with the store's
+message, and the others raise their client's own exception (from psycopg, redis-py, the Qdrant
+client and so on). The retriever raises each of those as `wardowl.SearchError`, with the fixed
+message "search failed" and the store's exception as its `__cause__`, so the store's text never
+reaches a model through an agent framework; read `__cause__` in your logs for the details. The
+same holds when `embed` returns vectors of another model's size.
 
 ## Hybrid search with one embedding
 
@@ -84,8 +86,8 @@ embedding when one is set.
 `InvalidQuery` is a `ValueError` that says the query, not the system, is at fault: only a vector
 for keyword search, only text for a backend without an embed function, or `k` beyond
 `max_candidates`. `FaissBackend` raises it for a query vector whose length is not its `dim`; other
-stores report a vector of the wrong length with their own errors. The
-[HTTP service](integrations/http.md#the-api) answers it with 422.
+stores report a vector of the wrong length with their own errors, which reach the caller as
+`SearchError`. The [HTTP service](integrations/http.md#the-api) answers `InvalidQuery` with 422.
 
 ## Audit fingerprints
 

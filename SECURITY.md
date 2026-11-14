@@ -16,7 +16,9 @@ are released as soon as they are ready, with credit to the reporter unless you p
 ## Supported versions
 
 The latest minor release gets every fix. The minor release before it gets security fixes, as patch
-releases, for six months after its successor came out. Older releases get none.
+releases, for six months after its successor came out. Older releases get none, except that an end
+date published in the table below is kept when a newer release comes out: 2.0.x keeps the date it
+was given when 2.1.0 came out.
 
 The project was called needtoknow until 2.0.0. needtoknow is archived on PyPI, and its last release,
 2.0.0, has no code: it installs wardowl and says so. needtoknow 1.x gets no security fixes: the
@@ -26,7 +28,8 @@ dates published for needtoknow 1.3 to 1.6 no longer apply.
 
 | Version | Security fixes | Until |
 |---|---|---|
-| 2.1.x | Yes (latest) | |
+| 3.0.x | Yes (latest) | |
+| 2.1.x | Yes | 2027-05-14, six months after 3.0.0 |
 | 2.0.x | Yes | 2027-04-24, six months after 2.1.0 |
 | needtoknow 1.6.x and earlier | No: upgrade to wardowl 2.0 | |
 
@@ -102,5 +105,5 @@ From 1.4.0, each release also carries SLSA build provenance (`wardowl-<version>.
 also stored as a GitHub attestation. With the GitHub CLI:
 
 ```bash
-gh attestation verify wardowl-2.1.0-py3-none-any.whl --repo muzakkirhussain011/wardowl
+gh attestation verify wardowl-3.0.0-py3-none-any.whl --repo muzakkirhussain011/wardowl
 ```

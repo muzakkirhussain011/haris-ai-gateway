@@ -91,7 +91,7 @@ says why. The table shows what each failure looks like.
 |---|---|---|
 | The permission service is down, slow or erroring | Raises `AuthorizationError` after the timeout and retries, or when an authorizer's `total_timeout` for the whole check runs out; with a circuit breaker open, at once | `wardowl.retrievals` with `error.type = AuthorizationError`; no results reach the model |
 | The permission service gives a malformed answer (wrong count, non-booleans, not a filter) | Raises `AuthorizationError`; never caches the answer | As above |
-| The vector store is down | Raises the store client's own error; nothing is returned | `error.type` names that error |
+| The vector store is down, or a search or count fails | Raises `SearchError`, with the store client's exception as its `__cause__`; nothing is returned | `wardowl.retrievals` with `error.type = SearchError`; the span's `wardowl.error.cause` and `RetrievalEvent.cause` name the client's exception |
 | The vector store ignores or mistranslates the filter | The re-check drops every chunk outside it | `violations > 0` on the result, the event and the `wardowl.violations` metric |
 | Post-filtering cannot find `k` readable chunks within `max_candidates` | Returns what it found | `complete = False`; `wardowl.outcome = incomplete` |
 | An approximate index returns fewer than `k` chunks under the filter (it may have stopped early) | Returns what it found | `complete = False`; `wardowl.outcome = incomplete` |
