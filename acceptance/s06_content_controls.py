@@ -30,7 +30,19 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from enterprise import PERSONAS, QUESTIONS, Embedder, Persona, Report, Spec, can_read, corpus, env, expected_ids
+from enterprise import (
+    PERSONAS,
+    QUESTIONS,
+    Embedder,
+    Persona,
+    Report,
+    Spec,
+    can_read,
+    corpus,
+    env,
+    expected_ids,
+    result_problem,
+)
 
 from wardowl import (
     AllOf,
@@ -653,8 +665,11 @@ def hybrid(report: Report, co: Company) -> None:
         for question, kinds in QUESTIONS:
             result = retriever.retrieve(question, persona.subject, k=5)
             seen += result.hits
-            if result.strategy != "prefilter" or result.violations or not result.complete:
-                odd.append(f"{question}: {result.strategy}, {result.violations} violations, complete={result.complete}")
+            # RankFusion never declares exact_search (docs/concepts.md), so a short fused result, as
+            # mallory's empty ones are, says complete=False and shortfall="unknown".
+            problem = result_problem(result, 5, "prefilter", exact=False)
+            if problem:
+                odd.append(f"{question}: {problem}")
             expected = expected_ids(persona, co.specs, kinds)
             if expected:
                 asked += 1
@@ -781,7 +796,10 @@ def own_vectors(report: Report, co: Company) -> None:
 def strategies(report: Report, co: Company) -> None:
     # The same policy as a plain function authorizer: no scope_for, so post-filtering searches unfiltered.
     plain = FunctionAuthorizer(co.authorizer.check, co.authorizer.filter_for)
-    for name, backend in (("memory", co.memory), ("pgvector", co.vector)):
+    # InMemoryBackend declares exact_search and pgvector does not (docs/concepts.md, "What a result tells
+    # you"): from pgvector a short result, as mallory's are, is complete only when post-filtering searched
+    # without a filter, and a pre-filtered one says shortfall="unknown".
+    for name, backend, exact in (("memory", co.memory, True), ("pgvector", co.vector, False)):
         for persona in PEOPLE:
             differ = []
             odd = []
@@ -792,8 +810,9 @@ def strategies(report: Report, co: Company) -> None:
                         retriever = PermissionedRetriever(backend, authorizer, strategy=strategy)  # type: ignore[arg-type]
                         result = runs[f"{label} {strategy}"] = retriever.retrieve(question, persona.subject, k=5)
                         want = "postfilter" if strategy == "postfilter" else "prefilter"
-                        if result.strategy != want or not result.complete or result.violations:
-                            odd.append(f"{label} {strategy}: {result.strategy}, complete={result.complete}")
+                        problem = result_problem(result, 5, want, exact=exact, scoped=label == "AllOf")
+                        if problem:
+                            odd.append(f"{label} {strategy}: {problem}")
                 reference = ids(runs["AllOf prefilter"])
                 for key, result in runs.items():
                     same = ids(result) == reference if name == "memory" else set(ids(result)) == set(reference)
@@ -802,7 +821,9 @@ def strategies(report: Report, co: Company) -> None:
             report.check(
                 f"{name}, {persona.id}: every strategy returns the same permitted hits", not differ, f"{differ}"
             )
-            report.check(f"{name}, {persona.id}: each result names its strategy and is complete", not odd, f"{odd}")
+            # On the exact store every result is complete, as before 3.0, so the check keeps its name there.
+            complete = "is complete" if exact else "is complete unless an approximate filtered search came back short"
+            report.check(f"{name}, {persona.id}: each result names its strategy and {complete}", not odd, f"{odd}")
 
     bob = WHO["bob"]
     for strategy in ("auto", "prefilter", "postfilter"):

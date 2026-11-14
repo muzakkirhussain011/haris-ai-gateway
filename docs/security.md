@@ -78,8 +78,12 @@ returns the stored `jsonb` column, Qdrant the point's payload, and Elasticsearch
 document's `_source`, where metadata is stored unindexed. The Chroma backend rebuilds metadata from
 an exact JSON copy rather than from Chroma's own fields, because of a Chroma bug that can attach a
 deleted collection's metadata to new records ([details](integrations/chroma.md#how-metadata-is-stored)).
-Elasticsearch and OpenSearch filter on a separate field, `wardowl_terms`, but the re-check reads
-the metadata, so if the two ever disagree a chunk can be hidden, never leaked.
+Elasticsearch, OpenSearch, Milvus, MongoDB, Redis, Weaviate, LanceDB, Vespa, Cassandra and
+Pinecone filter on a separate field, `wardowl_terms`, but the re-check reads the metadata, so if
+the two ever disagree a chunk can be hidden, never leaked. wardowl writes both in one write; a tool
+that changes the metadata without recomputing the terms makes them disagree. Terms that grant more
+than the metadata are dropped and counted in `violations`; terms that grant less hide the chunk
+from pre-filtered searches, and nothing reports it.
 
 **Caching delays revocation by at most `ttl`.** `CachingAuthorizer` keeps decisions for `ttl`
 seconds (30 by default), so a revoked permission can keep granting access for up to that long.
@@ -96,8 +100,10 @@ carries an HMAC-SHA256 over its key and content, and anything unsigned, tampered
 under another key is ignored. Keep that Redis private to the application either way. Key names are
 digests, so the subjects and chunks are not readable from a key listing. A failing Redis is only
 ever a miss, and a hanging one too once the client has timeouts
-([Operations](operations.md#sharing-the-cache-across-processes)). `invalidate()` clears Redis at
-once and reaches other replicas within `local_ttl` (1 second by default).
+([Operations](operations.md#sharing-the-cache-across-processes)). `invalidate()` writes a new
+epoch to Redis at once, under which no entry written before it is accepted, deletes those entries
+(for one subject, those its index lists), and reaches other replicas within `local_ttl` (1 second
+by default).
 
 **A scope only narrows the search.** `scope_for` (from `TenantAuthorizer` inside `AllOf`, for
 example) limits which chunks post-filtering searches, and every candidate is still checked. A scope

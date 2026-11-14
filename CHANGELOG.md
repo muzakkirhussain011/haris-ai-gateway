@@ -39,6 +39,98 @@ All notable changes are recorded here. The format follows
   to the cache, kept before `invalidate()` is called. The SpiceDB page shows a thread-safe function
   that does it, says what it relies on, and says what it does not cover: writes in other processes,
   unless the token is shared, and changes made directly in SpiceDB.
+- `OIDCAuthenticator(require_groups=True)` refuses a token without the groups claim
+  (`groups_claim`) as invalid, which the HTTP service answers with 401. The claim was read as "no
+  groups" when it was absent, so a token that lost its groups (a group mapper removed, or a
+  provider that leaves a long group list out of the token, as Microsoft Entra ID does for a user in
+  more than 200 groups) quietly stripped the user's group access: 200 with fewer hits, and no log
+  line (M21). An empty list is a claim, and passes. The default, `False`, keeps that reading, and
+  now logs each token without the claim at DEBUG on the `wardowl` logger, naming the claim and
+  nothing else. `subject()` applies the same rule to claims passed to it directly.
+- `OIDCAuthenticator` logs every token it refuses at INFO on the `wardowl` logger, with the check
+  that failed: PyJWT's exception class (such as `ImmatureSignatureError`, `ExpiredSignatureError`
+  or `InvalidAudienceError`, and the claim's name for `MissingRequiredClaimError`) or wardowl's own
+  reason (such as a `kid` that no published key matches). The token, its signature and its claims'
+  values are not logged, and the 401 the HTTP service answers is unchanged, so the caller is still
+  not told why. Every PyJWT error became `InvalidToken` and a 401 with no reason recorded anywhere
+  (M20). `create_app` still logs nothing for a 401 from an authenticator of your own.
+
+### Fixed
+
+- `OIDCAuthenticator` refuses a `leeway` that is not a finite number with `ValueError`. With NaN,
+  every one of PyJWT's time comparisons is false, so an expired token verified; an infinite leeway
+  turned the expiry check off. A `datetime.timedelta`, which PyJWT also takes, is still accepted.
+- `CachingAuthorizer.invalidate(subject)` with `RedisCache` no longer scans the whole Redis
+  database (finding M15 of the readiness review). It deleted the subject's entries with `SCAN`
+  and a `MATCH` pattern, which visits every key in the database, about 1,000 per round trip, so
+  its cost grew with everything else that Redis holds, not with the subject's entries, and was
+  paid in the calling thread: about 10,000 round trips for a Redis holding 10 million sessions
+  and queue items, which in an `async def` webhook handler held up every other request on that
+  worker. `RedisCache` now keeps, for each subject id, a sorted set of the names of the entries
+  written for it, under the id's hash tag so that Redis Cluster keeps it in the slot of those
+  entries. It is written in the same pipeline as the entries, before them, kept for `ttl` plus a
+  minute after its last write, and cleared on each write of the names whose entries expired more
+  than a minute earlier. `invalidate(subject)` writes the subject's new epoch first, as before,
+  then reads the index and unlinks what it lists: two round trips plus one per 500 entries. Each
+  write sends three more commands in its pipeline, so no extra round trip, and Redis holds one
+  sorted set per subject id written in the last `ttl` plus a minute. The revocation guarantee does
+  not change: the new epoch makes every replica refuse the entries written before it, which is
+  also what protected against a write racing the scan. An entry that no index lists, such as one a 3.0 replica writes
+  during a rolling upgrade, is refused the same way and stays in Redis until it expires, within
+  `ttl`; call `invalidate()` once every replica runs 3.1 to delete such entries at once.
+  `invalidate()` of everyone still scans the database. A shared cache without the new methods is
+  still cleared with `delete_prefix`. Tests, with a stand-in store and against Redis in CI: a
+  subject's invalidation deletes only that id's entries and never scans, entries without an index
+  are refused and then deleted by `invalidate()` of everyone, a write racing an invalidation stays
+  listed and is never read, the index drops long-expired names and deletes only under its prefix,
+  `ainvalidate` works in a worker thread while the event loop runs and finishes when cancelled,
+  and a subject's entries, epoch and index hash to one cluster slot (by redis-py's slot function;
+  Redis Cluster itself is not tested in CI).
+
+### Documentation
+
+- The HTTP service page and the `OIDCAuthenticator` docstring say that `exp`, and `nbf` and `iat`
+  when the token has them, are checked against the service's clock, and that `leeway` applies to
+  all three. With the default leeway of 0, an identity provider whose clock runs ahead of the
+  service's issues tokens that are refused until the service's clock catches up, which shows as
+  401s that come and go (M20). The page recommends a few seconds of leeway where the clocks are not
+  tightly synchronized, at the cost of accepting expired tokens for as long. The default stays 0,
+  since a minor release never weakens a default that keeps a protection on. New sections cover
+  tokens without groups and where to find why a token was refused; the MCP page's stdio example and
+  the production failure table say the same.
+- `CachingAuthorizer.ainvalidate(subject=None)`: `invalidate()` for async code, with the same
+  effect and errors. It drops this process's answers at once, then runs the shared cache's calls in
+  a worker thread with `asyncio.to_thread`, as the other async methods already do for their shared
+  reads and writes, so an `async def` handler that reports a revocation no longer holds up the
+  event loop while Redis is cleared. If the task awaiting it is cancelled, the thread still
+  finishes, and the caller is not told whether it succeeded.
+- `RedisCache.set_many_indexed(entries, ttl, index)` and `RedisCache.delete_indexed(index, prefix)`,
+  which keep and use the index of each subject's entries described under Fixed. A shared cache of
+  your own can have the same two methods; one with only `get_many`, `set_many` and `delete_prefix`
+  works as before.
+- Operations: what each form of `invalidate()` costs and where it waits, what `invalidate(subject)`
+  leaves in Redis, and why the Redis behind the cache should not evict keys: an evicted epoch or
+  index weakens what an invalidation deletes or refuses. Revocation, the runbook and the security
+  model say the same where they describe `invalidate()`.
+- What a rise in `violations` can mean. Concepts, the quickstart and the README said it means the
+  store ignored the filter, and the runbook looked only for a store bug; it also rises when another
+  tool leaves the permission terms stale on the stores that keep them, when MongoDB's index has not
+  caught up with a write, for Chroma records without wardowl's JSON copy (a collection kept from
+  needtoknow 1.x among them), when an authorizer's filter selects more than its `check` allows, and
+  when a permission changes between the filter and the check. The runbook lists each cause with how
+  to tell it and what to do, and shows how to find the rejected chunks; the production page's
+  failure table and its identity checklist (ids and groups are compared exactly, never lowercased)
+  are updated too. The security model and the
+  Milvus, Redis and LanceDB pages say that terms are recomputed in the same write as the metadata,
+  and what stale terms do; the extending guide says that `check_backend` cannot see other writers,
+  and that a backend should return at most `k` hits. The Google Drive page shows how to enforce
+  `access_expires_at` inside wardowl, with its cost, says that no backend lists chunks by
+  metadata, that `with_access` needs the authorizer's field names, how tenants and case work, and
+  that OpenFGA refuses the default `domain:` groups (use `domain_prefix="domain/"`) and SpiceDB
+  refuses email ids; the OpenFGA page and ADR 0006 say the same. The OPA, Cerbos, Cedar and Casbin
+  pages say how to keep tenants apart, Combining that a tenant from `OIDCAuthenticator` is a
+  string, the MCP page which group names permission services refuse, and the pgvector and
+  Cassandra pages what very large filters cost.
 
 ## [3.0.0] - 2026-11-14
 

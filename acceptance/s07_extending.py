@@ -4,7 +4,8 @@ Northwind's platform team runs the assistant on SQLite, not on one of wardowl's 
 and keeps who may read each source document in an ACL table next to the chunks. Following
 docs/extending.md they write two small classes: a `SearchBackend` over SQLite (vectors as JSON,
 cosine similarity in Python, the permission filter translated into SQL that keeps the integer 1
-and the string "1" apart), and an authorizer that reads the ACL table.
+and the string "1" apart, and `exact_search` declared, since it ranks every row the filter
+selects), and an authorizer that reads the ACL table.
 
 Before trusting them with the company's documents they run wardowl's public conformance kit on
 both, as any adopter would. They also run it on subtly broken copies, the kind of bug a teammate
@@ -37,7 +38,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from enterprise import PERSONAS, QUESTIONS, Embedder, Persona, Report, Spec, can_read, corpus, exact_top_k
+from enterprise import (
+    PERSONAS,
+    QUESTIONS,
+    Embedder,
+    Persona,
+    Report,
+    Spec,
+    can_read,
+    corpus,
+    exact_top_k,
+    result_problem,
+)
 
 from wardowl import (
     AllOf,
@@ -103,10 +115,13 @@ class SQLiteBackend:
     """Chunks in SQLite, ranked by cosine similarity, with the permission filter in SQL.
 
     The filter runs in the WHERE clause on the JSON metadata, through SQLite's `json_each`, so the
-    database only hands back chunks the subject may read; ranking is exact, over those rows.
+    database only hands back chunks the subject may read; ranking is exact, over those rows. So it
+    declares `exact_search`, as docs/extending.md says a brute-force scan may: a result with fewer
+    than k hits then proves that nothing else matches, and the conformance kit checks it as exact.
     """
 
     supports_filters = True
+    exact_search = True
 
     def __init__(self, path: str = ":memory:", embed: Embed | None = None) -> None:
         # aretrieve runs search in a worker thread: one connection, shared under a lock.
@@ -215,7 +230,9 @@ class TextComparingBackend(SQLiteBackend):
 
 class NearestFirstBackend(SQLiteBackend):
     """Another teammate's optimisation: take the k nearest chunks, then keep those the filter
-    selects. It never returns a wrong chunk; it often returns too few."""
+    selects. It never returns a wrong chunk; it often returns too few, and it still declares the
+    `exact_search` it inherits, where docs/upgrading.md (section 7) says a subclass that drops hits
+    must set it to False."""
 
     def search(self, query: str | Query, k: int, filter: Filter | None = None) -> list[Hit]:
         nearest = super().search(query, k)
@@ -445,7 +462,8 @@ def broken_backends(report: Report, app: App) -> None:
         if caught:
             report.note(f"{kind.__name__}: {result[:300]}")
 
-    # What the second bug does to a real retrieval: too few hits, and wardowl cannot tell.
+    # What the second bug does to a real retrieval: too few hits, and wardowl cannot tell, since the
+    # backend still declares exact_search.
     bob = WHO["bob"]
     nearest = app.open(NearestFirstBackend, str(app.path), embed=app.embedder)
     question = "What is the salary band for a senior engineer?"
@@ -454,8 +472,9 @@ def broken_backends(report: Report, app: App) -> None:
     )
     report.note(
         f"through NearestFirstBackend, bob got {len(result.hits)} of 5 hits for the salary question, though he may "
-        f"read {len(app.readable(bob))} documents, and the result said complete={result.complete}: complete trusts "
-        "the store's ranking (docs/concepts.md), which is why the kit's completeness checks matter"
+        f"read {len(app.readable(bob))} documents, and the result said complete={result.complete}: the retriever "
+        "takes a short result from a backend that declares exact_search as proof that nothing else matches "
+        "(docs/concepts.md), which is why the kit checks such a backend as exact"
     )
 
 
@@ -538,10 +557,12 @@ def serve(report: Report, app: App) -> None:
                 seen += [h.text for h in result.hits]
                 if set(ids(result)) != truth:
                     wrong.append(f"{name} {question}: {sorted(set(ids(result)) ^ truth)}")
-                if result.violations or not result.complete:
-                    odd.append(f"{name} {question}: {result.violations} violations, complete={result.complete}")
-            if results["auto"].strategy != "prefilter":
-                odd.append(f"{question}: auto chose {results['auto'].strategy}")
+                # The store declares exact_search, so a short result, as mallory's are, is complete, and
+                # pre-filtered says shortfall="exhausted" (docs/concepts.md, "What a result tells you").
+                want = "postfilter" if name == "postfilter" else "prefilter"
+                problem = result_problem(result, 5, want, exact=True, scoped=name != "postfilter")
+                if problem:
+                    odd.append(f"{name} {question}: {problem}")
             if ids(results["aretrieve"]) != ids(results["auto"]):
                 differ.append(question)
         report.no_leaks(f"{persona.id}: no leak through the team's store and policy", persona, seen, app.specs)

@@ -22,7 +22,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from wardowl import Document, Subject
+from wardowl import Document, RetrievalResult, Subject
 
 TENANTS = ("northwind", "globex")
 MODEL = os.environ.get("WARDOWL_ACCEPTANCE_MODEL", "BAAI/bge-small-en-v1.5")
@@ -365,6 +365,67 @@ class Report:
                     + "\n"
                 )
         sys.exit(1 if failed else 0)
+
+
+def declares_exact(backend: Any) -> bool:
+    """Whether a backend declares exact search, read as the retriever reads it: only True counts."""
+    return getattr(backend, "exact_search", False) is True
+
+
+def result_problem(
+    result: RetrievalResult,
+    k: int,
+    strategy: str,
+    *,
+    exact: bool,
+    scoped: bool = True,
+    readable: int | None = None,
+) -> str | None:
+    """What is wrong with a result's strategy, violations, `complete`, `shortfall` and `fallback`
+    under wardowl 3.0's contract, or None when nothing is (docs/concepts.md, "What a result tells
+    you" and "Short results"; docs/upgrading.md, "3. Expect complete=False for short results").
+
+    `k` is the number of hits asked for, and `strategy` the one the result must report. `exact` is
+    what the store's documentation says about it: True for a backend that declares `exact_search`
+    (InMemoryBackend, FaissBackend with a flat index, QdrantBackend with SearchParams(exact=True)),
+    never for RankFusion. `scoped` says whether post-filtering searched inside the authorizer's
+    scope. `readable` is given for a retriever with short_results="count": how many chunks the
+    asker may read, which is what the backend counts under the permission filter.
+
+    * k hits: complete, with no shortfall and no fallback.
+    * Fewer, pre-filtered: from an exact backend, complete, shortfall "exhausted". Counted: complete
+      and "exhausted" when the hits are all the asker may read, else not complete and "missed".
+      Otherwise, under the default short_results="report", not complete and "unknown". "report"
+      and "count" run nothing more, so the fallback is None.
+    * Fewer, post-filtered: no shortfall and no fallback, which describe pre-filtered searches only
+      (wardowl/retriever.py). Complete when the backend is exact or the search had no filter, where a
+      short candidate list means the store ran out; under a scope an approximate index may have
+      stopped early. This assumes post-filtering ran out of candidates before `max_candidates`
+      (1,000 by default), as it does on the scenarios' corpora, which are smaller than that.
+    """
+    hits = len(result.hits)
+    state = (
+        f"{result.strategy}, {result.violations} violations, {hits} of {k} hits, complete={result.complete},"
+        f" shortfall={result.shortfall}, fallback={result.fallback}"
+    )
+    if result.strategy != strategy or result.violations:
+        return state
+    want: tuple[bool, str | None, str | None]
+    if hits >= k:
+        want = (True, None, None)
+    elif strategy == "postfilter":
+        want = (exact or not scoped, None, None)
+    elif exact:
+        want = (True, "exhausted", None)
+    elif readable is None:
+        want = (False, "unknown", None)
+    elif hits >= readable:
+        want = (True, "exhausted", None)
+    else:
+        want = (False, "missed", None)
+    if (result.complete, result.shortfall, result.fallback) == want:
+        return None
+    return f"{state}; expected complete={want[0]}, shortfall={want[1]}, fallback={want[2]}"
 
 
 def expected_ids(persona: Persona, specs: Sequence[Spec], kinds: Iterable[str]) -> set[str]:
