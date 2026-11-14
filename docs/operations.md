@@ -114,9 +114,9 @@ authorizer = CachingAuthorizer(openfga, ttl=30, shared=shared, namespace="openfg
   before. `invalidate(subject)` writes the id's epoch, reads its index and deletes the entries it
   lists with `UNLINK`: a round trip for the epoch, one for the index and one per 500 entries,
   however many other keys the database holds. `invalidate()` of everyone writes the global epoch,
-  then deletes the namespace's entries with `SCAN`, which visits every key in the database, other
-  applications' keys included, about 1,000 per round trip: about 10,000 round trips for a Redis
-  that also holds 10 million sessions or queue items. Either way `invalidate()` waits for Redis in
+  then finds the namespace's entries with `SCAN` and unlinks them 500 at a time; `SCAN` visits
+  every key in the database, other applications' keys included, about 1,000 per round trip: about
+  10,000 round trips for a Redis that also holds 10 million sessions or queue items. Either way `invalidate()` waits for Redis in
   the calling thread, which in an `async def` handler is the event loop's. There, use
   `await authorizer.ainvalidate(user_id)`, or `ainvalidate()` for everyone: it drops this
   process's answers at once, runs the Redis calls in a worker thread with `asyncio.to_thread`, and
