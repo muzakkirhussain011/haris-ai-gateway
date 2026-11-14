@@ -177,8 +177,7 @@ All notable changes are recorded here. The format follows
 - What a rise in `violations` can mean. Concepts, the quickstart and the README said it means the
   store ignored the filter, and the runbook looked only for a store bug; it also rises when another
   tool leaves the permission terms stale on the stores that keep them, when MongoDB's index has not
-  caught up with a write, for Chroma records without wardowl's JSON copy (a collection kept from
-  needtoknow 1.x among them), when an authorizer's filter selects more than its `check` allows, and
+  caught up with a write, when an authorizer's filter selects more than its `check` allows, and
   when a permission changes between the filter and the check. The runbook lists each cause with how
   to tell it and what to do, and shows how to find the rejected chunks; the production page's
   failure table and its identity checklist (ids and groups are compared exactly, never lowercased)
