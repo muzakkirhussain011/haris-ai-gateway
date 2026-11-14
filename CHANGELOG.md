@@ -92,7 +92,10 @@ All notable changes are recorded here. The format follows
   "Connection reset by peer". The handler now logs the error, with the store's exception as its
   cause, on the `wardowl` logger, and answers "the search could not be completed, so nothing was
   returned", which echoes nothing from the request or the store. The status stays 500, as the HTTP
-  page documents for this case; U16 in the readiness review notes the same missing handler. The
+  page documents for this case; U16 in the readiness review notes the same missing handler. Any
+  other exception from the retrieval (an `AuditError` from a required observer, a reranker or
+  redactor that raises) is answered the same way, with "the retrieval failed on the server, so
+  nothing was returned", instead of leaving the application. The
   MCP tool needed no change: the MCP SDK catches the error, logs it with its traceback, and ends
   the call with an error that names only the tool ("Error executing tool search"), as the MCP page
   says. Tests: a store whose search fails and one whose

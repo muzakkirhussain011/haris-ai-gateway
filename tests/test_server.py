@@ -297,6 +297,22 @@ def test_a_failed_search_answers_500_itself_echoes_nothing_and_logs_the_cause(ca
     assert c.get("/healthz").json() == {"status": "ok"}
 
 
+def test_any_other_failure_in_the_retrieval_also_answers_500_itself(caplog):
+    def broken(query, hits):  # a reranker that fails, naming what it should not
+        raise RuntimeError(DRIVER_ERROR)
+
+    retriever = PermissionedRetriever(InMemoryBackend(DOCS), MetadataACLAuthorizer(), reranker=broken)
+    c = TestClient(create_app(retriever, tokens))  # raises whatever leaves the application
+    with caplog.at_level(logging.ERROR, logger="wardowl"):
+        response = ask(c, {"query": "launch"})
+    assert response.status_code == 500
+    assert response.json() == {"detail": "the retrieval failed on the server, so nothing was returned"}
+    assert "hunter2" not in response.text and "db.internal" not in response.text
+    (record,) = [r for r in caplog.records if r.name == "wardowl" and r.levelno >= logging.ERROR]
+    assert record.getMessage() == "wardowl's retrieval failed; nothing was returned"
+    assert c.get("/healthz").json() == {"status": "ok"}
+
+
 def test_an_authenticator_may_be_async():
     async def later(token):
         return tokens(token)

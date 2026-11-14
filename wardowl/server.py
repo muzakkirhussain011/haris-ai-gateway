@@ -453,6 +453,12 @@ def create_app(
             # cause, logged with it, and never sent.
             _log.exception("wardowl's search failed; nothing was returned")
             raise HTTPException(500, "the search could not be completed, so nothing was returned") from None
+        except Exception:
+            # Any other failure inside the retrieval (an `AuditError` from a required observer, a
+            # reranker or redactor that raised, a bug): still a 500 answered here, for the same
+            # reason, with the error in the log and nothing of it in the answer.
+            _log.exception("wardowl's retrieval failed; nothing was returned")
+            raise HTTPException(500, "the retrieval failed on the server, so nothing was returned") from None
         hits = [
             Hit(
                 id=h.id,
