@@ -15,21 +15,8 @@ retriever = PermissionedRetriever(backend, authorizer, redactor=SpanRedactor())
 
 `SpanRedactor` reads a list of spans from each chunk's metadata, under `redactions` by default:
 character offsets into the chunk's text, with who may read each span under the field names and
-marker `MetadataACLAuthorizer` uses by default: user ids in `allowed_users`, group names in
-`allowed_groups`, and `"*"` in `allowed_groups` for everyone. If your authorizer is configured
-with other names or another marker, give the redactor the same, or a span written in the
-authorizer's form is read with the wrong ones:
-
-```python
-from wardowl import MetadataACLAuthorizer, SpanRedactor
-
-authorizer = MetadataACLAuthorizer(users_field="readers", groups_field="teams", everyone="all")
-redactor = SpanRedactor(users_field="readers", groups_field="teams", everyone="all")
-```
-
-Unlike the authorizer, which also takes a single string where a list is expected, the redactor
-needs each of the two, where a span has it, to be a list of strings, and fails the retrieval
-otherwise (see below).
+marker that `MetadataACLAuthorizer` uses by default: user ids in `allowed_users`, group names in
+`allowed_groups`, and `"*"` in `allowed_groups` for everyone.
 
 ```python
 Document(
@@ -47,8 +34,22 @@ shown to a listed user, a member of a listed group, or everyone when the marker 
 is listed. A group name that is empty or only whitespace, on the subject or in the span, grants
 nothing, and neither does such a marker, as with `MetadataACLAuthorizer`. Overlapping spans are
 replaced together, and the `redactions` field is removed from the metadata returned, since it names
-who may read what. Write the spans at ingestion time, as you write the chunk's own
-permissions, and update them with `set_metadata`.
+who may read what. Write the spans at ingestion time, as you write the chunk's own permissions, and
+update them with `set_metadata`.
+
+If your authorizer is configured with other field names or another marker, give the redactor the
+same, or spans written in the authorizer's form are read with the wrong ones:
+
+```python
+from wardowl import MetadataACLAuthorizer, SpanRedactor
+
+authorizer = MetadataACLAuthorizer(users_field="readers", groups_field="teams", everyone="all")
+redactor = SpanRedactor(users_field="readers", groups_field="teams", everyone="all")
+```
+
+Unlike the authorizer, which also takes a single string where a list is expected, the redactor
+needs each of the two, where a span has it, to be a list of strings, and fails the retrieval
+otherwise (see below).
 
 **A chunk without the field is hidden whole.** Its text becomes `[REDACTED]`, because a list that
 was never written cannot be told apart from one lost on the way, for example by a `set_metadata`
