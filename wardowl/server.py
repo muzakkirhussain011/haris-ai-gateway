@@ -25,7 +25,9 @@ How it holds:
    the check a token failed at INFO on the `wardowl` logger, never the token. A permission check
    that fails answers 503 with no details (they go to the `wardowl` logger), and nothing is
    returned. A query the backend cannot search as sent (`InvalidQuery`: a vector of the wrong
-   length, say) answers 422, echoing nothing; any other failure is a server fault and answers 500.
+   length, say) answers 422, echoing nothing. A search or count the store could not complete
+   (`SearchError`) answers 500 with a fixed message, and the store's error goes to the `wardowl`
+   logger; any other failure is a server fault and answers 500 too.
 3. Hits carry no metadata unless a field is listed in `metadata_fields`.
 4. `k`, the query's length and the vector's length are bounded, the vector holds finite numbers
    only, a body over `max_body_bytes` is refused with 413 before it is parsed, and the query text
@@ -56,7 +58,7 @@ from typing import Annotated, Any
 
 from wardowl._timeout import TimedOut, checked, within
 from wardowl.authz import AuthorizationError
-from wardowl.retriever import PermissionedRetriever
+from wardowl.retriever import PermissionedRetriever, SearchError
 from wardowl.types import InvalidQuery, Query, Subject
 
 try:
@@ -443,6 +445,14 @@ def create_app(
             raise HTTPException(
                 422, "this query cannot be searched here; check k, the vector's length, or send text"
             ) from None
+        except SearchError:
+            # The store's search or count failed: unreachable, misconfigured, or refusing the query
+            # (a database refuses a vector of the wrong length). A server fault, so 500, answered
+            # here: left to escape, it reached uvicorn, which logged it and closed the connection,
+            # and the client's next request on that connection was reset. The store's error is the
+            # cause, logged with it, and never sent.
+            _log.exception("wardowl's search failed; nothing was returned")
+            raise HTTPException(500, "the search could not be completed, so nothing was returned") from None
         hits = [
             Hit(
                 id=h.id,

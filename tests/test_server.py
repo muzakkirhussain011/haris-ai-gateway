@@ -32,6 +32,7 @@ from wardowl import (  # noqa: E402
     MetadataACLAuthorizer,
     PermissionedRetriever,
     Query,
+    SearchError,
     Subject,
 )
 from wardowl._timeout import TimedOut, within  # noqa: E402
@@ -247,6 +248,53 @@ class Misconfigured:
 def test_a_server_fault_is_a_500_not_a_422(retriever):
     response = ask(TestClient(create_app(retriever, tokens), raise_server_exceptions=False), {"query": "launch"})
     assert response.status_code == 500 and "db.internal" not in response.text and "prefilter" not in response.text
+
+
+DRIVER_ERROR = "could not connect to postgresql://admin:hunter2@db.internal:5432/rag"
+
+
+class Unreachable:
+    """A store whose driver error names its host and credentials, as real drivers' do."""
+
+    supports_filters = True
+
+    def search(self, query, k, filter=None):
+        raise ConnectionError(DRIVER_ERROR)
+
+
+class CountFails(InMemoryBackend):
+    """A store that searches, then fails to count a short result."""
+
+    exact_search = False  # so a short result is counted, under short_results="count"
+
+    def count(self, filter, limit):
+        raise ConnectionError(DRIVER_ERROR)
+
+
+@pytest.mark.parametrize(
+    ("retriever", "failed"),
+    [
+        (PermissionedRetriever(Unreachable(), MetadataACLAuthorizer()), "search failed"),
+        (PermissionedRetriever(CountFails(DOCS), MetadataACLAuthorizer(), short_results="count"), "count failed"),
+    ],
+    ids=["search", "count"],
+)
+def test_a_failed_search_answers_500_itself_echoes_nothing_and_logs_the_cause(caplog, retriever, failed):
+    # The test client raises whatever leaves the application, so getting a response proves that the
+    # handler answered. Left to escape, the error reached uvicorn, which closed the connection.
+    c = TestClient(create_app(retriever, tokens))
+    with caplog.at_level(logging.ERROR, logger="wardowl"):
+        response = ask(c, {"query": "launch"})
+    assert response.status_code == 500
+    assert response.json() == {"detail": "the search could not be completed, so nothing was returned"}
+    assert not any(s in response.text for s in ("hunter2", "db.internal", failed))
+    (record,) = [r for r in caplog.records if r.name == "wardowl" and r.levelno >= logging.ERROR]
+    assert record.getMessage() == "wardowl's search failed; nothing was returned"
+    assert record.exc_info is not None
+    error = record.exc_info[1]
+    assert isinstance(error, SearchError) and str(error) == failed and str(error.__cause__) == DRIVER_ERROR
+    # The same client goes on to its next request.
+    assert c.get("/healthz").json() == {"status": "ok"}
 
 
 def test_an_authenticator_may_be_async():
