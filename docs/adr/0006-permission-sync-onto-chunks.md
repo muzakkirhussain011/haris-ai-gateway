@@ -42,7 +42,10 @@ Google Drive is the first connector (`wardowl.sync.google_drive`).
 - A sharing change applies after the next sync of that document, not at once. Sources with a
   changes feed (Drive's `changes.list`) keep this to the sync interval.
 - Subjects must use the source's identifiers: email addresses for Drive. Mixing identity schemes
-  denies, it never over-grants.
+  never over-grants: under `MetadataACLAuthorizer` it denies, and a permission service that
+  refuses such ids raises `UnsupportedSubject`, which fails closed too. SpiceDB refuses an email
+  address as a subject id, and OpenFGA refuses Drive's default `domain:` groups when groups are
+  sent as contextual tuples ([Google Drive](../integrations/google-drive.md#with-openfga-or-spicedb-as-well)).
 - Sources whose rules are unions of grants fit one pair of fields. Confluence intersects them (the
   space's permission and every view restriction on the page and its ancestors), which needs one
   pair of fields per level, combined with `AllOf`; that is decided with the Confluence connector,

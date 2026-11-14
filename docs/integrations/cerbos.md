@@ -90,6 +90,18 @@ it and reports it in `violations`. With `PermissionedRetriever(recheck=False)` t
 decides and such a chunk is returned, so use `recheck=False` only when every chunk stores each
 attribute in the shape the policy assumes.
 
+## Tenants
+
+The example policy has no tenant: a group name that two tenants both use, such as `hr`, is one
+group to it. With several tenants in one store, add the tenant check,
+`AllOf(TenantAuthorizer(), CerbosAuthorizer(...))`, which denies another tenant's chunks before
+Cerbos is asked, and puts the tenant in the search's filter whether or not the plan gives one
+([Combining](../combining.md#tenant-isolation)). A policy can also compare the tenant itself, as
+the acceptance suite's
+[`document.yaml`](https://github.com/muzakkirhussain011/wardowl/blob/main/acceptance/policies/cerbos/document.yaml)
+does with `request.resource.attr.tenant == request.principal.attr.tenant`: once Cerbos fills in
+the principal's tenant, that is an `==` the table above translates.
+
 ## Failures
 
 Every failure raises `AuthorizationError`, so retrieval returns nothing. `timeout=` (2 seconds by
