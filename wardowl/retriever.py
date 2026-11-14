@@ -28,10 +28,11 @@ Guarantees
 ----------
 * Fail closed: if the authorizer errors, `AuthorizationError` is raised and nothing is returned.
   Its message is fixed, without the text of the exception behind it, which is kept as its
-  `__cause__`: agent frameworks show tool errors to the model. If the backend's search or count
-  fails, `SearchError` is raised the same way, with a fixed message and the backend's exception as
-  its `__cause__`; only `InvalidQuery`, which says the query itself cannot be searched, is raised
-  as it is.
+  `__cause__`: agent frameworks show tool errors to the model. So is a malformed answer: a filter
+  holding something other than `In`, `And` and `Or`, or nested more than 100 levels deep. If the
+  backend's search or count fails, or its search returns something other than hits, `SearchError`
+  is raised the same way, with a fixed message and the backend's exception as its `__cause__`;
+  only `InvalidQuery`, which says the query itself cannot be searched, is raised as it is.
 * Defence in depth: pre-filtered results are checked again with the authorizer (`recheck=True`).
   A backend that ignored the filter cannot leak; the rejected hits are counted in `violations`.
   With `recheck=False` there is no second call to the authorizer, but each pre-filtered hit is
@@ -51,19 +52,21 @@ import asyncio
 import contextvars
 import dataclasses
 import functools
+import itertools
 import logging
 import math
+import numbers
 import random
 import threading
 import time
-from collections.abc import Callable, Generator, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from wardowl.authz import AuthorizationError, Authorizer
 from wardowl.events import AuditError, Observer, RetrievalEvent, query_fingerprint
-from wardowl.filters import And, Filter, In, Or, matches
+from wardowl.filters import _MAX_DEPTH, And, Filter, In, Or, matches
 from wardowl.redaction import RedactFunction, Redactor
 from wardowl.types import Hit, InvalidQuery, Query, Subject
 
@@ -87,6 +90,10 @@ RecallSample = Literal["measured", "over_limit", "unsupported", "failed"]
 @runtime_checkable
 class SearchBackend(Protocol):
     """A vector store or search index. Return hits ordered best first.
+
+    Each hit is a `Hit` whose id is a string, whose metadata is a mapping and whose score is a
+    number. The retriever reads at most k of them, and raises `SearchError` for a reply that is not
+    an iterable of such hits, as it does when `search` raises.
 
     `supports_filters` says whether `search` honours the `filter` argument. Backends may also
     provide `async def asearch(...)` with the same signature; otherwise `search` runs in a thread.
@@ -124,7 +131,9 @@ class SearchError(RuntimeError):
     Its message is fixed ("search failed" or "count failed"), never the text of the backend's
     exception, which can name hosts, users or credentials and stays its `__cause__` for the logs:
     agent frameworks show a tool's error to the model. `InvalidQuery` from the backend is raised as
-    it is, since it says the query itself cannot be searched.
+    it is, since it says the query itself cannot be searched. A search that returns something
+    other than hits (see `SearchBackend`) fails too, with a `TypeError` that says what was wrong as
+    the cause.
     """
 
 
@@ -465,8 +474,9 @@ class PermissionedRetriever:
         """Return at most `k` hits the subject may read, best first.
 
         `query` is text, or a `Query` carrying a vector you computed. Raises `AuthorizationError`
-        when the authorizer fails or gives a malformed answer, `SearchError` when the backend's
-        search or count fails, `AuditError` when one of `required_observers` cannot record the
+        when the authorizer fails or gives a malformed answer (a filter nested more than 100 levels
+        deep included), `SearchError` when the backend's search or count fails or its search returns
+        something other than hits, `AuditError` when one of `required_observers` cannot record the
         call, and `ValueError` or `TypeError` for invalid arguments: `InvalidQuery`, a
         `ValueError`, when the query or `k` is at fault rather than the configuration. Nothing is
         returned in any of these cases.
@@ -917,6 +927,29 @@ class PermissionedRetriever:
         return self.backend, options
 
     @staticmethod
+    def _replied(reply: Any, k: int) -> list[Hit]:
+        """The first k hits of a backend's reply, each checked for what the retriever relies on.
+
+        Raises `TypeError`, which the caller raises as `SearchError`, for a reply that is not an
+        iterable of `Hit`, or a hit whose id is not a string, whose metadata is not a mapping or
+        whose score is not a number. Such a hit would otherwise fail later, outside the backend's
+        errors, as a bare `TypeError` or `AttributeError` (an id that cannot be hashed, a score
+        that cannot be sorted, metadata the filter cannot be matched against), or be returned as it
+        is. The plan reads no more than k hits of a search for k, so the rest are not checked.
+        """
+        hits = list(itertools.islice(reply, k))
+        for hit in hits:
+            if not isinstance(hit, Hit):
+                raise TypeError(f"a search returns Hit objects, not {type(hit).__name__}")
+            if not isinstance(hit.id, str):
+                raise TypeError(f"a hit's id is a string, not {type(hit.id).__name__}")
+            if not isinstance(hit.metadata, Mapping):
+                raise TypeError(f"a hit's metadata is a mapping, not {type(hit.metadata).__name__}")
+            if isinstance(hit.score, bool) or not isinstance(hit.score, numbers.Real):
+                raise TypeError(f"a hit's score is a number, not {type(hit.score).__name__}")
+        return hits
+
+    @staticmethod
     def _counted(value: Any) -> int | None:
         """A backend's count: a whole number of chunks, or None when it cannot count them."""
         if value is None:
@@ -929,7 +962,7 @@ class PermissionedRetriever:
         if isinstance(op, _Search):
             backend, options = self._target(op)
             with _backend_errors("search failed"):
-                return backend.search(op.query, op.k, op.filter, **options)
+                return self._replied(backend.search(op.query, op.k, op.filter, **options), op.k)
         if isinstance(op, _Count):
             counter: Any = self.backend
             with _backend_errors("count failed"):
@@ -959,8 +992,10 @@ class PermissionedRetriever:
             asearch = getattr(backend, "asearch", None)
             with _backend_errors("search failed"):
                 if asearch is not None:
-                    return await asearch(op.query, op.k, op.filter, **options)
-                return await asyncio.to_thread(backend.search, op.query, op.k, op.filter, **options)
+                    return self._replied(await asearch(op.query, op.k, op.filter, **options), op.k)
+                return self._replied(
+                    await asyncio.to_thread(backend.search, op.query, op.k, op.filter, **options), op.k
+                )
         if isinstance(op, _Count):
             counter: Any = self.backend
             acount = getattr(counter, "acount", None)
@@ -1000,9 +1035,50 @@ class PermissionedRetriever:
 
     @staticmethod
     def _filter(value: Any) -> Filter | None:
-        if value is None or isinstance(value, (In, And, Or)):
-            return value
-        raise AuthorizationError(f"authorizer returned {type(value).__name__}, not a filter")
+        """An authorizer's filter or scope, checked whole: None, or a tree of `In`, `And` and `Or`
+        at most 100 levels deep (as `filter_from_dict` allows), or `AuthorizationError`.
+
+        `And` and `Or` take any clause, so a clause that is not a filter would otherwise reach the
+        backend and fail there, as a `SearchError` that blames the store. A filter deep enough to
+        reach Python's recursion limit would raise `RecursionError` wherever it is matched or
+        translated, and with `recheck=False` the retriever matches it outside the backend's errors.
+        The walk uses a stack of its own, so a deep filter cannot exhaust Python's, and looks at each
+        clause object once, so a clause shared by many parents is not walked again for each.
+        """
+        if value is None:
+            return None
+        if not isinstance(value, (In, And, Or)):
+            raise AuthorizationError(f"authorizer returned {type(value).__name__}, not a filter")
+        heights: dict[int, int] = {}  # id of each clause walked -> levels from it down to its deepest In
+        walking: set[int] = set()  # clauses whose own clauses are still being walked
+        # (clause, None) is still to be walked; (clause, its clauses) is walked once those are.
+        stack: list[tuple[Any, tuple[Any, ...] | None]] = [(value, None)]
+        while stack:
+            node, below = stack.pop()
+            key = id(node)
+            if below is not None:
+                walking.discard(key)
+                heights[key] = height = 1 + max(heights[id(c)] for c in below)
+                if height > _MAX_DEPTH:
+                    raise AuthorizationError(f"authorizer returned a filter nested more than {_MAX_DEPTH} levels deep")
+                continue
+            if key in heights:
+                continue
+            if key in walking:  # a clause that holds itself, which only object.__setattr__ can make
+                raise AuthorizationError("authorizer returned a filter that holds itself")
+            if isinstance(node, In):
+                heights[key] = 1
+                continue
+            if not isinstance(node, (And, Or)):
+                raise AuthorizationError(f"authorizer returned a filter holding {type(node).__name__}, not a filter")
+            clauses = tuple(getattr(node, "clauses", ()))
+            if not clauses:  # And() and Or() refuse this: an empty And would allow everything
+                raise AuthorizationError(f"authorizer returned an {type(node).__name__} without clauses")
+            walking.add(key)
+            stack.append((node, clauses))
+            stack.extend((clause, None) for clause in clauses)
+        result: Filter = value
+        return result
 
     @staticmethod
     def _reranked(hits: list[Hit], ranked: Sequence[Hit]) -> list[Hit]:

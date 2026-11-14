@@ -15,6 +15,9 @@ matches beyond those 1,000 rows are missed, so such a search can return fewer th
 none, though more chunks match, and nothing in the result says so. Raise `max_queries`, or send
 fewer groups, to avoid it.
 
+A row whose stored metadata is not a JSON object, as one written by another tool can be, is
+returned with empty metadata: it carries no permissions, so the retriever's re-check denies it.
+
 Every write is a plain write, ordered by the client's timestamps; `set_metadata` uses no lightweight
 transaction, whose Paxos timestamps would not order with the plain writes of `add` and `delete`.
 """
@@ -250,8 +253,13 @@ class CassandraBackend:
             args = [(vector, *sorted(g), vector, fetch) for g in groups if len(g) == size]
             for result in self._run(cql, args):
                 for row in result:
-                    doc_id, text, metadata, score = (_field(row, n) for n in ("id", "text", "metadata", "score"))
-                    hit = Hit(doc_id, text or "", float(score), json.loads(metadata or "{}"))
+                    doc_id, text, stored, score = (_field(row, n) for n in ("id", "text", "metadata", "score"))
+                    try:
+                        metadata = json.loads(stored or "")
+                    except (TypeError, ValueError):
+                        metadata = None
+                    # A row without readable metadata carries no permissions: the re-check denies it.
+                    hit = Hit(doc_id, text or "", float(score), metadata if isinstance(metadata, dict) else {})
                     if doc_id not in best and (local is None or matches(local, hit.metadata)):
                         best[doc_id] = hit
         return sorted(best.values(), key=lambda h: (-h.score, h.id))[:k]

@@ -168,6 +168,39 @@ def test_partial_coverage_raises_instead_of_passing_for_complete_results(coverag
     assert [h.id for h in Fake({"root": {"coverage": full, "children": [_hit("a")]}}).backend().search("q", 3)] == ["a"]
 
 
+def test_a_document_whose_metadata_is_not_a_json_object_carries_no_permissions():
+    # As another tool could store it: JSON that is not an object, text that is not JSON, nothing.
+    odd = ["[]", '["allowed_groups"]', "1", '"x"', "true", "null", "not json", ""]
+    children = []
+    for i, stored in enumerate([*odd, None]):
+        fields = {"wardowl_id": f"d{i}", "text": "t"}
+        if stored is not None:
+            fields["wardowl_metadata"] = stored
+        children.append({"id": f"id:wardowl:wardowl::d{i}", "relevance": 0.5, "fields": fields})
+    reply = {"root": {"children": [*children, _hit("ok", {"allowed_groups": ["eng"]})]}}
+    hits = Fake(reply).backend().search("q", 20)
+    assert [h.metadata for h in hits] == [{}] * len(children) + [{"allowed_groups": ["eng"]}]
+    # Denied and counted, with or without the re-check, where it failed the whole retrieval.
+    for recheck in (True, False):
+        retriever = PermissionedRetriever(Fake(reply).backend(), MetadataACLAuthorizer(), recheck=recheck)
+        result = retriever.retrieve("q", Subject("ann", ["eng"]), k=20)
+        assert [h.id for h in result.hits] == ["ok"] and result.violations == len(children)
+
+
+def test_only_an_exact_vector_search_declares_exact_search():
+    fake = Fake({"root": {"children": [_hit("a", {"allowed_groups": ["eng"]})]}})
+    assert fake.backend(approximate=False).exact_search is True
+    assert fake.backend().exact_search is False
+    keyword = VespaBackend("http://vespa:8080", None, mode="keyword", approximate=False, client=fake.client)
+    assert keyword.exact_search is False  # BM25 ranks only documents that hold the query's words
+    # Vespa then computes the distance to every document the filter admits, so a short result is complete.
+    ann = Subject("ann", ["eng"])
+    exact = PermissionedRetriever(fake.backend(approximate=False), MetadataACLAuthorizer()).retrieve("q", ann, k=3)
+    assert [h.id for h in exact.hits] == ["a"] and exact.complete and exact.shortfall == "exhausted"
+    hnsw = PermissionedRetriever(fake.backend(), MetadataACLAuthorizer()).retrieve("q", ann, k=3)
+    assert [h.id for h in hnsw.hits] == ["a"] and not hnsw.complete and hnsw.shortfall == "unknown"
+
+
 def test_failed_writes_raise_and_settings_are_checked():
     backend = Fake(status=507).backend()
     with pytest.raises(RuntimeError, match="write failed"):

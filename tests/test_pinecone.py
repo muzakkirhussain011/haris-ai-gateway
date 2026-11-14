@@ -173,6 +173,26 @@ def test_failed_or_malformed_answers_raise(reply, status):
         Fake([reply], status).backend().search("q", 3)
 
 
+def test_a_record_whose_metadata_is_not_a_json_object_carries_no_permissions():
+    # As another tool could store it: JSON that is not an object, text that is not JSON, values of
+    # the other types Pinecone metadata holds, or nothing.
+    odd = ["[]", "1", '"x"', "null", "not json", "", 5, ["allowed_groups"], True, None]
+    matches = []
+    for i, stored in enumerate(odd):
+        meta = {"wardowl_id": f"d{i}", "wardowl_text": "t"}
+        if stored is not None:
+            meta["wardowl_metadata"] = stored
+        matches.append({"id": f"d{i}", "score": 0.5, "metadata": meta})
+    reply = {"matches": [*matches, _match("ok", {"allowed_groups": ["eng"]})]}
+    hits = Fake([reply]).backend().search("q", 20)
+    assert [h.metadata for h in hits] == [{}] * len(odd) + [{"allowed_groups": ["eng"]}]
+    # Denied and counted, with or without the re-check, where it failed the whole retrieval.
+    for recheck in (True, False):
+        retriever = PermissionedRetriever(Fake([reply]).backend(), MetadataACLAuthorizer(), recheck=recheck)
+        result = retriever.retrieve("q", Subject("ann", ["eng"]), k=20)
+        assert [h.id for h in result.hits] == ["ok"] and result.violations == len(odd)
+
+
 def test_settings_are_checked_and_clear_tolerates_an_empty_namespace():
     fake = Fake(status=404)
     fake.backend().clear()

@@ -14,8 +14,22 @@ retriever = PermissionedRetriever(backend, authorizer, redactor=SpanRedactor())
 ## Spans with their own readers
 
 `SpanRedactor` reads a list of spans from each chunk's metadata, under `redactions` by default:
-character offsets into the chunk's text, with who may read each span, in the same form as
-`MetadataACLAuthorizer`'s permissions.
+character offsets into the chunk's text, with who may read each span under the field names and
+marker `MetadataACLAuthorizer` uses by default: user ids in `allowed_users`, group names in
+`allowed_groups`, and `"*"` in `allowed_groups` for everyone. If your authorizer is configured
+with other names or another marker, give the redactor the same, or a span written in the
+authorizer's form is read with the wrong ones:
+
+```python
+from wardowl import MetadataACLAuthorizer, SpanRedactor
+
+authorizer = MetadataACLAuthorizer(users_field="readers", groups_field="teams", everyone="all")
+redactor = SpanRedactor(users_field="readers", groups_field="teams", everyone="all")
+```
+
+Unlike the authorizer, which also takes a single string where a list is expected, the redactor
+needs each of the two, where a span has it, to be a list of strings, and fails the retrieval
+otherwise (see below).
 
 ```python
 Document(
@@ -29,9 +43,11 @@ Document(
 ```
 
 An engineer retrieves `Team plan. [REDACTED] Launch in May.`; a member of HR the full text. A span is
-shown to a listed user, a member of a listed group, or everyone when `"*"` is listed. Overlapping
-spans are replaced together, and the `redactions` field is removed from the metadata returned, since
-it names who may read what. Write the spans at ingestion time, as you write the chunk's own
+shown to a listed user, a member of a listed group, or everyone when the marker (`"*"` by default)
+is listed. A group name that is empty or only whitespace, on the subject or in the span, grants
+nothing, and neither does such a marker, as with `MetadataACLAuthorizer`. Overlapping spans are
+replaced together, and the `redactions` field is removed from the metadata returned, since it names
+who may read what. Write the spans at ingestion time, as you write the chunk's own
 permissions, and update them with `set_metadata`.
 
 **A chunk without the field is hidden whole.** Its text becomes `[REDACTED]`, because a list that
@@ -58,9 +74,9 @@ again for the new text.
 
 **Malformed spans fail the retrieval.** A `redactions` field that is not a list, a span that is
 not a mapping, offsets that are not two integers with `0 <= start < end`, a `sha256` that is not a
-string, or `allowed_users` and `allowed_groups` that are not lists of strings are wrong whatever the
-text, so they point at the code that writes spans: the retrieval raises `AuthorizationError` and
-returns nothing.
+string, or `allowed_users` and `allowed_groups` (or the fields you named) that are not lists of
+strings are wrong whatever the text, so they point at the code that writes spans: the retrieval
+raises `AuthorizationError` and returns nothing.
 
 When you change a chunk's permissions with `set_metadata`, which replaces the whole metadata, pass
 its spans again along with them (see [Operations](operations.md#changing-a-documents-permissions)).

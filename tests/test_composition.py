@@ -159,6 +159,28 @@ def test_malformed_answers_from_a_part_fail_closed():
         AnyOf()
 
 
+def test_a_part_that_answers_with_something_else_than_a_filter_fails_where_it_is_combined():
+    # And() and Or() take any clause: the combined answer passed as a filter, and the store failed on
+    # it, so the retrieval raised SearchError, which blames the store.
+    bogus = FunctionAuthorizer(lambda s, h, a: [True] * len(h), filter_for=lambda s, a: "everything")
+    docs = [Document("a", "leave", {"tenant": "acme", "allowed_groups": ["*"]})]
+    for combined in (AllOf(TenantAuthorizer(), bogus), AnyOf(TenantAuthorizer(), bogus), AllOf(bogus)):
+        name = type(combined).__name__
+        with pytest.raises(AuthorizationError, match=f"an authorizer in {name} returned str, not a filter"):
+            combined.filter_for(BOB)
+        with pytest.raises(AuthorizationError, match=f"an authorizer in {name} returned str, not a filter"):
+            asyncio.run(combined.afilter_for(BOB))
+        with pytest.raises(AuthorizationError, match=f"an authorizer in {name} returned str, not a filter"):
+            combined.scope_for(BOB)
+        retriever = PermissionedRetriever(InMemoryBackend(docs), combined)
+        with pytest.raises(AuthorizationError, match="not a filter"):
+            retriever.retrieve("leave", BOB)
+        with pytest.raises(AuthorizationError, match="not a filter"):
+            asyncio.run(retriever.aretrieve("leave", BOB))
+    # A part without a filter still leaves the whole without one, and the bogus answer unused.
+    assert AllOf(bogus, Asked(lambda h: True)).filter_for(BOB) is None
+
+
 def test_async_gives_the_same_answers():
     docs = [Document(f"d{i}", "leave", {"tenant": TENANTS[i % 2], "allowed_groups": ["*"]}) for i in range(8)]
     for authz in (

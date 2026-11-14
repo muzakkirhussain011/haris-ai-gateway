@@ -6,6 +6,96 @@ All notable changes are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `VespaBackend` declares `exact_search` when it searches vectors with `approximate=False`, and
+  only then: in keyword mode, and with the default `approximate=True`, it still does not. Vespa's
+  exact nearest-neighbor search computes the distance to every document that matches the query's
+  other conditions, the permission filter among them, so a pre-filtered result with fewer than k
+  hits now reports `complete=True` and `shortfall="exhausted"`, and post-filtering that runs out of
+  candidates inside a scope reports `complete=True`, where both reported `complete=False`; under
+  `short_results="exact"` or `"widen"`, `fallback` is None where it was `"unsupported"`. That is what
+  the fields mean ("False when wardowl knows results may be missing"); the searches and the hits are
+  the same. The conformance kit already checked this configuration as exact against a real Vespa in
+  CI. A query for more hits than the query profile's `maxHits` gets an error from Vespa's search
+  handler rather than fewer hits (read in Vespa's source, not run), and the backend raises it, so a
+  short result is not a cut one.
+
+### Added
+
+- `SpanRedactor(users_field=..., groups_field=..., everyone=...)`, the field names and the
+  everyone marker of a span's readers, as `MetadataACLAuthorizer` takes them. The redactor read
+  `allowed_users`, `allowed_groups` and `"*"` whatever the authorizer was given, so under an
+  authorizer with another marker, a span whose readers were written in the authorizer's form, with
+  `"*"` meaning a group of that name, was shown to everyone. The defaults are the names and marker
+  it read before, so nothing changes without the new arguments.
+
+### Fixed
+
+- An authorizer's filter or scope nested more than 100 levels deep raises `AuthorizationError`
+  ("authorizer returned a filter nested more than 100 levels deep") before anything is searched,
+  as `filter_from_dict` already refused such a document. With `recheck=False`, and a backend whose
+  search does not recurse into the filter, one deep enough to reach Python's recursion limit made
+  `retrieve` raise a bare `RecursionError`, which its docstring does not list; with the built-in
+  backends, whose translation or matching recurses, it was raised inside the search, as
+  `SearchError`. A filter between 101 levels and that limit was searched, and is refused now.
+  `MetadataACLAuthorizer`, `TenantAuthorizer`, `OpenFGAAuthorizer` and `SpiceDBAuthorizer` build
+  filters one or two levels deep, `AllOf` and `AnyOf` add one level, and OPA's answers are parsed
+  with the same bound, so a filter that deep comes from a Cerbos plan nested that far, an
+  authorizer of your own, or combinations around an answer already near the bound. The retriever
+  walks the filter with a stack of its own, so the check cannot exhaust Python's, and looks at each
+  clause object once, so a clause shared by many parents costs one visit. The threat model's T14
+  said "Filters nest at most 100 deep", which held only for parsed filters until now.
+- A filter that holds something other than `In`, `And` and `Or` anywhere in it fails as the
+  authorizer's fault. `And` and `Or` take any clause, and the retriever checked only the top of the
+  answer, so `Or(In(...), "everything")`, or such an answer from one part of `AllOf` or `AnyOf`,
+  which wrapped each part's answer as it came, reached the backend, whose translation failed on it:
+  the retrieval raised `SearchError`, which blames the store. The retriever now checks the whole
+  tree and raises `AuthorizationError`, as for an answer that is not a filter at all, and so it does
+  for an `And` or `Or` without clauses or a filter that holds itself, which only `object.__setattr__`
+  can make. `AllOf` and `AnyOf` raise it themselves ("an authorizer in AllOf returned str, not a
+  filter") when they join the parts' filters or scopes, so code that calls their `filter_for` or
+  `scope_for` gets it too. A part with no filter still leaves `AllOf.filter_for` without one, as
+  before, whatever the other parts answered.
+- A backend whose search returns something other than hits fails the retrieval with
+  `SearchError("search failed")`, its `__cause__` a `TypeError` that names what was wrong, as when
+  the search raises. The retriever reads at most k hits of the reply, and each must be a `Hit` whose
+  id is a string, whose metadata is a mapping and whose score is a number (any `numbers.Real` but a
+  bool). Such hits failed later, outside the backend's errors: an id that cannot be hashed raised
+  `TypeError` when post-filtering, a score of None `TypeError` when sorted, metadata of None
+  `AttributeError` with `recheck=False` or `AuthorizationError` from the authorizer, and on some paths
+  a hit with such an id or score was returned as it was. A backend of your own that returns ids of
+  another type, such as integers, or scores of another type, now fails the same way: return the
+  types `Hit` declares.
+- `VespaBackend`, `PineconeBackend` and `CassandraBackend` return a stored record whose metadata
+  is not a JSON object (an array, a string, a number, `true` or `null`, or text that is not JSON)
+  with empty metadata, as the other backends do. One such record, which a tool other than wardowl
+  could write, failed every retrieval whose search reached it: `AuthorizationError` with the
+  re-check, a bare `AttributeError` with `recheck=False`, and `SearchError` for text that is not
+  JSON. With empty metadata it carries no permissions: the re-check, or the local match with
+  `recheck=False`, denies it, and a pre-filtered one is counted in `violations`; a filter that
+  `CassandraBackend` applies itself, past `max_queries`, leaves it out. `PgVectorBackend` does the
+  same for a `jsonb` value that is not an object, which reached the retrieval under post-filtering
+  without a scope and failed it with `AuthorizationError`. A pre-filtered search does not return
+  such a row, since PostgreSQL's `@>` and `->` find no object key in it (from PostgreSQL's
+  documentation; not run).
+- `MetadataACLAuthorizer` ignores group names that are empty or only whitespace, on the subject and
+  as its `everyone` marker. `Subject` accepts them, as identity providers can send them, and the
+  sync layer refuses only the empty name; a subject with `""` among its groups could read a chunk
+  whose `allowed_groups` listed `""`, and with `everyone=""` such a chunk was readable by every
+  subject. Since the filter no longer holds such names, a chunk's blank names grant nothing either,
+  a group name of only spaces that the sync layer wrote included. `SpanRedactor` reads a span's
+  readers the same way. This only removes access through names that name no group; `Subject` still
+  accepts them, and every other name is matched as before.
+
+### Documentation
+
+- Redaction said a span gives its readers "in the same form as `MetadataACLAuthorizer`'s
+  permissions", which held only for the authorizer's default field names and marker, and the
+  redactor needs lists where the authorizer also takes a single string. The page now names the
+  fields and the marker, shows how to give the redactor the authorizer's own, and says how the two
+  differ. The threat model's T14 says where the 100-level bound is enforced.
+
 ## [3.0.0] - 2026-11-14
 
 A major release, because several fixes change documented behaviour that 2.1 code may rely on: a
