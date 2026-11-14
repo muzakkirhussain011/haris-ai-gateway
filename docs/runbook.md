@@ -24,8 +24,11 @@ steps, containment first. [What to alert on](operations.md#what-to-alert-on) lis
 1. Remove the access at its source: in the permission service, or on the chunks with
    `set_metadata` ([Changing a document's permissions](operations.md#changing-a-documents-permissions)).
 2. Call `authorizer.invalidate(user_id)` on the `CachingAuthorizer`, or `invalidate()` for every
-   subject if you cannot tell who else is affected. With a shared cache, no retrieval that starts in
-   the calling process afterwards uses the old decision, and other replicas stop within `local_ttl`.
+   subject if you cannot tell who else is affected (from async code, `await` `ainvalidate` with the
+   same argument). With a shared cache, no retrieval that starts in the calling process afterwards
+   uses the old decision, and other replicas stop within `local_ttl`. `invalidate()` for every
+   subject scans the whole Redis database, about one round trip per 1,000 keys in it, while the
+   calling thread waits.
 3. Keep the audit events and request logs for the period, before any retention job removes them.
 
 **Find out what happened.** Look up the events whose `subject_id` is that user and whose
