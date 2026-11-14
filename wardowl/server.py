@@ -42,6 +42,7 @@ How it holds:
 
 import asyncio
 import contextlib
+import datetime
 import http.client
 import inspect
 import logging
@@ -154,6 +155,12 @@ class OIDCAuthenticator:
             raise ValueError("algorithms must be asymmetric, such as RS256 or ES256")
         if not (timeout > 0 and cooldown > 0 and lifespan >= cooldown):
             raise ValueError("timeout and cooldown must be positive, and lifespan at least cooldown")
+        if isinstance(leeway, datetime.timedelta):  # PyJWT takes either
+            leeway = leeway.total_seconds()
+        # NaN makes every one of PyJWT's time comparisons false, so expired tokens would verify;
+        # an infinite leeway turns the expiry check off. Neither is a clock-skew allowance.
+        if not math.isfinite(leeway):
+            raise ValueError("leeway must be a finite number of seconds")
         self.issuer = issuer
         self.audience = audience
         self.algorithms = list(algorithms)

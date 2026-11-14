@@ -2,7 +2,9 @@
 
 import asyncio
 import base64
+import datetime
 import logging
+import math
 import ssl
 import threading
 import time
@@ -590,6 +592,20 @@ def test_the_leeway_applies_to_the_expiry_too():
     with pytest.raises(InvalidToken):
         oidc(leeway=10)(expired)
     assert oidc(leeway=60)(expired) == Subject("ann", ["eng"])
+
+
+@pytest.mark.parametrize("leeway", [math.nan, math.inf, -math.inf])
+def test_a_leeway_that_is_not_finite_is_refused(leeway):
+    # NaN would make PyJWT's expiry comparison false, so an expired token would verify.
+    with pytest.raises(ValueError, match="leeway"):
+        oidc(leeway=leeway)
+
+
+def test_the_leeway_may_be_a_timedelta_as_pyjwt_allows():
+    expired = token(exp=int(time.time()) - 30)
+    assert oidc(leeway=datetime.timedelta(minutes=1))(expired) == Subject("ann", ["eng"])
+    with pytest.raises(InvalidToken):
+        oidc(leeway=datetime.timedelta(seconds=10))(expired)
 
 
 def wardowl_records(caplog):

@@ -24,6 +24,12 @@ All notable changes are recorded here. The format follows
   not told why. Every PyJWT error became `InvalidToken` and a 401 with no reason recorded anywhere
   (M20). `create_app` still logs nothing for a 401 from an authenticator of your own.
 
+### Fixed
+
+- `OIDCAuthenticator` refuses a `leeway` that is not a finite number with `ValueError`. With NaN,
+  every one of PyJWT's time comparisons is false, so an expired token verified; an infinite leeway
+  turned the expiry check off. A `datetime.timedelta`, which PyJWT also takes, is still accepted.
+
 ### Documentation
 
 - The HTTP service page and the `OIDCAuthenticator` docstring say that `exp`, and `nbf` and `iat`
