@@ -99,7 +99,7 @@ modules and need their extra.
    :members: scope_for
 
 .. autoclass:: wardowl.CachingAuthorizer
-   :members: invalidate, stats, max_staleness
+   :members: invalidate, ainvalidate, stats, max_staleness
 
 .. autoclass:: wardowl.caching.CacheStats
    :members:
@@ -108,6 +108,7 @@ modules and need their extra.
    :members: get_many, set_many, delete_prefix
 
 .. autoclass:: wardowl.caching.RedisCache
+   :members: set_many_indexed, delete_indexed, delete_prefix
 
 .. autoclass:: wardowl.authorizers.opa.OPAAuthorizer
 

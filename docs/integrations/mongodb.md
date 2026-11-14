@@ -92,7 +92,16 @@ look misses. It does not run two writers at once.
   Vector Search returns at most 10,000 chunks, so a vector search with `k` above that raises
   `ValueError` rather than return 10,000 as if no more matched.
 - **`exact=True`** compares the query with every chunk that passes the filter instead: exact
-  results, at a higher cost on large collections.
+  results, at a higher cost on large collections. `$vectorSearch` then runs an ENN search, which,
+  MongoDB documents, "exhaustively searches all the indexed vector embeddings"
+  ([`$vectorSearch`](https://www.mongodb.com/docs/atlas/atlas-vector-search/vector-search-stage/)),
+  with the permission filter as its pre-filter. So a vector backend with `exact=True` declares
+  `exact_search`, and the retriever reports a result shorter than k as complete
+  (`shortfall="exhausted"`) instead of `complete=False`. Only what the index holds counts: a chunk
+  written with `wait=False`, or by another tool, can be missing from a search made just after it
+  ([above](#writes-become-searchable-shortly-after)), and a chunk without a vector is never in the
+  vector index. CI runs the conformance kit, which checks a backend that declares `exact_search` as
+  exact, against Atlas Local with `exact=True`.
 - For a native `aretrieve`, pass `async_collection=` the same collection from an
   `AsyncMongoClient`; otherwise async calls run in a thread.
 

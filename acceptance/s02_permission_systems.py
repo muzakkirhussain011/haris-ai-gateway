@@ -75,8 +75,10 @@ from enterprise import (
     Spec,
     can_read,
     corpus,
+    declares_exact,
     env,
     expected_ids,
+    result_problem,
 )
 from psycopg import sql
 from psycopg_pool import ConnectionPool
@@ -402,8 +404,12 @@ def retrieve_all(
     authorizer: Any,
     strategy: Strategy,
     observers: Sequence[Callable[[RetrievalEvent], None]] = (),
+    *,
+    exact: bool,
 ) -> None:
-    """Every persona asks every question; nothing leaks, nothing unreadable comes back, nothing is missed."""
+    """Every persona asks every question; nothing leaks, nothing unreadable comes back, nothing is missed.
+    `exact` says whether the backend declares exact_search, as FAISS's flat index does and pgvector
+    does not (docs/concepts.md)."""
     retriever = PermissionedRetriever(backend, authorizer, strategy=strategy, observers=observers)
     unreadable: list[str] = []
     missing: list[str] = []
@@ -416,11 +422,12 @@ def retrieve_all(
             texts += [h.text for h in result.hits]
             unreadable += [f"{persona.id} got {d}" for d in ids if not can_read(persona, company.spec[d])]
             missing += [f"{persona.id} missed {d}" for d in sorted(company.required(persona, index) - set(ids))]
-            if result.strategy != strategy or result.violations or not result.complete:
-                odd.append(
-                    f"{persona.id}, question {index + 1}: {result.strategy}, "
-                    f"{result.violations} violations, complete={result.complete}"
-                )
+            # docs/concepts.md, "What a result tells you": mallory's empty results are complete from
+            # an exact store; from pgvector, an approximate one, they say complete=False and, pre-filtered
+            # under the default short_results="report", shortfall="unknown".
+            problem = result_problem(result, K, strategy, exact=exact)
+            if problem:
+                odd.append(f"{persona.id}, question {index + 1}: {problem}")
         report.no_leaks(
             f"{label}: no canary {persona.id} may not read reaches {persona.id}", persona, texts, company.specs
         )
@@ -432,7 +439,9 @@ def retrieve_all(
         not missing,
         f"{len(missing)}: {missing[:6]}",
     )
-    report.check(f"{label}: ran as {strategy}, complete, with no violations", not odd, f"{len(odd)}: {odd[:4]}")
+    # On an exact store every result is complete, as before 3.0, so the check keeps its name there.
+    complete = "complete" if exact else "complete unless an approximate filtered search came back short"
+    report.check(f"{label}: ran as {strategy}, {complete}, with no violations", not odd, f"{len(odd)}: {odd[:4]}")
 
 
 def step_retrieval(report: Report, company: Company, w: Wiring) -> None:
@@ -443,7 +452,8 @@ def step_retrieval(report: Report, company: Company, w: Wiring) -> None:
             authorizer.filter_for(ALICE.subject) is None,
         )
     for strategy in w.strategies:
-        retrieve_all(report, company, f"{w.name} ({strategy})", w.backend, authorizer, strategy)
+        # Every wiring but OpenFGA over pgvector searches Company.backend, FAISS's flat index.
+        retrieve_all(report, company, f"{w.name} ({strategy})", w.backend, authorizer, strategy, exact=True)
 
 
 def step_revocation(report: Report, company: Company, w: Wiring) -> None:
@@ -928,7 +938,13 @@ def openfga_on_pgvector(report: Report, company: Company, services: Services) ->
     def retrieval(backend: PgVectorBackend) -> None:
         events: list[RetrievalEvent] = []
         label = "OpenFGA over pgvector (prefilter)"
-        retrieve_all(report, company, label, backend, store.authorizer(), "prefilter", [events.append])
+        # PgVectorBackend does not declare exact_search (docs/concepts.md); its HNSW index is approximate.
+        retrieve_all(report, company, label, backend, store.authorizer(), "prefilter", [events.append], exact=False)
+        report.check(
+            "OpenFGA over pgvector: the backend does not declare exact_search, as docs/concepts.md says",
+            not declares_exact(backend),
+            f"exact_search is {getattr(backend, 'exact_search', None)!r}",
+        )
         odd = [e for e in events if e.searches != 1 or e.strategy != "prefilter"]
         report.check(
             "OpenFGA over pgvector: each retrieval was one SQL search, with the permission filter inside it",
@@ -1027,6 +1043,11 @@ class SpiceDB:
             group_subjects=False,  # memberships live in SpiceDB
             consistency=consistency,
             circuit_breaker=breaker,
+            # CHANGELOG 3.0.0: without it, filter_for gives no filter when LookupResources finds no
+            # document, and strategy="prefilter" then raises ValueError for a subject who may read
+            # nothing (mallory, and odd ids such as "Carol"). A team that pre-filters with SpiceDB
+            # passes it, as this wiring does; the trade-off is in docs/integrations/spicedb.md.
+            trust_empty_lookup=True,
         )
 
     def strict(self, url: str | None = None, breaker: CircuitBreaker | None = None) -> SpiceDBAuthorizer:
@@ -1060,9 +1081,20 @@ def spicedb(report: Report, company: Company, services: Services) -> None:
         hits = [company.hit(d) for d in company.msa]
         stated = float(getattr(lagging, "max_staleness", SPICEDB_QUANTIZATION))
         bound = stated + SLACK
+
+        def carol_reads() -> bool:
+            # A minimizeLatency check answers at a quantized revision, which can still predate the
+            # schema this run wrote seconds ago: SpiceDB then refuses ("object definition ... not
+            # found"), as the Nov 2 run did 4.1 s after the write. That is SpiceDB's documented
+            # staleness, not a failure, so it counts as "not yet" until the bound.
+            try:
+                return all(lagging.check(CAROL.subject, hits))
+            except AuthorizationError:
+                return False
+
         report.check(
             "SpiceDB (default consistency): carol reads the MSA renewals before the revocation",
-            wait_until(lambda: all(lagging.check(CAROL.subject, hits)), bound),
+            wait_until(carol_reads, bound),
         )
         db.write("OPERATION_DELETE", db.carol)
         revoked = time.monotonic()
@@ -1352,6 +1384,11 @@ def main() -> None:
     report.note(f"{len(company.docs)} documents embedded with {MODEL}; {required} must-return hits per strategy")
     report.check("the scenario's own expectations are not empty", required > 0, "no document is required anywhere")
     report.check("the docker CLI is on PATH, to stop and start the services", shutil.which("docker") is not None)
+    # The completeness checks take every wiring's store to prove short results complete.
+    report.check(
+        "the store, FAISS's flat index, declares exact_search, as docs/concepts.md says",
+        declares_exact(company.backend()),
+    )
     for system in (
         baseline,
         function_rule,

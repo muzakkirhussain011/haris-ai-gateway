@@ -18,7 +18,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from wardowl.backends._engines import TERMS_FIELD, EngineBackend, filter_to_query, mappings, terms
+from wardowl.backends._engines import TERMS_FIELD, EngineBackend, check_layout, filter_to_query, mappings, terms
 
 __all__ = ["TERMS_FIELD", "OpenSearchBackend", "create_index", "filter_to_query", "permission_terms"]
 
@@ -44,10 +44,15 @@ def create_index(
 
     `engine` is `"lucene"` (the default) or `"faiss"`; both apply filters during the search.
     `parameters` are the HNSW method parameters, for example `{"m": 16, "ef_construction": 128}`.
+
+    An existing index is left as it is, after one check: if its mapping is needtoknow 1.x's
+    (`needtoknow_terms` mapped, `wardowl_terms` not), which no filtered search can match, it raises
+    `ValueError`. Write such an index's chunks into a new one.
     """
     if not isinstance(dim, int) or dim < 1:
         raise ValueError("dim must be a positive integer")
     if client.indices.exists(index=index):
+        check_layout(client, index, "OpenSearch")
         return
     method: dict[str, Any] = {"name": "hnsw", "engine": engine, "space_type": "cosinesimil"}
     if parameters is not None:

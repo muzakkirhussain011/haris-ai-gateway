@@ -60,7 +60,7 @@ Content-Type: application/json
 | Status | When |
 |---|---|
 | 200 | The hits the caller may read, best first, and whether the result is `complete` |
-| 401 | No bearer token, or one that fails verification |
+| 401 | No bearer token, or one that fails verification. The answer is the same whatever the reason; `OIDCAuthenticator` logs the check that failed ([Why a token was refused](#why-a-token-was-refused)) |
 | 413 | A body over `max_body_bytes` |
 | 422 | A malformed body, including one with a field the API does not define, or a value over its limit. Also a well-formed query the service cannot search as sent (`InvalidQuery`): `k` over the retriever's `max_candidates`, only a vector for a keyword backend, only text for a backend without an embed function, or a vector of the wrong length where the backend checks it (`FaissBackend`). The answer echoes nothing from the request or the backend |
 | 500 | A fault on the server's side, such as a misconfigured backend or reranker. Nothing is returned, and the error goes to the server's log |
@@ -78,10 +78,12 @@ any field the API does not define is refused, which is the same rule the
 
 `OIDCAuthenticator` verifies JWT access tokens against your identity provider's published keys:
 the signature (RS256 or ES256 by default; shared-secret algorithms are refused), the issuer, the
-audience and the expiry. The token must name its key (`kid`), and is verified with that key's own
-algorithm, which must be one of `algorithms`; the algorithm in the token's header does not choose
-it. The subject is the `sub` claim, its groups the `groups` claim (`groups_claim` renames it), and
-its tenant the claim named by `tenant_claim`.
+audience, and the token's times: `exp`, and `nbf` and `iat` when the token has them
+([Clock skew and leeway](#clock-skew-and-leeway)). The token must name its key (`kid`), and is
+verified with that key's own algorithm, which must be one of `algorithms`; the algorithm in the
+token's header does not choose it. The subject is the `sub` claim, its groups the `groups` claim
+(`groups_claim` renames it; see [Tokens without groups](#tokens-without-groups)), and its tenant
+the claim named by `tenant_claim`, which every token must then carry.
 
 The published keys are fetched with a 5-second `timeout` and kept for `lifespan` (300 seconds), so
 a key your provider rotates out stops verifying within that time. A token naming a key that is not
@@ -125,6 +127,90 @@ async def authenticate(token: str) -> Subject:
 
 app = create_app(retriever, authenticate)
 ```
+
+### Clock skew and leeway
+
+The token's times are checked against the service's own clock. `exp` (expiry) must be in the
+future; `nbf` (not before) and `iat` (issued at), when the token has them, must not be. `leeway`
+(seconds, 0 by default) widens all three checks: a token is accepted up to `leeway` seconds after
+its `exp`, and up to `leeway` seconds before its `nbf` or `iat`.
+
+With the default, a provider whose clock runs ahead of the service's issues tokens that the service
+refuses until its own clock catches up. With the provider's clock one second ahead, a token used
+within a second of being issued answers 401, and the same token works a moment later: the 401s
+come and go, and the response does not say why ([Why a token was refused](#why-a-token-was-refused)
+shows where to look). Keep both clocks synchronized, with NTP for example, and where they can
+drift apart, allow a few seconds:
+
+```python
+authenticate = OIDCAuthenticator(
+    issuer="https://login.example.com/",
+    audience="knowledge-api",
+    jwks_url="https://login.example.com/.well-known/jwks.json",
+    leeway=5,  # seconds, for exp, nbf and iat alike
+)
+```
+
+The cost is the same leeway on the expiry: an expired token is still accepted for those 5 seconds.
+That is why the default stays 0: a non-zero default would let every token outlive its `exp`, and a
+minor release never weakens a default that keeps a protection on ([support policy](../support.md)).
+
+### Tokens without groups
+
+A token without the groups claim gives a subject with no groups. With an authorizer that decides by
+the subject's groups, such as `MetadataACLAuthorizer`, the user then loses every access that came
+through a group. That is right for a provider that sends no groups, and wrong when the claim went
+missing: a group mapper removed from the client, or a provider that leaves a long group list out of
+the token. Microsoft Entra ID, for one, leaves the `groups` claim out of a JWT for a user in more
+than 200 groups and sends an overage claim instead
+([access token claims](https://learn.microsoft.com/entra/identity-platform/access-token-claims-reference#payload-claims)).
+The request then answers 200 with fewer hits, and nothing fails. `OIDCAuthenticator` logs each such
+token at DEBUG on the `wardowl` logger:
+
+```text
+wardowl found no groups claim in a token; its subject has no groups
+```
+
+To refuse those tokens instead, pass `require_groups=True`: a token without the claim then answers
+401, logged as `MissingRequiredClaimError (groups)`. An empty list is a claim, and passes: it says
+the user is in no groups. Before you turn it on, check what your provider sends for a user in no
+groups: if it leaves the claim out for them, `require_groups` refuses those users. A claim that is
+not a list of strings, `null` included, is refused either way.
+
+### Why a token was refused
+
+A refused token answers 401 with the same body whatever the reason, so the caller learns nothing
+about which check failed. `OIDCAuthenticator` logs the check at INFO on the `wardowl` logger, one
+line per refused token, with nothing from the token itself: not the token, its signature, or the
+values of its claims.
+
+```text
+wardowl refused a token: ImmatureSignatureError
+wardowl refused a token: ExpiredSignatureError
+wardowl refused a token: MissingRequiredClaimError (tid)
+wardowl refused a token: no key published by the identity provider matches the token's kid
+```
+
+A check PyJWT made is named by its exception's class: `ImmatureSignatureError` for an `nbf` or
+`iat` later than the service's clock plus `leeway`, which is what a provider's clock running ahead
+looks like; `ExpiredSignatureError`; `InvalidAudienceError`; `InvalidIssuerError`;
+`InvalidSignatureError`; `MissingRequiredClaimError` with the claim's name; and `DecodeError` for
+a token that is not a JWT. wardowl's own checks (the key id, the key's algorithm, `sub`, and the
+groups and tenant claims) are described in words.
+
+Unless your logging configuration says otherwise, Python shows only warnings and errors, so these
+lines do not appear by default. To see them without turning on INFO for every library:
+
+```python
+import logging
+
+logging.basicConfig()  # a handler on the root logger, if your application sets none up
+logging.getLogger("wardowl").setLevel(logging.INFO)  # DEBUG adds the tokens without groups
+```
+
+A line is written for every refused request, made-up tokens included. `create_app` itself logs
+nothing for a 401, so an authenticator of your own that raises `InvalidToken` logs its reasons only
+if it does so itself.
 
 ### Mapping a real provider's tokens
 

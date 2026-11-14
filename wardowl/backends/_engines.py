@@ -23,6 +23,7 @@ from wardowl.filters import And, Filter, In, Or, _is_value, _ordered
 from wardowl.types import Document, Hit, Query
 
 TERMS_FIELD = "wardowl_terms"
+_LEGACY_TERMS_FIELD = "needtoknow_terms"  # the terms field of indexes needtoknow 1.x created
 _SEP = "\x1f"  # the ASCII unit separator: field names may not contain it
 _LISTS = (list, tuple, set, frozenset)
 _DIGEST = f"{_SEP}sha256:"
@@ -263,6 +264,28 @@ def _raise_for_items(response: Any, *, allow_not_found: bool) -> None:
         status = result.get("status", 0)
         if status >= 300 and not (allow_not_found and status == 404):
             raise RuntimeError(f"bulk request failed for {result.get('_id')!r}: {result.get('error')}")
+
+
+def check_layout(client: Any, index: str, engine: str) -> None:
+    """Raise `ValueError` if an existing index was created by needtoknow 1.x.
+
+    Such an index maps `needtoknow_terms` and not `wardowl_terms`. Its mapping, like wardowl's, has
+    `dynamic: false`, under which a field the mapping lacks is kept in `_source` but never indexed,
+    so a filter on `wardowl_terms` would match no document, whoever wrote it. Reads the mapping of
+    each index the name resolves to (an alias can name several); writes nothing.
+    """
+    answer = client.indices.get_mapping(index=index)
+    body = getattr(answer, "body", answer)  # the Elasticsearch client wraps the JSON in a response object
+    for name, entry in body.items():
+        properties = ((entry or {}).get("mappings") or {}).get("properties") or {}
+        if _LEGACY_TERMS_FIELD in properties and TERMS_FIELD not in properties:
+            raise ValueError(
+                f"{engine} index {name!r} was created by needtoknow 1.x: it maps {_LEGACY_TERMS_FIELD!r} "
+                f"and not {TERMS_FIELD!r}, so a filtered search would match no document. Write the chunks "
+                "into a new index with wardowl, switch to it, then drop this one, as the upgrading guide "
+                "says (From needtoknow 1.x to wardowl 2.0, step 2: "
+                "https://muzakkirhussain011.github.io/wardowl/upgrading.html)"
+            )
 
 
 def mappings(vector: dict[str, Any], vector_field: str, content_field: str, metadata_field: str) -> dict[str, Any]:

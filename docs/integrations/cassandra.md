@@ -44,7 +44,10 @@ The vector index is approximate, so a search can now and then return fewer than 
 match. The filter is exact: no hit is ever a chunk the filter excludes.
 
 `max_queries` (256 by default) bounds how many ANN queries one search sends; ANDs that another AND
-implies are dropped first.
+implies are dropped first. It does not bound the work of rewriting the filter: the backend builds
+one set of terms per value of each `In`, and sorts them, before it can tell that the filter needs
+more queries than that, so a subject in 40,000 groups costs 40,000 sets on every search, whatever
+`max_queries` is.
 
 ### Filters that need more than `max_queries` queries
 

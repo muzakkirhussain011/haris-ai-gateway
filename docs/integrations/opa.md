@@ -66,6 +66,17 @@ that shape differently. Every chunk must then store each field in the shape the 
 list for `allowed_groups`, one string for a document id); keep `recheck=True`, the default, unless
 that holds for every chunk.
 
+## Tenants
+
+The policy above has no tenant: a group name that two tenants both use, such as `hr`, is one group
+to it. With several tenants in one store, add the tenant check,
+`AllOf(TenantAuthorizer(), OPAAuthorizer(...))`, which denies another tenant's chunks before OPA is
+asked, and puts the tenant in the search's filter whether or not OPA returns one
+([Combining](../combining.md#tenant-isolation)). A policy can also compare the tenant itself, as the
+acceptance suite's
+[`documents.rego`](https://github.com/muzakkirhussain011/wardowl/blob/main/acceptance/policies/opa/documents.rego)
+does with `entry.tenant == input.subject.attributes.tenant`.
+
 ## Failing closed
 
 Every failure raises `AuthorizationError`: an unreachable server, a timeout, a non-200 response,

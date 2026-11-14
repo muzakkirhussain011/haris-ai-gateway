@@ -22,6 +22,11 @@ either would address a list key or the JSON copy rather than a field. Values oth
 and integers (booleans, floats, nested objects) are kept in the JSON copy only, which matches the
 reference semantics: no filter ever matches them.
 
+A record without that copy, or whose copy is not JSON text for an object, carries no permissions,
+so the re-check denies it. needtoknow 1.x kept the copy under `needtoknow_metadata`: a search that
+returns a record holding that key and no `wardowl_metadata` raises `ValueError`, naming the upgrade
+step, instead of denying every such record.
+
 How large a filter Chroma is sent, and why
 ------------------------------------------
 Chroma 1.5 turns a `where` into one SQLite statement. Each `$and` and `$or` becomes a chain of
@@ -54,6 +59,8 @@ Embed = Callable[[str], Sequence[float]]
 
 JSON_KEY = "wardowl_metadata"
 """Reserved field holding the exact JSON copy of a chunk's metadata."""
+
+_LEGACY_JSON_KEY = "needtoknow_metadata"  # where needtoknow 1.x kept the JSON copy
 
 _SEP = "::"
 _LISTS = (list, tuple, set, frozenset)
@@ -263,10 +270,20 @@ def _encode_metadata(doc_id: str, metadata: Mapping[str, Any]) -> dict[str, Any]
 
 def _decode_metadata(stored: Mapping[str, Any] | None) -> dict[str, Any]:
     # Records written by something other than wardowl have no trusted copy: treat them as
-    # carrying no permissions, so the re-check denies them.
+    # carrying no permissions, so the re-check denies them. So does a copy that is not a JSON object.
+    if stored and JSON_KEY not in stored and isinstance(stored.get(_LEGACY_JSON_KEY), str):
+        raise ValueError(
+            f"Chroma record written by needtoknow 1.x (it holds {_LEGACY_JSON_KEY!r} and no {JSON_KEY!r}), "
+            "whose permissions wardowl cannot read: write the chunks into a new collection with wardowl, "
+            "switch to it, then drop this one, as the upgrading guide says (From needtoknow 1.x to "
+            "wardowl 2.0, step 2: https://muzakkirhussain011.github.io/wardowl/upgrading.html)"
+        )
     if not stored or not isinstance(stored.get(JSON_KEY), str):
         return {}
-    metadata = json.loads(stored[JSON_KEY])
+    try:
+        metadata = json.loads(stored[JSON_KEY])
+    except ValueError:
+        return {}
     return metadata if isinstance(metadata, dict) else {}
 
 
