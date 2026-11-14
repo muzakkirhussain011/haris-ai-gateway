@@ -4,7 +4,10 @@ import asyncio
 import copy
 import json
 import pickle
+import warnings
 from fractions import Fraction
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -667,7 +670,7 @@ READABLE = {"allowed_groups": ["*"]}
     "reply",
     [
         [Hit(["handbook"], "leave", 1.0, READABLE)],  # an id that cannot be hashed
-        [Hit(7, "leave", 1.0, READABLE)],
+        [SimpleNamespace(id="handbook", score=1.0, metadata=READABLE)],  # no text
         [Hit("handbook", "leave", None, READABLE)],  # passed the check and was returned as it was
         [Hit("handbook", "leave", "high", READABLE), Hit("salaries", "leave", 0.5, READABLE)],
         [Hit("handbook", "leave", True, READABLE)],
@@ -692,6 +695,59 @@ def test_a_reply_that_is_not_hits_fails_as_the_stores_fault(reply, store, strate
         asyncio.run(retriever.aretrieve("leave", BOB))
     assert isinstance(failure.value.__cause__, TypeError)
     assert [(e.error, e.cause, e.returned_ids) for e in events] == [("SearchError", "TypeError", ())] * 2
+
+
+class _Duck:
+    """A hit of another class, with a hit's fields, as a backend of your own might return."""
+
+    def __init__(self, doc_id, text, score, metadata):
+        self.id, self.text, self.score, self.metadata = doc_id, text, score, metadata
+
+
+@pytest.mark.parametrize(
+    ("reply", "message"),
+    [
+        ([Hit(7, "leave policy", 1.0, READABLE)], "a hit whose id is of type int"),
+        ([_Duck("handbook", "leave policy", 1.0, READABLE)], "an object of type _Duck, not a Hit"),
+    ],
+)
+def test_a_hit_that_works_but_breaks_the_hit_type_is_used_with_a_deprecation_warning(reply, message):
+    # Such hits went through retrieve in 3.0.0: a minor release keeps them working, and warns.
+    retriever = PermissionedRetriever(_Replies(reply), MetadataACLAuthorizer())
+    with pytest.warns(DeprecationWarning, match=f"{message}; wardowl 4.0 will refuse it with SearchError") as caught:
+        result = retriever.retrieve("leave", BOB)
+    assert result.hits == reply
+    assert [Path(w.filename).name for w in caught if "wardowl 4.0" in str(w.message)] == [Path(__file__).name]
+    with warnings.catch_warnings(record=True) as again:
+        warnings.simplefilter("always")
+        assert retriever.retrieve("leave", BOB).hits == reply
+        assert asyncio.run(retriever.aretrieve("leave", BOB)).hits == reply
+    assert not [w for w in again if "wardowl 4.0" in str(w.message)]  # once per retriever
+
+    async def awaited():
+        return await PermissionedRetriever(_AsyncReplies(reply), MetadataACLAuthorizer()).aretrieve("leave", BOB)
+
+    with pytest.warns(DeprecationWarning, match=message) as caught:
+        assert asyncio.run(awaited()).hits == reply
+    assert [Path(w.filename).name for w in caught if "wardowl 4.0" in str(w.message)] == [Path(__file__).name]
+
+
+@pytest.mark.parametrize(
+    ("reply", "options"),
+    [
+        ([Hit(7, "leave policy", 1.0, READABLE)], {"reranker": lambda query, hits: hits}),
+        ([_Duck("handbook", "leave policy", 1.0, READABLE)], {"redactor": lambda subject, hits: hits}),
+    ],
+    ids=["int id, reranker", "another class, redactor"],
+)
+def test_a_hit_that_the_reranker_or_redactor_step_fails_on_is_refused(reply, options):
+    # In 3.0.0 these failed once such a hit passed the check: ValueError from matching the reranker's
+    # hits to the chunks by string id, AuthorizationError from the check that a redactor returns Hits.
+    retriever = PermissionedRetriever(_Replies(reply), MetadataACLAuthorizer(), **options)
+    for call in (lambda: retriever.retrieve("leave", BOB), lambda: asyncio.run(retriever.aretrieve("leave", BOB))):
+        with pytest.raises(SearchError, match=r"^search failed$") as failure:
+            call()
+        assert isinstance(failure.value.__cause__, TypeError)
 
 
 def test_only_the_hits_asked_for_are_read_and_any_real_number_is_a_score():

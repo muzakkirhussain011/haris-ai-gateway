@@ -59,6 +59,7 @@ import numbers
 import random
 import threading
 import time
+import warnings
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -92,8 +93,13 @@ class SearchBackend(Protocol):
     """A vector store or search index. Return hits ordered best first.
 
     Each hit is a `Hit` whose id is a string, whose metadata is a mapping and whose score is a
-    number. The retriever reads at most k of them, and raises `SearchError` for a reply that is not
-    an iterable of such hits, as it does when `search` raises.
+    number. The retriever reads at most k of them, and raises `SearchError`, as it does when
+    `search` raises, for a reply that is not iterable, or a hit without an id, text, score or
+    metadata, with an id that cannot be hashed, metadata that is not a mapping, or a score that is
+    not a number (True and False are not scores); with a reranker, for a hit whose id is not a
+    string, and with a redactor, for a hit that is not a `Hit`, since either would fail there.
+    Otherwise a hit that is not a `Hit`, or whose id is not a string, is used as it is, with a
+    `DeprecationWarning`, once per retriever: wardowl 4.0 will refuse it with `SearchError`.
 
     `supports_filters` says whether `search` honours the `filter` argument. Backends may also
     provide `async def asearch(...)` with the same signature; otherwise `search` runs in a thread.
@@ -456,6 +462,7 @@ class PermissionedRetriever:
         self.recall_sample_rate = recall_sample_rate
         self._failures = 0
         self._failures_lock = threading.Lock()
+        self._warned: set[str] = set()  # kinds of odd hits warned about (see _deprecated)
 
     # ---- public API ------------------------------------------------------------------------
 
@@ -926,32 +933,67 @@ class PermissionedRetriever:
         options: dict[str, Any] = {"exact": True} if op.mode == "exact" else {}
         return self.backend, options
 
-    @staticmethod
-    def _replied(reply: Any, k: int) -> list[Hit]:
+    def _replied(self, reply: Any, k: int) -> list[Hit]:
         """The first k hits of a backend's reply, each checked for what the retriever relies on.
 
-        Raises `TypeError`, which the caller raises as `SearchError`, for a reply that is not an
-        iterable of `Hit`, or a hit whose id is not a string, whose metadata is not a mapping or
-        whose score is not a number. Such a hit would otherwise fail later, outside the backend's
-        errors, as a bare `TypeError` or `AttributeError` (an id that cannot be hashed, a score
-        that cannot be sorted, metadata the filter cannot be matched against), or be returned as it
-        is. The plan reads no more than k hits of a search for k, so the rest are not checked.
+        Raises `TypeError`, which the caller raises as `SearchError`, for what would fail later
+        anyway, outside the backend's errors, or be returned as it is: a reply that is not
+        iterable, or a hit without an id, text, score or metadata, with an id that cannot be hashed
+        (the retriever puts ids in sets), metadata that is not a mapping (the filter and the
+        authorizers read it as one), or a score that is not a number (hits are sorted by it).
+        With a reranker, a hit whose id is not a string is refused too, since the reranker's hits
+        are matched to the chunks by string id; with a redactor, a hit that is not a `Hit`, since
+        the redactor's hits must be `Hit` objects. Other hits that are not `Hit` objects, or whose
+        ids are not strings, work and are only warned about (`_deprecated`). The plan reads no
+        more than k hits of a search for k, so the rest are not checked.
         """
         hits = list(itertools.islice(reply, k))
         for hit in hits:
-            if not isinstance(hit, Hit):
-                raise TypeError(f"a search returns Hit objects, not {type(hit).__name__}")
+            missing = [name for name in ("id", "text", "score", "metadata") if not hasattr(hit, name)]
+            if missing:
+                raise TypeError(f"a search returned a {type(hit).__name__} without {', '.join(missing)}")
             # As the backend made them, whatever `Hit` declares: a dataclass checks nothing.
             doc_id: Any = hit.id
             metadata: Any = hit.metadata
             score: Any = hit.score
-            if not isinstance(doc_id, str):
-                raise TypeError(f"a hit's id is a string, not {type(doc_id).__name__}")
+            try:
+                hash(doc_id)
+            except TypeError:
+                raise TypeError(f"a hit's id must be hashable, and a {type(doc_id).__name__} is not") from None
             if not isinstance(metadata, Mapping):
                 raise TypeError(f"a hit's metadata is a mapping, not {type(metadata).__name__}")
             if isinstance(score, bool) or not isinstance(score, numbers.Real):
                 raise TypeError(f"a hit's score is a number, not {type(score).__name__}")
+            if self.reranker is not None and not isinstance(doc_id, str):
+                raise TypeError(f"with a reranker, a hit's id is a string, not {type(doc_id).__name__}")
+            if self.redactor is not None and not isinstance(hit, Hit):
+                raise TypeError(f"with a redactor, a search returns Hit objects, not {type(hit).__name__}")
         return hits
+
+    def _deprecated(self, hits: Sequence[Any]) -> None:
+        """Warn, once per retriever for each kind, about hits that work but break `Hit`'s types.
+
+        Called from `_run` and `_arun`, outside the backend's errors, so that warnings turned into
+        errors are raised as they are; `stacklevel` points at the code that called `retrieve` or
+        awaited `aretrieve`.
+        """
+        odd = {
+            "class": next((type(h).__name__ for h in hits if not isinstance(h, Hit)), None),
+            "id": next((type(h.id).__name__ for h in hits if not isinstance(h.id, str)), None),
+        }
+        for kind, name in odd.items():
+            if name is None:
+                continue
+            with self._failures_lock:  # retrievals run in several threads at once
+                if kind in self._warned:
+                    continue
+                self._warned.add(kind)
+            what = f"an object of type {name}, not a Hit" if kind == "class" else f"a hit whose id is of type {name}"
+            warnings.warn(
+                f"the backend's search returned {what}; wardowl 4.0 will refuse it with SearchError",
+                DeprecationWarning,
+                stacklevel=4,
+            )
 
     @staticmethod
     def _counted(value: Any) -> int | None:
@@ -966,7 +1008,9 @@ class PermissionedRetriever:
         if isinstance(op, _Search):
             backend, options = self._target(op)
             with _backend_errors("search failed"):
-                return self._replied(backend.search(op.query, op.k, op.filter, **options), op.k)
+                hits = self._replied(backend.search(op.query, op.k, op.filter, **options), op.k)
+            self._deprecated(hits)
+            return hits
         if isinstance(op, _Count):
             counter: Any = self.backend
             with _backend_errors("count failed"):
@@ -996,10 +1040,12 @@ class PermissionedRetriever:
             asearch = getattr(backend, "asearch", None)
             with _backend_errors("search failed"):
                 if asearch is not None:
-                    return self._replied(await asearch(op.query, op.k, op.filter, **options), op.k)
-                return self._replied(
-                    await asyncio.to_thread(backend.search, op.query, op.k, op.filter, **options), op.k
-                )
+                    reply = await asearch(op.query, op.k, op.filter, **options)
+                else:
+                    reply = await asyncio.to_thread(backend.search, op.query, op.k, op.filter, **options)
+                hits = self._replied(reply, op.k)
+            self._deprecated(hits)
+            return hits
         if isinstance(op, _Count):
             counter: Any = self.backend
             acount = getattr(counter, "acount", None)

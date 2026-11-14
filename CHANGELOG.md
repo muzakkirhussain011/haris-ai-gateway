@@ -30,6 +30,14 @@ All notable changes are recorded here. The format follows
   `"*"` meaning a group of that name, was shown to everyone. The defaults are the names and marker
   it read before, so nothing changes without the new arguments.
 
+### Deprecated
+
+- A search that returns hits that are not `Hit` objects (any object with `id`, `text`, `score`
+  and `metadata`), or `Hit` objects whose `id` is not a string (an integer, say). The retriever uses
+  them as before, and warns with `DeprecationWarning` once per retriever for each of the two kinds,
+  pointing at the code that called `retrieve` or awaited `aretrieve`; wardowl 4.0 will refuse them
+  with `SearchError`. Return `Hit` objects with string ids, as the built-in backends do.
+
 ### Fixed
 
 - An authorizer's filter or scope nested more than 100 levels deep raises `AuthorizationError`
@@ -59,14 +67,22 @@ All notable changes are recorded here. The format follows
   before, whatever the other parts answered.
 - A backend whose search returns something other than hits fails the retrieval with
   `SearchError("search failed")`, its `__cause__` a `TypeError` that names what was wrong, as when
-  the search raises. The retriever reads at most k hits of the reply, and each must be a `Hit` whose
-  id is a string, whose metadata is a mapping and whose score is a number (any `numbers.Real` but a
-  bool). Such hits failed later, outside the backend's errors: an id that cannot be hashed raised
-  `TypeError` when post-filtering, a score of None `TypeError` when sorted, metadata of None
-  `AttributeError` with `recheck=False` or `AuthorizationError` from the authorizer, and on some paths
-  a hit with such an id or score was returned as it was. A backend of your own that returns ids of
-  another type, such as integers, or scores of another type, now fails the same way: return the
-  types `Hit` declares.
+  the search raises. The retriever reads at most k hits of the reply and refuses what failed later
+  anyway, outside the backend's errors, or was returned as it was: a reply that is not iterable, a
+  hit without an `id`, `text`, `score` or `metadata` attribute, an id that cannot be hashed (it
+  raised `TypeError` when post-filtering), metadata that is not a mapping (None raised
+  `AttributeError` with `recheck=False`, and `AuthorizationError` from the authorizer otherwise),
+  and a score that is not a number (None raised `TypeError` when post-filtering sorted it, and was
+  returned as it was when pre-filtering; `True` and `False`, which are not relevance scores, were
+  sorted as 1 and 0 and returned). With a reranker it refuses a hit whose id is not a string, and
+  with a redactor a hit that is not a `Hit`: in 3.0.0 such a hit failed the retrieval once it passed
+  the permission check, with `ValueError` ("the reranker returned a chunk it was not given"), since
+  the reranker's hits are matched to the chunks by string id, and with `AuthorizationError`, since
+  a redactor must return `Hit` objects. Other hits that are not `Hit` objects, or whose ids are not
+  strings, worked in 3.0.0 through post-filtering, the re-check, `CachingAuthorizer`, redaction (an
+  integer id), reranking (another class), short results, recall samples and audit events, checked by
+  running them through `retrieve` and `aretrieve` on 3.0.0's code, and they still work (see
+  Deprecated).
 - `VespaBackend`, `PineconeBackend` and `CassandraBackend` return a stored record whose metadata
   is not a JSON object (an array, a string, a number, `true` or `null`, or text that is not JSON)
   with empty metadata, as the other backends do. One such record, which a tool other than wardowl
