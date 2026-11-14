@@ -10,6 +10,11 @@ fails. Each item links to the page with the details.
 - [ ] The `Subject` is built from your authenticated session: the user id and groups your identity
   provider vouches for, never values from the request body, and never a tool argument a language
   model fills in. ([Security model](security.md#the-subject-must-come-from-authentication))
+- [ ] Subject ids and group names are written exactly as the chunks' permissions hold them.
+  wardowl compares them exactly and never lowercases, trims or normalises them, in the
+  `Subject`, in `OIDCAuthenticator` or in the filters. The Google Drive connector writes addresses
+  lowercased, so lowercase the id and the groups where the subject is built; an id or group that
+  differs in case does not match. ([Google Drive](integrations/google-drive.md#how-drive-sharing-maps-onto-subjects))
 - [ ] Only groups that grant access to documents are on the subject. A subject in tens of thousands
   of groups works, but costs on every query. ([Operations](operations.md#subjects-in-very-many-groups))
 - [ ] In a multi-tenant deployment, every subject carries its tenant, and the authorizer is wrapped
@@ -93,6 +98,8 @@ says why. The table shows what each failure looks like.
 | The permission service gives a malformed answer (wrong count, non-booleans, not a filter) | Raises `AuthorizationError`; never caches the answer | As above |
 | The vector store is down, or a search or count fails | Raises `SearchError`, with the store client's exception as its `__cause__`; nothing is returned | `wardowl.retrievals` with `error.type = SearchError`; the span's `wardowl.error.cause` and `RetrievalEvent.cause` name the client's exception |
 | The vector store ignores or mistranslates the filter | The re-check drops every chunk outside it | `violations > 0` on the result, the event and the `wardowl.violations` metric |
+| The store matches a chunk the stored metadata denies: permission terms another tool left stale, MongoDB's index catching up after a write, a Chroma record without wardowl's JSON copy | The re-check drops it | `violations > 0`, as above; the [runbook](runbook.md#the-violations-count-rose) tells these causes apart |
+| The authorizer's filter selects more than its `check` allows, or a permission changes between the two | The re-check drops what `check` denies | `violations > 0`, as above |
 | Post-filtering cannot find `k` readable chunks within `max_candidates` | Returns what it found | `complete = False`; `wardowl.outcome = incomplete` |
 | An approximate index returns fewer than `k` chunks under the filter (it may have stopped early) | Returns what it found | `complete = False`; `wardowl.outcome = incomplete` |
 | A subject has no tenant under `TenantAuthorizer` | Raises `AuthorizationError` | As for a failing authorizer |

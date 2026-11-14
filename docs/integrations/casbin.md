@@ -83,6 +83,20 @@ that user's or role's access. A subject whose id starts with the prefix raises
 `AuthorizationError`, since it could pass for a group; pick a prefix your user ids never start with
 (`group_prefix="team/"`, say). An empty prefix is refused.
 
+## Tenants
+
+The request above has no tenant: a group, a document id or a user named the same in two tenants is
+one name to Casbin. With several tenants in one store, add the tenant check,
+`AllOf(TenantAuthorizer(), CasbinAuthorizer(enforcer))`. It denies another tenant's chunks before
+Casbin is asked, and since Casbin gives no filter, the retriever then post-filters inside the
+subject's tenant rather than across the whole store
+([Scoped post-filtering](../combining.md#scoped-post-filtering)). A model with domains, such as the
+acceptance suite's
+[`model.conf`](https://github.com/muzakkirhussain011/wardowl/blob/main/acceptance/policies/casbin/model.conf)
+with a `request` that sends the subject's tenant as the domain, keeps grants and memberships inside
+one tenant, but compares the subject's tenant with the policy row's, not with the chunk's: keep the
+tenant check as well.
+
 ## Pre-filtering and failures
 
 Casbin answers yes or no per request and has no reverse lookup, so `filter_for` returns None and

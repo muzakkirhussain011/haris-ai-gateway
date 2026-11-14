@@ -1027,6 +1027,11 @@ class SpiceDB:
             group_subjects=False,  # memberships live in SpiceDB
             consistency=consistency,
             circuit_breaker=breaker,
+            # CHANGELOG 3.0.0: without it, filter_for gives no filter when LookupResources finds no
+            # document, and strategy="prefilter" then raises ValueError for a subject who may read
+            # nothing (mallory, and odd ids such as "Carol"). A team that pre-filters with SpiceDB
+            # passes it, as this wiring does; the trade-off is in docs/integrations/spicedb.md.
+            trust_empty_lookup=True,
         )
 
     def strict(self, url: str | None = None, breaker: CircuitBreaker | None = None) -> SpiceDBAuthorizer:
@@ -1060,9 +1065,20 @@ def spicedb(report: Report, company: Company, services: Services) -> None:
         hits = [company.hit(d) for d in company.msa]
         stated = float(getattr(lagging, "max_staleness", SPICEDB_QUANTIZATION))
         bound = stated + SLACK
+
+        def carol_reads() -> bool:
+            # A minimizeLatency check answers at a quantized revision, which can still predate the
+            # schema this run wrote seconds ago: SpiceDB then refuses ("object definition ... not
+            # found"), as the Nov 2 run did 4.1 s after the write. That is SpiceDB's documented
+            # staleness, not a failure, so it counts as "not yet" until the bound.
+            try:
+                return all(lagging.check(CAROL.subject, hits))
+            except AuthorizationError:
+                return False
+
         report.check(
             "SpiceDB (default consistency): carol reads the MSA renewals before the revocation",
-            wait_until(lambda: all(lagging.check(CAROL.subject, hits)), bound),
+            wait_until(carol_reads, bound),
         )
         db.write("OPERATION_DELETE", db.carol)
         revoked = time.monotonic()

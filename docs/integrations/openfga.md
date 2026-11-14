@@ -43,7 +43,12 @@ contains `:`, `#`, `*`, whitespace or a control character therefore raises `Unsu
 instead of being sent. So does one OpenFGA's API refuses for its length: a user (`user:<id>`)
 longer than 512 bytes in UTF-8, or a group (`group:<name>`) longer than 256 characters. OpenFGA
 would refuse every request naming them. `UnsupportedSubject` is an `AuthorizationError`, so
-retrieval fails closed, and a `ValueError`, since the subject is at fault.
+retrieval fails closed, and a `ValueError`, since the subject is at fault. Groups written by
+another part of your system must follow the same rule: the Google Drive connector's domain groups,
+`domain:example.com` by default, are refused, so a subject that carries one cannot be sent with
+`contextual_groups=True` ([Google Drive](google-drive.md#with-openfga-or-spicedb-as-well) shows
+another prefix). So are group display names with spaces, such as `Sales Team`; send ids or paths
+such as `/acme/sales`.
 
 Change the names with `object_type=`, `user_type=`, `relations={"read": "viewer"}`,
 `group_type=` and `group_relation=`. Pass `authorization_model_id=` to pin a model version.

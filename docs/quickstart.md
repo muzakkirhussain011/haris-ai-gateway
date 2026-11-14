@@ -55,7 +55,7 @@ What came back:
 | `strategy` | `prefilter` (the filter ran inside the search) or `postfilter` (candidates were checked after it) |
 | `complete` | `False` when results may be missing, for example because post-filtering reached its candidate limit, or an approximate index returned fewer than `k` |
 | `examined`, `denied` | Candidates the authorizer checked, and how many of them Bob may not read |
-| `violations` | Pre-filtered hits the re-check rejected. Always 0 unless the backend ignored the filter |
+| `violations` | Pre-filtered hits the re-check rejected. 0 unless the store's filter and the re-check disagree ([why they can](concepts.md#what-a-result-tells-you)) |
 
 ## Async
 

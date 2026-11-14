@@ -54,6 +54,27 @@ All notable changes are recorded here. The format follows
   leaves in Redis, and why the Redis behind the cache should not evict keys: an evicted epoch or
   index weakens what an invalidation deletes or refuses. Revocation, the runbook and the security
   model say the same where they describe `invalidate()`.
+### Documentation
+
+- What a rise in `violations` can mean. Concepts, the quickstart and the README said it means the
+  store ignored the filter, and the runbook looked only for a store bug; it also rises when another
+  tool leaves the permission terms stale on the stores that keep them, when MongoDB's index has not
+  caught up with a write, for Chroma records without wardowl's JSON copy (a collection kept from
+  needtoknow 1.x among them), when an authorizer's filter selects more than its `check` allows, and
+  when a permission changes between the filter and the check. The runbook lists each cause with how
+  to tell it and what to do, and shows how to find the rejected chunks; the production page's
+  failure table and its identity checklist (ids and groups are compared exactly, never lowercased)
+  are updated too. The security model and the
+  Milvus, Redis and LanceDB pages say that terms are recomputed in the same write as the metadata,
+  and what stale terms do; the extending guide says that `check_backend` cannot see other writers,
+  and that a backend should return at most `k` hits. The Google Drive page shows how to enforce
+  `access_expires_at` inside wardowl, with its cost, says that no backend lists chunks by
+  metadata, that `with_access` needs the authorizer's field names, how tenants and case work, and
+  that OpenFGA refuses the default `domain:` groups (use `domain_prefix="domain/"`) and SpiceDB
+  refuses email ids; the OpenFGA page and ADR 0006 say the same. The OPA, Cerbos, Cedar and Casbin
+  pages say how to keep tenants apart, Combining that a tenant from `OIDCAuthenticator` is a
+  string, the MCP page which group names permission services refuse, and the pgvector and
+  Cassandra pages what very large filters cost.
 
 ## [3.0.0] - 2026-11-14
 
