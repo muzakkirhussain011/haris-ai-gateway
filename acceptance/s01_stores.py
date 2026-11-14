@@ -13,7 +13,11 @@ wardowl's documentation:
    answer with the company's own policy (`can_read`): no canary of a document the person may not
    read, no document of the other tenant, nothing for mallory, only the public handbook for frank,
    and the documents asked about, as far as an exact search over what the person may read ranks
-   them in the top 10.
+   them in the top 10. A result with fewer than 10 hits is complete only where the store proves it
+   (docs/concepts.md, "What a result tells you"); elsewhere it must say why it may be short.
+   Where the store can count (pgvector, and Qdrant in vector mode), mallory and frank are served
+   again with `short_results="count"`, as docs/upgrading.md recommends, which proves their short
+   results complete when nothing more matches.
 3. Where the store has keyword search, search by keyword and fuse it with vector search (hybrid),
    and probe with documents' reference codes, which keyword search finds exactly.
 4. Check `aretrieve` against `retrieve`, and searching with the application's own query vectors.
@@ -48,6 +52,7 @@ import tempfile
 import time
 import uuid
 import zipfile
+from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
@@ -66,8 +71,10 @@ from enterprise import (
     Spec,
     can_read,
     corpus,
+    declares_exact,
     exact_top_k,
     expected_ids,
+    result_problem,
 )
 
 from wardowl import (
@@ -114,6 +121,12 @@ PUBLIC_KINDS = ("handbook-leave", "handbook-it")
 GONE = "northwind/people/handbook-leave-1"  # the page deleted at the end; every northwind employee reads it
 # People and questions for the checks that compare two ways of asking.
 SAMPLE = [(BY_ID[p], q) for p in ("alice", "carol", "frank", "grace", "heidi", "mallory") for q in QUESTION_TEXTS[::3]]
+# The people served with short_results="count", and how many hits they ask for: mallory may read
+# nothing, and frank the 12 public handbook pages, fewer than COUNT_K, so all their results are short.
+COUNTED = ("mallory", "frank")
+COUNT_K = 20
+# What the completeness check requires of a store that does not declare exact_search.
+UNPROVEN = "complete unless an approximate filtered search came back short"
 
 AsyncSide = tuple[Any, Any, Callable[[], Awaitable[Any]] | None]
 
@@ -224,6 +237,11 @@ class Store:
     keyword: Any = None  # the same index searched with BM25, where the store has keyword search
     open_async: Callable[[], Awaitable[AsyncSide]] | None = None  # native async clients, made in the loop
     vector_ranked: bool = True  # False for InMemoryBackend, which ranks by the words a query shares
+    # True when the backend declares exact_search, as docs/concepts.md says InMemoryBackend and FAISS's
+    # flat index do: a short result then proves that nothing else matches. A store that compares every
+    # permitted row without declaring it (LanceDB, pgvector without an index) does not prove it.
+    declares_exact: bool = False
+    counts: bool = False  # the backend can count the chunks a filter matches (short_results="count")
     extra: list[tuple[str, Callable[[], Any]]] = field(default_factory=list)
 
     @property
@@ -293,9 +311,17 @@ def leaks_in(world: World, answers: Iterable[tuple[str, RetrievalResult]]) -> li
 
 
 def judge(
-    report: Report, world: World, label: str, results: dict[tuple[str, str], RetrievalResult], strategy: str
+    report: Report,
+    world: World,
+    label: str,
+    results: dict[tuple[str, str], RetrievalResult],
+    strategy: str,
+    *,
+    exact: bool,
+    scoped: bool = True,
 ) -> None:
-    """The checks every answer must pass, whatever the store and the strategy."""
+    """The checks every answer must pass, whatever the store and the strategy. `exact` says whether
+    the backend declares exact_search, `scoped` whether post-filtering searched inside AllOf's scope."""
     for persona in PERSONAS:
         texts = [h.text for (pid, _), r in results.items() if pid == persona.id for h in r.hits]
         report.no_leaks(f"{label}: no canary reaches {persona.id}", persona, texts, world.specs)
@@ -314,17 +340,21 @@ def judge(
                 crossed.append(f"{pid} ({persona.tenant}) got {hit_id}")
             if pid == "frank" and (spec is None or spec.tenant != "northwind" or spec.kind not in PUBLIC_KINDS):
                 frank.append(hit_id)
-        if result.strategy != strategy or result.violations or not result.complete:
-            wrong.append(
-                f"{pid} asking {question!r}: {result.strategy}, {result.violations} violations,"
-                f" complete={result.complete}"
-            )
+        problem = result_problem(result, K, strategy, exact=exact, scoped=scoped)
+        if problem:
+            wrong.append(f"{pid} asking {question!r}: {problem}")
     report.check(f"{label}: every hit is a document its asker may read", not unreadable, short(unreadable))
     report.check(f"{label}: no document crosses tenants", not crossed, short(crossed))
     report.check(f"{label}: mallory, in no group, gets nothing", not mallory, short(mallory))
     report.check(f"{label}: frank, a contractor, gets only public handbook pages", not frank, short(frank))
     report.check(f"{label}: at most {K} distinct hits per answer", not repeated, short(repeated))
-    report.check(f"{label}: strategy {strategy}, no violations, complete", not wrong, short(wrong))
+    # docs/concepts.md, "What a result tells you": k hits are complete; fewer are complete only when
+    # the backend declares exact_search, or post-filtering searched without a filter. An approximate
+    # search under a filter that comes back short says complete=False, and a pre-filtered one says
+    # shortfall="unknown" under the default short_results="report" (docs/upgrading.md, section 3).
+    # On an exact store every result is complete, as before 3.0, so the check keeps its name there.
+    complete = "complete" if exact else UNPROVEN
+    report.check(f"{label}: strategy {strategy}, no violations, {complete}", not wrong, short(wrong))
 
 
 def completeness(
@@ -373,14 +403,105 @@ def every_persona(report: Report, world: World, store: Store) -> None:
         report.note(f"{store.name}: {store.mode}, so recall@{K} must be {need}")
     else:
         report.note(f"{store.name}: {store.mode}; recall against the vector baseline does not apply")
+    # The completeness checks rest on what the documentation says each backend declares, so the
+    # declaration itself is checked too: a backend that stopped declaring it would pass them otherwise.
+    report.check(
+        f"{store.name}: the backend declares exact_search={store.declares_exact}, as docs/concepts.md says",
+        declares_exact(store.vector) == store.declares_exact,
+        f"exact_search is {getattr(store.vector, 'exact_search', None)!r}",
+    )
     for strategy, expected in STRATEGIES.items():
         label = f"{store.name} {store.kind} {strategy}"
         results = serve(retriever(store.vector, strategy))
-        judge(report, world, label, results, expected)
+        scoped = strategy != "postfilter, no scope"
+        judge(report, world, label, results, expected, exact=store.declares_exact, scoped=scoped)
         if store.vector_ranked:
             completeness(report, world, label, results, store.exact)
         else:
             word_oracle(report, world, label, results)
+
+
+def outcome(result: RetrievalResult) -> tuple[list[str], bool, str | None, str | None]:
+    return ids(result), result.complete, result.shortfall, result.fallback
+
+
+async def _counted_async(store: Store) -> tuple[dict[tuple[str, str], RetrievalResult], str]:
+    """The counted questions through aretrieve, with the store's native async client where it has one,
+    so the backend counts with `acount` there."""
+    close = None
+    if store.open_async is not None:
+        vector, _, close = await store.open_async()
+        how = "a native async client"
+    else:
+        vector, how = store.vector, "the sync search in a thread"
+    try:
+        counting = PermissionedRetriever(vector, AUTHORIZER, short_results="count")
+        out: dict[tuple[str, str], RetrievalResult] = {}
+        for pid in COUNTED:
+            for question in QUESTION_TEXTS:
+                out[(pid, question)] = await counting.aretrieve(question, BY_ID[pid].subject, COUNT_K)
+        return out, how
+    finally:
+        if close is not None:
+            await close()
+
+
+def counted_short_results(report: Report, world: World, store: Store) -> None:
+    """short_results="count", for people who may read fewer chunks than they ask for.
+
+    docs/upgrading.md ("3. Expect complete=False for short results") recommends it to tell a user who
+    may read little from an index that stopped early, on a backend that can count: PgVectorBackend,
+    and QdrantBackend in vector mode. The backend counts the chunks the permission filter matches; a
+    count no larger than the hits proves the result complete, with shortfall="exhausted", and a
+    larger one says the index missed some, shortfall="missed" (docs/concepts.md, "Short results").
+    It only counts, so the hits are those of the default retriever. Mallory may read nothing and frank
+    12 documents, fewer than the COUNT_K they ask for, so the exact top COUNT_K is all they may read.
+    """
+    name = f"{store.name} short_results=count"
+    counting = PermissionedRetriever(store.vector, AUTHORIZER, short_results="count")
+    default = retriever(store.vector, "auto")
+    results: dict[tuple[str, str], RetrievalResult] = {}
+    wrong, missed, differ = [], [], []
+    found = total = 0
+    for pid in COUNTED:
+        persona = BY_ID[pid]
+        readable = {s.id for s in world.specs if can_read(persona, s)}
+        for question in QUESTION_TEXTS:
+            result = results[(pid, question)] = counting.retrieve(question, persona.subject, COUNT_K)
+            got = set(ids(result))
+            problem = result_problem(result, COUNT_K, "prefilter", exact=store.declares_exact, readable=len(readable))
+            if problem:
+                wrong.append(f"{pid} asking {question!r}: {problem}")
+            if result.complete and got != readable:
+                missed.append(f"{pid} asking {question!r}: missing {short(sorted(readable - got))}")
+            found += len(got & readable)
+            total += len(readable)
+            if ids(result) != ids(default.retrieve(question, persona.subject, COUNT_K)):
+                differ.append(f"{pid}: {question}")
+        texts = [h.text for (p, _), r in results.items() if p == pid for h in r.hits]
+        report.no_leaks(f"{name}: no canary reaches {pid}", persona, texts, world.specs)
+    got_async, how = asyncio.run(_counted_async(store))
+    answers = [(pid, r) for (pid, _), r in [*results.items(), *got_async.items()]]
+    problems = leaks_in(world, answers)
+    report.check(f"{name}: every hit is a document its asker may read", not problems, short(problems))
+    report.check(
+        f"{name}: a short result is complete, shortfall exhausted, when the count finds no more; else missed",
+        not wrong,
+        short(wrong),
+    )
+    report.check(f"{name}: a complete short result holds all its asker may read", not missed, short(missed))
+    recall = found / total if total else 1.0
+    floor = 1.0 if store.exact else 0.9
+    report.check(f"{name}: recall@{COUNT_K} at least {floor}", recall >= floor, f"recall@{COUNT_K} is {recall:.3f}")
+    report.check(f"{name}: the hits are the default retriever's, as it only counts", not differ, short(differ))
+    async_differ = [f"{pid}: {q}" for (pid, q), r in results.items() if outcome(got_async[(pid, q)]) != outcome(r)]
+    report.check(
+        f"{name}: aretrieve, through {how}, returns and reports what retrieve does",
+        not async_differ,
+        short(async_differ),
+    )
+    shortfalls = Counter(str(r.shortfall) for r in results.values())
+    report.note(f"{name}: shortfall of the {len(results)} results: {dict(shortfalls)}")
 
 
 def probe_reference_codes(
@@ -411,10 +532,13 @@ def word_search_codes(report: Report, world: World, store: Store) -> None:
 def keyword_and_hybrid(report: Report, world: World, store: Store) -> None:
     warned = FUSION.count
     hybrid = RankFusion(store.vector, store.keyword)
+    # No keyword backend declares exact_search, and RankFusion never does (docs/concepts.md): a keyword
+    # search ranks only the chunks that hold the query's words, so its results are often short.
     for kind, backend in (("keyword", store.keyword), ("hybrid", hybrid)):
         for strategy in ("auto", "postfilter, no scope"):
             results = serve(retriever(backend, strategy))
-            judge(report, world, f"{store.name} {kind} {strategy}", results, STRATEGIES[strategy])
+            label, scoped = f"{store.name} {kind} {strategy}", strategy != "postfilter, no scope"
+            judge(report, world, label, results, STRATEGIES[strategy], exact=False, scoped=scoped)
     probe_reference_codes(
         report, world, store.name, {"keyword": retriever(store.keyword, "auto"), "hybrid": retriever(hybrid, "auto")}
     )
@@ -505,15 +629,30 @@ def own_vectors(report: Report, world: World, store: Store) -> None:
     )
 
 
-def serving(store: Store) -> dict[str, PermissionedRetriever]:
+@dataclass(frozen=True)
+class Way:
+    """One way the assistant searches a store, and what its results must report (see `judge`)."""
+
+    retriever: PermissionedRetriever
+    strategy: str
+    exact: bool
+    scoped: bool = True
+
+    def problem(self, result: RetrievalResult) -> str | None:
+        return result_problem(result, K, self.strategy, exact=self.exact, scoped=self.scoped)
+
+
+def serving(store: Store) -> dict[str, Way]:
     """Every way the assistant searches this store: a permission change must hold for each."""
     ways = {
-        f"{store.kind} auto": retriever(store.vector, "auto"),
-        f"{store.kind} postfilter, no scope": retriever(store.vector, "postfilter, no scope"),
+        f"{store.kind} auto": Way(retriever(store.vector, "auto"), "prefilter", store.declares_exact),
+        f"{store.kind} postfilter, no scope": Way(
+            retriever(store.vector, "postfilter, no scope"), "postfilter", store.declares_exact, scoped=False
+        ),
     }
     if store.keyword is not None:
-        ways["keyword auto"] = retriever(store.keyword, "auto")
-        ways["hybrid auto"] = retriever(RankFusion(store.vector, store.keyword), "auto")
+        ways["keyword auto"] = Way(retriever(store.keyword, "auto"), "prefilter", exact=False)
+        ways["hybrid auto"] = Way(retriever(RankFusion(store.vector, store.keyword), "auto"), "prefilter", exact=False)
     return ways
 
 
@@ -524,8 +663,8 @@ def revocation(report: Report, world: World, store: Store) -> None:
     ways = serving(store)
     main = f"{store.kind} auto"
     before = {}
-    for label, r in ways.items():
-        before[label] = ids(r.retrieve(MSA, carol.subject, K))
+    for label, way in ways.items():
+        before[label] = ids(way.retriever.retrieve(MSA, carol.subject, K))
         found = renewal_ids & set(before[label])
         report.check(
             f"{name} {label}: carol, named on the contract renewals, finds them", bool(found), short(before[label])
@@ -538,20 +677,23 @@ def revocation(report: Report, world: World, store: Store) -> None:
         replace(s, readers=tuple(r for r in s.readers if r != "user:carol")) if s.id in renewal_ids else s
         for s in world.specs
     ]
-    for label, r in ways.items():
-        answers = [r.retrieve(q, carol.subject, K) for q in (MSA, renewals[0].canary or "")]
+    for label, way in ways.items():
+        answers = [way.retriever.retrieve(q, carol.subject, K) for q in (MSA, renewals[0].canary or "")]
         got = sorted({h.id for a in answers for h in a.hits} & renewal_ids)
         report.check(f"{name} {label}: carol no longer gets the renewals", not got, short(got))
         texts = [h.text for a in answers for h in a.hits]
         report.no_leaks(f"{name} {label}: no renewal's canary reaches carol after the change", carol, texts, revoked)
-        odd = [f"{a.violations} violations, complete={a.complete}" for a in answers if a.violations or not a.complete]
+        # A store still serving the old access list returns renewals the re-check removes: violations.
+        # Keyword search ranks only the chunks that hold the query's words, so an answer can be short;
+        # on a store that does not declare exact_search it then says complete=False (see `judge`).
+        odd = [problem for a in answers if (problem := way.problem(a))]
         report.check(f"{name} {label}: the store serves the new permissions at once", not odd, short(odd))
-    kept = ids(ways[main].retrieve(MSA, erin.subject, K))
+    kept = ids(ways[main].retriever.retrieve(MSA, erin.subject, K))
     report.check(f"{name}: erin, in legal, still gets the renewals", bool(renewal_ids & set(kept)), short(kept))
 
     store.vector.set_metadata({s.id: s.metadata() for s in renewals})
-    for label, r in ways.items():
-        after = ids(r.retrieve(MSA, carol.subject, K))
+    for label, way in ways.items():
+        after = ids(way.retriever.retrieve(MSA, carol.subject, K))
         found = renewal_ids & set(after)
         report.check(f"{name} {label}: carol gets the renewals again once restored", bool(found), short(after))
         if label == main and store.exact:
@@ -570,16 +712,16 @@ def deletion(report: Report, world: World, store: Store) -> None:
     gone = world.by_id[GONE]
     ways = serving(store)
     main = f"{store.kind} auto"
-    before = ids(ways[main].retrieve(gone.text, BY_ID["alice"].subject, K))
+    before = ids(ways[main].retriever.retrieve(gone.text, BY_ID["alice"].subject, K))
     report.check(f"{name}: alice finds the handbook page before it is deleted", GONE in before, short(before))
     store.vector.delete([GONE])
     seen = []
-    for label, r in ways.items():
+    for label, way in ways.items():
         for persona in PERSONAS:
             for question in (gone.text, LEAVE):
-                if GONE in ids(r.retrieve(question, persona.subject, K)):
+                if GONE in ids(way.retriever.retrieve(question, persona.subject, K)):
                     seen.append(f"{label} {persona.id}: {question[:40]}")
-    seen += [f"{main} {pid}: {q}" for (pid, q), result in serve(ways[main]).items() if GONE in ids(result)]
+    seen += [f"{main} {pid}: {q}" for (pid, q), result in serve(ways[main].retriever).items() if GONE in ids(result)]
     report.check(f"{name}: once deleted, no persona gets the page, however they search", not seen, short(seen))
 
 
@@ -612,6 +754,8 @@ def exercise(report: Report, world: World, name: str, setup: Callable[..., Store
         steps: list[tuple[str, Callable[[Report, World, Store], None]]] = [
             ("every persona asks every question", every_persona)
         ]
+        if store.counts:
+            steps.append(("short results counted, with short_results='count'", counted_short_results))
         if store.keyword is not None:
             steps.append(("keyword search and hybrid search", keyword_and_hybrid))
         elif not store.vector_ranked:
@@ -652,7 +796,8 @@ def settings(report: Report, name: str, *variables: str) -> list[str] | None:
 def setup_memory(report: Report, world: World, name: str, cleanup: list[Callable[[], Any]]) -> Store:
     # No embeddings: InMemoryBackend ranks by the words a query shares with each chunk.
     backend = InMemoryBackend(world.docs)
-    return Store(name, backend, exact=True, mode="word overlap, every chunk scored", vector_ranked=False)
+    mode = "word overlap, every chunk scored"
+    return Store(name, backend, exact=True, mode=mode, vector_ranked=False, declares_exact=True)
 
 
 def setup_faiss(report: Report, world: World, name: str, cleanup: list[Callable[[], Any]]) -> Store:
@@ -660,7 +805,7 @@ def setup_faiss(report: Report, world: World, name: str, cleanup: list[Callable[
 
     backend = FaissBackend(world.embed, dim=world.dim)  # IndexFlatIP over normalized vectors
     backend.add(world.docs, world.doc_vectors)
-    store = Store(name, backend, exact=True, mode="flat index, exact")
+    store = Store(name, backend, exact=True, mode="flat index, exact", declares_exact=True)
     store.extra.append(("an index saved to disk and loaded again", partial(faiss_reload, report, world, store)))
     return store
 
@@ -733,7 +878,9 @@ def setup_pgvector(
         return avector, akeyword, apool.close
 
     mode = "HNSW with iterative scans, approximate" if hnsw else "no vector index, every permitted row compared: exact"
-    return Store(name, vector, exact=not hnsw, mode=mode, keyword=keyword, open_async=open_async)
+    # PgVectorBackend does not declare exact_search, which it cannot see from the table, and counts in
+    # vector mode (docs/integrations/pgvector.md).
+    return Store(name, vector, exact=not hnsw, mode=mode, keyword=keyword, open_async=open_async, counts=True)
 
 
 def setup_elasticsearch(report: Report, world: World, name: str, cleanup: list[Callable[[], Any]]) -> Store | None:
@@ -823,7 +970,10 @@ def setup_qdrant(report: Report, world: World, name: str, cleanup: list[Callable
             aclient.close,
         )
 
-    return Store(name, vector, exact=False, mode="HNSW, approximate", keyword=keyword, open_async=open_async)
+    # Default search_params, so HNSW: exact_search is False, and the vector backend counts with Qdrant's
+    # exact count (docs/integrations/qdrant.md).
+    mode = "HNSW, approximate"
+    return Store(name, vector, exact=False, mode=mode, keyword=keyword, open_async=open_async, counts=True)
 
 
 def setup_milvus(report: Report, world: World, name: str, cleanup: list[Callable[[], Any]]) -> Store | None:
