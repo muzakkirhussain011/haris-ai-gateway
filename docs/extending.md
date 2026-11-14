@@ -24,6 +24,10 @@ matches, only strings and integers match, list fields match when they share an e
 `In(field, [])` matches nothing. Return the metadata exactly as stored, because the re-check
 decides on it.
 
+Return a list of at most `k` hits. The retriever keeps no more hits than it asked for, but it reads
+the whole answer before it cuts it to that number, so a generator that ignores `k` is read to its
+end.
+
 Add `async def asearch(...)` with the same signature for a native async path; otherwise
 `aretrieve` runs `search` in a thread.
 
@@ -135,6 +139,14 @@ may miss matches, pass `exact=False`: a result may then be short, but never wron
 `exact_search` is True is checked as exact whatever `exact` says, since the retriever takes its
 short results as proof that nothing else matches, and so is every search asked for with
 `exact=True`. `count`, where it returns a number, must count what `matches` selects.
+
+`check_backend` stores documents through your factory and changes them only with the backend's own
+`set_metadata`, so it shows that the backend's writes keep what the store filters on in step with
+the metadata it returns. It has no handle on the store's own client, and cannot write as another
+tool would. If something else changes the metadata of chunks the backend serves, such as an
+ingestion pipeline writing with the store's client, test that it also rewrites what the store
+filters on (the permission terms, on the backends that keep them): stale terms show up as
+`violations`, or hide chunks without a sign ([What a result tells you](concepts.md#what-a-result-tells-you)).
 
 `check_authorizer` checks that `check` returns one boolean per hit, that a hit's answer does not
 depend on the rest of the batch, and that `check` agrees with the filter from `filter_for`. If the

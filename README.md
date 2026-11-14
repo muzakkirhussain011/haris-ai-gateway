@@ -102,7 +102,7 @@ differently each time.
 - **Fails closed.** If the permission service errors, times out or returns malformed answers, the
   user gets an error, never unfiltered results.
 - **Defence in depth.** Pre-filtered results are checked again, so a backend bug that ignores the
-  filter cannot leak. Each result reports how many such violations it caught.
+  filter cannot leak. Each result reports, in `violations`, how many hits the re-check removed.
 
 ## Install
 
@@ -131,7 +131,9 @@ permissioned search to a real vector store.
 | `auto` (default) | Picks `prefilter` when both sides support it | | |
 
 Every call returns a `RetrievalResult` with the hits plus `strategy`, `examined`, `denied`,
-`violations` (pre-filtered hits the re-check rejected, which should always be 0) and `complete`.
+`violations` (pre-filtered hits the re-check rejected, which should be 0; the
+[runbook](https://muzakkirhussain011.github.io/wardowl/runbook.html#the-violations-count-rose) lists
+what raises it) and `complete`.
 
 ## Integrations
 

@@ -156,8 +156,33 @@ candidate as well. `strategy="postfilter"` does not mean an unfiltered search.
 | `sampled_recall` | For a retrieval `recall_sample_rate` sampled, the share of an exact search's top `k` that came back |
 | `recall_sample` | What happened to that sample: `measured`, `over_limit`, `unsupported` or `failed`; `None` when the retrieval was not sampled |
 
-`violations` should always be 0. Anything else means the backend returned chunks outside the
-filter, and deserves an alert: the re-check removed them, but the backend has a bug.
+`violations` should be 0, and anything else deserves an alert: the store returned chunks that the
+re-check then rejected. None of them reached the caller, but the filter the store applied and the
+re-check disagreed. A bug in the store, or in the backend's translation of the filter, is one cause.
+The others known are:
+
+- **Permission terms that grant more than the metadata.** Elasticsearch, OpenSearch, Milvus,
+  MongoDB, Redis, Weaviate, LanceDB, Vespa, Cassandra and Pinecone filter on a separate field of
+  permission terms (`wardowl_terms`), while the re-check reads the stored metadata. wardowl's own
+  `add` and `set_metadata` write both together; a tool that changes the metadata without
+  recomputing the terms leaves them stale. Terms broader than the metadata are counted here. Terms
+  narrower than the metadata hide the chunk from pre-filtered searches, and nothing reports it.
+- **An index that has not caught up with a write.** MongoDB Atlas indexes a write a moment after
+  storing it ([Writes become searchable shortly after](integrations/mongodb.md#writes-become-searchable-shortly-after)).
+  A retrieval in between can match a replaced chunk by its old terms, for example while
+  `set_metadata` writes a revocation, and the re-check, which reads the new metadata, rejects it.
+- **Chroma records without wardowl's JSON copy of the metadata**, written by another tool or kept
+  from needtoknow 1.x, which named the copy `needtoknow_metadata`. They can match the filter on
+  their plain fields, and are read as carrying no permissions.
+- **An authorizer whose filter selects more than its `check` allows**: an OPA policy whose filter
+  and decisions differ, or chunks whose fields have a shape the policy does not expect, such as a
+  list where OpenFGA or SpiceDB expects one resource id, or where a Cerbos rule compares with `==`.
+- **A permission that changed between the filter and the check.** OpenFGA and SpiceDB answer them
+  in separate calls (ListObjects or LookupResources, then BatchCheck or CheckBulkPermissions), and
+  `CachingAuthorizer` caches the two separately, so a chunk the filter still lists and the check
+  now denies is counted.
+
+The [runbook](runbook.md#the-violations-count-rose) says how to tell them apart.
 
 `complete=False` means wardowl knows results may be missing. That is the case when:
 
