@@ -8,6 +8,37 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- `SpiceDBAuthorizer(consistency=...)` also takes a function of no arguments that returns the
+  consistency requirement, so that every request can carry the ZedToken of the application's latest
+  write (M13 in the readiness review). It is called once for each `check` or `filter_for` that
+  sends SpiceDB a request, before the first, and every request of that call (each
+  CheckBulkPermissions batch, each subject's LookupResources) carries what it returned; a call that
+  sends nothing does not call it. A mapping was the only form, fixed when the authorizer was
+  created, and `atLeastAsFresh` guarantees data at least as fresh as its token and nothing more, so
+  a token passed once covered no later write. The documentation still told operators to declare
+  `max_staleness=0` with it, and a `CachingAuthorizer` told so holds nothing back after
+  `invalidate()`: an answer from before a later revocation could be kept for its whole `ttl`. What
+  the function returns must be exactly one of SpiceDB's four requirements, with a non-empty token
+  for `atLeastAsFresh` and `atExactSnapshot`. Anything else, None or `{}` included, or an exception
+  from the function, raises `AuthorizationError` and nothing is sent, rather than a weaker
+  requirement being used. With a function, `max_staleness` is 11 seconds unless you pass it,
+  whatever the function returns. A mapping is sent as given, unchecked, and declares the same
+  `max_staleness` as before. The tests cover a token per call, one evaluation for a call of several
+  requests, the failures, a mapping, `max_staleness` for both forms, and, against a real SpiceDB, a
+  revocation reported to the cache with the token of its write.
+
+### Documentation
+
+- The module docstring, the SpiceDB page and
+  [Revocation and consistency](https://muzakkirhussain011.github.io/wardowl/revocation.html) said
+  to declare `max_staleness=0` when sending `atLeastAsFresh` with "the token of every change you
+  report", and the strict-revocation recipe said to pass "the zedtoken of your write", which a token
+  fixed when the authorizer is created does not do; revocation also said that `atLeastAsFresh`
+  answers from current data. They now say what the token guarantees, and that `max_staleness=0` is
+  right only when every request carries a token at least as new as the latest revocation reported
+  to the cache, kept before `invalidate()` is called. The SpiceDB page shows a thread-safe function
+  that does it, says what it relies on, and says what it does not cover: writes in other processes,
+  unless the token is shared, and changes made directly in SpiceDB.
 - `OIDCAuthenticator(require_groups=True)` refuses a token without the groups claim
   (`groups_claim`) as invalid, which the HTTP service answers with 401. The claim was read as "no
   groups" when it was absent, so a token that lost its groups (a group mapper removed, or a
@@ -23,41 +54,6 @@ All notable changes are recorded here. The format follows
   values are not logged, and the 401 the HTTP service answers is unchanged, so the caller is still
   not told why. Every PyJWT error became `InvalidToken` and a 401 with no reason recorded anywhere
   (M20). `create_app` still logs nothing for a 401 from an authenticator of your own.
-
-### Fixed
-
-- `OIDCAuthenticator` refuses a `leeway` that is not a finite number with `ValueError`. With NaN,
-  every one of PyJWT's time comparisons is false, so an expired token verified; an infinite leeway
-  turned the expiry check off. A `datetime.timedelta`, which PyJWT also takes, is still accepted.
-- `CachingAuthorizer.invalidate(subject)` with `RedisCache` no longer scans the whole Redis
-  database (finding M15 of the readiness review). It deleted the subject's entries with `SCAN`
-  and a `MATCH` pattern, which visits every key in the database, about 1,000 per round trip, so
-  its cost grew with everything else that Redis holds, not with the subject's entries, and was
-  paid in the calling thread: about 10,000 round trips for a Redis holding 10 million sessions
-  and queue items, which in an `async def` webhook handler held up every other request on that
-  worker. `RedisCache` now keeps, for each subject id, a sorted set of the names of the entries
-  written for it, under the id's hash tag so that Redis Cluster keeps it in the slot of those
-  entries. It is written in the same pipeline as the entries, before them, kept for `ttl` plus a
-  minute after its last write, and cleared on each write of the names whose entries expired more
-  than a minute earlier. `invalidate(subject)` writes the subject's new epoch first, as before,
-  then reads the index and unlinks what it lists: two round trips plus one per 500 entries. Each
-  write sends three more commands in its pipeline, so no extra round trip, and Redis holds one
-  sorted set per subject id written in the last `ttl` plus a minute. The revocation guarantee does
-  not change: the new epoch makes every replica refuse the entries written before it, which is
-  also what protected against a write racing the scan. An entry that no index lists, such as one a 3.0 replica writes
-  during a rolling upgrade, is refused the same way and stays in Redis until it expires, within
-  `ttl`; call `invalidate()` once every replica runs 3.1 to delete such entries at once.
-  `invalidate()` of everyone still scans the database. A shared cache without the new methods is
-  still cleared with `delete_prefix`. Tests, with a stand-in store and against Redis in CI: a
-  subject's invalidation deletes only that id's entries and never scans, entries without an index
-  are refused and then deleted by `invalidate()` of everyone, a write racing an invalidation stays
-  listed and is never read, the index drops long-expired names and deletes only under its prefix,
-  `ainvalidate` works in a worker thread while the event loop runs and finishes when cancelled,
-  and a subject's entries, epoch and index hash to one cluster slot (by redis-py's slot function;
-  Redis Cluster itself is not tested in CI).
-
-### Documentation
-
 - The HTTP service page and the `OIDCAuthenticator` docstring say that `exp`, and `nbf` and `iat`
   when the token has them, are checked against the service's clock, and that `leeway` applies to
   all three. With the default leeway of 0, an identity provider whose clock runs ahead of the
@@ -100,6 +96,38 @@ All notable changes are recorded here. The format follows
   pages say how to keep tenants apart, Combining that a tenant from `OIDCAuthenticator` is a
   string, the MCP page which group names permission services refuse, and the pgvector and
   Cassandra pages what very large filters cost.
+
+### Fixed
+
+- `OIDCAuthenticator` refuses a `leeway` that is not a finite number with `ValueError`. With NaN,
+  every one of PyJWT's time comparisons is false, so an expired token verified; an infinite leeway
+  turned the expiry check off. A `datetime.timedelta`, which PyJWT also takes, is still accepted.
+- `CachingAuthorizer.invalidate(subject)` with `RedisCache` no longer scans the whole Redis
+  database (finding M15 of the readiness review). It deleted the subject's entries with `SCAN`
+  and a `MATCH` pattern, which visits every key in the database, about 1,000 per round trip, so
+  its cost grew with everything else that Redis holds, not with the subject's entries, and was
+  paid in the calling thread: about 10,000 round trips for a Redis holding 10 million sessions
+  and queue items, which in an `async def` webhook handler held up every other request on that
+  worker. `RedisCache` now keeps, for each subject id, a sorted set of the names of the entries
+  written for it, under the id's hash tag so that Redis Cluster keeps it in the slot of those
+  entries. It is written in the same pipeline as the entries, before them, kept for `ttl` plus a
+  minute after its last write, and cleared on each write of the names whose entries expired more
+  than a minute earlier. `invalidate(subject)` writes the subject's new epoch first, as before,
+  then reads the index and unlinks what it lists: two round trips plus one per 500 entries. Each
+  write sends three more commands in its pipeline, so no extra round trip, and Redis holds one
+  sorted set per subject id written in the last `ttl` plus a minute. The revocation guarantee does
+  not change: the new epoch makes every replica refuse the entries written before it, which is
+  also what protected against a write racing the scan. An entry that no index lists, such as one a 3.0 replica writes
+  during a rolling upgrade, is refused the same way and stays in Redis until it expires, within
+  `ttl`; call `invalidate()` once every replica runs 3.1 to delete such entries at once.
+  `invalidate()` of everyone still scans the database. A shared cache without the new methods is
+  still cleared with `delete_prefix`. Tests, with a stand-in store and against Redis in CI: a
+  subject's invalidation deletes only that id's entries and never scans, entries without an index
+  are refused and then deleted by `invalidate()` of everyone, a write racing an invalidation stays
+  listed and is never read, the index drops long-expired names and deletes only under its prefix,
+  `ainvalidate` works in a worker thread while the event loop runs and finishes when cancelled,
+  and a subject's entries, epoch and index hash to one cluster slot (by redis-py's slot function;
+  Redis Cluster itself is not tested in CI).
 
 ## [3.0.0] - 2026-11-14
 
