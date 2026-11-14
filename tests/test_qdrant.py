@@ -392,7 +392,7 @@ async def _native_asearch(client, name, k, f):
         await async_client.close()
 
 
-def test_a_point_is_never_reported_under_an_id_another_point_holds_where_add_writes_it(any_client):
+def test_a_point_is_never_reported_under_an_id_another_point_holds_where_add_writes_it(any_client, request):
     # A point written by another tool at the UUID u, and a point at another chunk's point id holding
     # "x", were both reported under the id of a wardowl chunk: one id for two points, which made the
     # reranker path raise and could hide the chunk across post-filtering rounds.
@@ -422,7 +422,7 @@ def test_a_point_is_never_reported_under_an_id_another_point_holds_where_add_wri
         assert {h.id: h.text for h in asyncio.run(backend.asearch("leave", 6))} == wanted
         reversing = PermissionedRetriever(backend, MetadataACLAuthorizer(), reranker=lambda q, hits: hits[::-1])
         assert sorted(h.id for h in reversing.retrieve("leave", Subject("ann"), k=6).hits) == sorted(wanted)
-        if URL:  # a native async client needs the server: local mode keeps each client's data apart
+        if request.node.callspec.params["any_client"] == "server":  # local mode keeps each client's data apart
             assert asyncio.run(_native_asearch(any_client, name, 6, readable)) == backend.search("leave", 6, readable)
         # The point at another chunk's point id is still reported under "x" once no chunk holds "x".
         backend.delete(["x"])

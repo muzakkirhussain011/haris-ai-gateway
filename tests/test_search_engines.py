@@ -203,10 +203,10 @@ def test_create_index_refuses_an_index_that_needtoknow_1x_created():
     # every pre-filtered search found nothing, with no error.
     from wardowl.backends import elasticsearch, opensearch
 
-    for module, engine, wrapped in ((elasticsearch, "Elasticsearch", True), (opensearch, "OpenSearch", False)):
+    for module, name, wrapped in ((elasticsearch, "Elasticsearch", True), (opensearch, "OpenSearch", False)):
         for answer in ({"docs": {"mappings": LEGACY}}, {"docs-a": {"mappings": CURRENT}, "docs": {"mappings": LEGACY}}):
             client = SimpleNamespace(indices=Indices(answer, wrapped))
-            with pytest.raises(ValueError, match=rf"{engine} index 'docs' was created by needtoknow 1\.x.*upgrading"):
+            with pytest.raises(ValueError, match=rf"{name} index 'docs' was created by needtoknow 1\.x.*upgrading"):
                 module.create_index(client, "docs", EMBED.dim)
         # Indexes wardowl created, empty ones and one that maps both fields are left as they are.
         both = {"properties": {**LEGACY["properties"], **CURRENT["properties"]}}

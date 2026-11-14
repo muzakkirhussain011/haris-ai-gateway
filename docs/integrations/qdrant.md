@@ -29,8 +29,9 @@ updates on a field without an index, so index `wardowl_id` in collections you cr
 On a collection that already exists, `create_collection` first reads its first 16 points (in point
 id order, payload keys `wardowl_id` and `needtoknow_id` only) and raises `ValueError`, creating no
 index, if one of them holds `needtoknow_id` and no `wardowl_id`: a point that needtoknow 1.x wrote.
-Such a point sits at a point id derived another way, so `set_metadata` and `delete` by chunk id
-would not reach it, and a revocation would change nothing without saying so. The backend makes the
+Unless its chunk id is a UUID, such a point sits at a point id derived another way, so
+`set_metadata` and `delete` by chunk id would not reach it, and a revocation would change nothing
+without saying so. The backend makes the
 same check before its first `add`, `set_metadata` or `delete` that has something to write, and
 writes nothing if it fails; once a check passes it does not check again. Write such a collection's
 chunks into a new one ([Upgrading](../upgrading.md#2-index-your-chunks-again)). The check reads a

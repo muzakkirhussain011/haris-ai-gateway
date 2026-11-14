@@ -170,16 +170,17 @@ def _held(stored: Iterable[Any]) -> set[str]:
 
 def _check_collection(client: Any, name: str) -> None:
     """Raise `ValueError` if the collection's first points include one written by needtoknow 1.x:
-    `needtoknow_id` and no `wardowl_id`. Such a point sits at a point id derived another way, so
-    `set_metadata` and `delete` by chunk id would not reach it. Reads only; writes nothing."""
+    `needtoknow_id` and no `wardowl_id`. Unless its chunk id is a UUID, such a point sits at a point
+    id derived another way, so `set_metadata` and `delete` by chunk id would not reach it. Reads
+    only; writes nothing."""
     points, _ = client.scroll(name, limit=_LAYOUT_SAMPLE, with_payload=[ID_KEY, _LEGACY_ID_KEY], with_vectors=False)
     for p in points:
         payload = p.payload or {}
         if isinstance(payload.get(_LEGACY_ID_KEY), str) and not isinstance(payload.get(ID_KEY), str):
             raise ValueError(
                 f"Qdrant collection {name!r} holds points written by needtoknow 1.x (payload key "
-                f"{_LEGACY_ID_KEY!r} and no {ID_KEY!r}), which set_metadata and delete cannot reach by "
-                f"chunk id: {_UPGRADE}"
+                f"{_LEGACY_ID_KEY!r} and no {ID_KEY!r}), which set_metadata and delete do not reach by a "
+                f"chunk id that is not a UUID: {_UPGRADE}"
             )
 
 

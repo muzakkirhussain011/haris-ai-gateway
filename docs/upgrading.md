@@ -267,8 +267,8 @@ then drop the old one.
 On some stores, an object left in the 1.x layout misbehaved without an error: Qdrant reported point
 UUIDs as chunk ids, and `set_metadata` and `delete` by a chunk id that is not a UUID reached no
 point, so a revocation changed nothing; Elasticsearch and OpenSearch found nothing under a
-pre-filter; and Chroma denied every chunk. From wardowl 3.1 these
-raise `ValueError` instead, pointing here, and write nothing:
+pre-filter; and Chroma denied every chunk. From wardowl 3.1 these raise `ValueError` instead,
+pointing here, and write nothing:
 
 | Store | What is checked | When |
 |---|---|---|
