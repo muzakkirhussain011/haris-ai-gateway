@@ -50,6 +50,44 @@ def test_a_span_shown_to_listed_users_groups_or_everyone(span):
     assert SpanRedactor().redact(ANN, [hit(redactions=[span])])[0].text == TEXT
 
 
+HIDDEN = "Team plan. [REDACTED] Launch in May."
+
+
+def test_the_readers_field_names_and_marker_can_be_those_of_the_authorizer():
+    names = {"users_field": "readers", "groups_field": "teams", "everyone": "all"}
+    redactor, authorizer = SpanRedactor(**names), MetadataACLAuthorizer(**names)
+    everyone = {"start": 11, "end": 38, "teams": ["all"]}
+    star = {"start": 11, "end": 38, "teams": ["*"]}  # under another marker, a group like any other
+    ann = {"start": 11, "end": 38, "readers": ["ann"]}
+    old = {"start": 11, "end": 38, "allowed_groups": ["eng"]}  # the default names are not read
+    sam = Subject("sam", ["*"])
+    shown = {
+        (ANN, "everyone"): True,
+        (ANN, "star"): False,
+        (ANN, "ann"): True,
+        (ANN, "old"): False,
+        (sam, "everyone"): True,
+        (sam, "star"): True,
+        (sam, "ann"): False,
+        (sam, "old"): False,
+    }
+    for (subject, name), expected in shown.items():
+        readers = {"everyone": everyone, "star": star, "ann": ann, "old": old}[name]
+        text = redactor.redact(subject, [hit(redactions=[readers])])[0].text
+        assert text == (TEXT if expected else HIDDEN), (subject.id, name)
+        # The authorizer reads the same readers on a chunk the same way.
+        assert authorizer.check(subject, [Hit("c", "t", 1.0, readers)]) == [expected], (subject.id, name)
+    with pytest.raises(ValueError, match="teams must be a list of strings"):
+        redactor.redact(ANN, [hit(redactions=[{"start": 11, "end": 38, "teams": "all"}])])
+
+
+def test_blank_group_names_and_a_blank_marker_show_no_span():
+    blank = {"start": 11, "end": 38, "allowed_groups": ["", " "]}
+    assert SpanRedactor().redact(Subject("ann", ["", " "]), [hit(redactions=[blank])])[0].text == HIDDEN
+    assert SpanRedactor(everyone="").redact(ANN, [hit(redactions=[blank])])[0].text == HIDDEN
+    assert SpanRedactor().redact(Subject("ann", ["", "hr"]), [hit(redactions=[SALARIES])])[0].text == TEXT
+
+
 def test_overlapping_and_touching_spans_are_replaced_once():
     spans = [{"start": 11, "end": 25}, {"start": 20, "end": 30}, {"start": 30, "end": 38}, {"start": 39, "end": 45}]
     [hidden] = SpanRedactor(replacement="#").redact(ANN, [hit(redactions=spans)])

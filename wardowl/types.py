@@ -49,7 +49,9 @@ def _frozen(value: Any) -> Any:
 class Subject:
     """Who is asking: a user id, the groups they belong to, and any attributes your policy needs.
 
-    The id and every group are strings. `attributes` is copied when the subject is made, and the
+    The id and every group are strings. A group name that is empty or only whitespace is accepted,
+    since identity providers can send one, but `MetadataACLAuthorizer` and `SpanRedactor` ignore
+    it, so it grants nothing through them. `attributes` is copied when the subject is made, and the
     copy cannot be changed: mappings in it are read-only, lists become tuples and sets frozensets.
     Decisions are cached per subject, so a subject changed afterwards could otherwise be given an
     answer cached for what it was before.

@@ -109,6 +109,28 @@ def test_set_metadata_updates_the_rows_found_with_plain_writes(monkeypatch):
     )
 
 
+def test_a_row_whose_metadata_is_not_a_json_object_carries_no_permissions(monkeypatch):
+    # As another tool could store it: JSON that is not an object, text that is not JSON, or nothing.
+    odd = ["[]", '["allowed_groups"]', "1", '"x"', "null", "not json", "", None]
+    rows = [{"id": f"d{i}", "text": "t", "metadata": stored, "score": 0.5} for i, stored in enumerate(odd)]
+    rows.append({"id": "ok", "text": "t", "metadata": '{"allowed_groups": ["eng"]}', "score": 0.25})
+
+    def run(self, cql, args, *, write=False):
+        return [rows for _ in args]  # every ANN query finds every row
+
+    monkeypatch.setattr(CassandraBackend, "_run", run)
+    backend = CassandraBackend(NoSession(), "ks", "chunks", EMBED)
+    assert [h.metadata for h in backend.search("q", 20)] == [{}] * len(odd) + [{"allowed_groups": ["eng"]}]
+    # Denied and counted, with or without the re-check, where it failed the whole retrieval.
+    for recheck in (True, False):
+        retriever = PermissionedRetriever(backend, MetadataACLAuthorizer(), recheck=recheck)
+        result = retriever.retrieve("q", Subject("ann", ["eng"]), k=20)
+        assert [h.id for h in result.hits] == ["ok"] and result.violations == len(odd)
+    # A filter applied here, past max_queries, leaves them out like any other row it does not match.
+    wide = CassandraBackend(NoSession(), "ks", "chunks", EMBED, max_queries=1)
+    assert [h.id for h in wide.search("q", 20, In("allowed_groups", ["eng", "hr"]))] == ["ok"]
+
+
 # ---- a real Cassandra --------------------------------------------------------------------------
 
 needs_cassandra = pytest.mark.skipif(not HOST, reason="set WARDOWL_TEST_CASSANDRA_HOST to run against Cassandra")

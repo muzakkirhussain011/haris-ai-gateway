@@ -709,6 +709,25 @@ def test_pgvector_sets_its_scan_limits_in_each_search_and_reads_every_row_for_an
     ]
 
 
+def test_pgvector_reads_metadata_that_is_not_a_json_object_as_no_permissions():
+    pytest.importorskip("psycopg")
+    from wardowl.backends.pgvector import PgVectorBackend
+
+    # What psycopg loads from a jsonb array, string, number or true, as a row written by another
+    # tool can hold. ([], "", 0, false and null were read as {} already.)
+    odd = [[1], ["allowed_groups"], "hr", 7, 2.5, True]
+    rows = [(f"odd-{i}", "leave policy", stored, 0.25) for i, stored in enumerate(odd)]
+    rows.append(ROW)
+    backend = PgVectorBackend(Recorder(rows), EMBED)
+    assert [h.metadata for h in backend.search("leave", 10)] == [{}] * len(odd) + [ROW[2]]
+    keyword = PgVectorBackend(Recorder(rows), None, mode="keyword")
+    assert [h.metadata for h in keyword.search("leave", 10)] == [{}] * len(odd) + [ROW[2]]
+    # Post-filtering without a scope reaches such rows: each is denied, where it failed the retrieval.
+    retriever = PermissionedRetriever(backend, MetadataACLAuthorizer(), strategy="postfilter")
+    result = retriever.retrieve("leave", Subject("ann", ["hr"]), k=3)
+    assert [h.id for h in result.hits] == ["d1"] and result.denied == len(odd)
+
+
 def test_pgvector_counts_the_rows_a_filter_matches_no_further_than_a_limit():
     pytest.importorskip("psycopg")
     from wardowl.backends.pgvector import PgVectorBackend

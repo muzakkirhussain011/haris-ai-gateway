@@ -36,11 +36,19 @@ class Redactor(Protocol):
 RedactFunction = Callable[[Subject, Sequence[Hit]], Sequence[Hit]]
 
 
-def _may_read(subject: Subject, users: Any, groups: Any) -> bool:
-    for name, value in (("allowed_users", users), ("allowed_groups", groups)):
+def _named(value: Any) -> bool:
+    """False for a string that is empty or only whitespace, which names no user or group."""
+    return not isinstance(value, str) or bool(value.strip())
+
+
+def _may_read(subject: Subject, span: Mapping[str, Any], users_field: str, groups_field: str, everyone: str) -> bool:
+    users, groups = span.get(users_field, []), span.get(groups_field, [])
+    for name, value in ((users_field, users), (groups_field, groups)):
         if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
             raise ValueError(f"a span's {name} must be a list of strings")
-    return subject.id in users or "*" in groups or bool(subject.groups.intersection(groups))
+    # As in MetadataACLAuthorizer, a blank group name, or a blank marker, grants nothing.
+    named = {g for g in groups if _named(g)}
+    return subject.id in users or (_named(everyone) and everyone in named) or bool(subject.groups & named)
 
 
 def _mask(text: str, hidden: Sequence[tuple[int, int]], replacement: str) -> str:
@@ -66,12 +74,18 @@ class SpanRedactor:
     Each chunk carries, under `field` in its metadata, a list of spans:
     `{"start": 120, "end": 340, "allowed_groups": ["hr"], "allowed_users": []}`, character offsets
     into the text. A span the subject may not read (not a listed user, not in a listed group, and
-    `"*"` not listed) is replaced by `replacement`; overlapping spans are replaced together. The
-    field itself is removed from the metadata returned, since it names who may read what. A
-    malformed list of spans raises `ValueError`, which the retriever turns into
+    the `everyone` marker not listed) is replaced by `replacement`; overlapping spans are replaced
+    together. The field itself is removed from the metadata returned, since it names who may read
+    what. A malformed list of spans raises `ValueError`, which the retriever turns into
     `AuthorizationError`: a field that is not a list, a span that is not a mapping, offsets that are
     not two integers with `0 <= start < end`, a `sha256` that is not a string, or readers that are
     not lists of strings. Those are wrong whatever the text.
+
+    The readers have `MetadataACLAuthorizer`'s field names and marker, with the same defaults: user
+    ids under `users_field` (`"allowed_users"`), group names under `groups_field`
+    (`"allowed_groups"`), and `everyone` (`"*"`) among the groups for every subject. Give the
+    redactor the same three as the authorizer when you change them. A group name, or a marker,
+    that is empty or only whitespace grants nothing, as in the authorizer.
 
     A chunk without the field is hidden whole, its text replaced by `replacement`: a list lost when
     the metadata was replaced cannot be told from one never written. Store `[]` for a chunk with
@@ -83,10 +97,22 @@ class SpanRedactor:
     no longer cover what they were written to protect.
     """
 
-    def __init__(self, field: str = "redactions", replacement: str = "[REDACTED]", *, required: bool = True) -> None:
+    def __init__(
+        self,
+        field: str = "redactions",
+        replacement: str = "[REDACTED]",
+        *,
+        required: bool = True,
+        users_field: str = "allowed_users",
+        groups_field: str = "allowed_groups",
+        everyone: str = "*",
+    ) -> None:
         self.field = field
         self.replacement = replacement
         self.required = required
+        self.users_field = users_field
+        self.groups_field = groups_field
+        self.everyone = everyone
 
     def redact(self, subject: Subject, hits: Sequence[Hit]) -> list[Hit]:
         return [self._redact(subject, hit) for hit in hits]
@@ -115,7 +141,7 @@ class SpanRedactor:
                 stale = True  # the text was shortened after its spans were written
             elif digest is not None and digest != span_digest(hit.text[start:end]):
                 stale = True
-            if not _may_read(subject, span.get("allowed_users", []), span.get("allowed_groups", [])):
+            if not _may_read(subject, span, self.users_field, self.groups_field, self.everyone):
                 hidden.append((start, end))
         text = self.replacement if stale else _mask(hit.text, hidden, self.replacement)
         return dataclasses.replace(hit, text=text, metadata=metadata)

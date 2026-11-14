@@ -28,10 +28,11 @@ Guarantees
 ----------
 * Fail closed: if the authorizer errors, `AuthorizationError` is raised and nothing is returned.
   Its message is fixed, without the text of the exception behind it, which is kept as its
-  `__cause__`: agent frameworks show tool errors to the model. If the backend's search or count
-  fails, `SearchError` is raised the same way, with a fixed message and the backend's exception as
-  its `__cause__`; only `InvalidQuery`, which says the query itself cannot be searched, is raised
-  as it is.
+  `__cause__`: agent frameworks show tool errors to the model. So is a malformed answer: a filter
+  holding something other than `In`, `And` and `Or`, or nested more than 100 levels deep. If the
+  backend's search or count fails, or its search returns something other than hits, `SearchError`
+  is raised the same way, with a fixed message and the backend's exception as its `__cause__`;
+  only `InvalidQuery`, which says the query itself cannot be searched, is raised as it is.
 * Defence in depth: pre-filtered results are checked again with the authorizer (`recheck=True`).
   A backend that ignored the filter cannot leak; the rejected hits are counted in `violations`.
   With `recheck=False` there is no second call to the authorizer, but each pre-filtered hit is
@@ -51,19 +52,22 @@ import asyncio
 import contextvars
 import dataclasses
 import functools
+import itertools
 import logging
 import math
+import numbers
 import random
 import threading
 import time
-from collections.abc import Callable, Generator, Iterator, Sequence
+import warnings
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from wardowl.authz import AuthorizationError, Authorizer
 from wardowl.events import AuditError, Observer, RetrievalEvent, query_fingerprint
-from wardowl.filters import And, Filter, In, Or, matches
+from wardowl.filters import _MAX_DEPTH, And, Filter, In, Or, matches
 from wardowl.redaction import RedactFunction, Redactor
 from wardowl.types import Hit, InvalidQuery, Query, Subject
 
@@ -87,6 +91,15 @@ RecallSample = Literal["measured", "over_limit", "unsupported", "failed"]
 @runtime_checkable
 class SearchBackend(Protocol):
     """A vector store or search index. Return hits ordered best first.
+
+    Each hit is a `Hit` whose id is a string, whose metadata is a mapping and whose score is a
+    number. The retriever reads at most k of them, and raises `SearchError`, as it does when
+    `search` raises, for a reply that is not iterable, or a hit without an id, text, score or
+    metadata, with an id that cannot be hashed, metadata that is not a mapping, or a score that is
+    not a number (True and False are not scores); with a reranker, for a hit whose id is not a
+    string, and with a redactor, for a hit that is not a `Hit`, since either would fail there.
+    Otherwise a hit that is not a `Hit`, or whose id is not a string, is used as it is, with a
+    `DeprecationWarning`, once per retriever: wardowl 4.0 will refuse it with `SearchError`.
 
     `supports_filters` says whether `search` honours the `filter` argument. Backends may also
     provide `async def asearch(...)` with the same signature; otherwise `search` runs in a thread.
@@ -124,7 +137,9 @@ class SearchError(RuntimeError):
     Its message is fixed ("search failed" or "count failed"), never the text of the backend's
     exception, which can name hosts, users or credentials and stays its `__cause__` for the logs:
     agent frameworks show a tool's error to the model. `InvalidQuery` from the backend is raised as
-    it is, since it says the query itself cannot be searched.
+    it is, since it says the query itself cannot be searched. A search that returns something
+    other than hits (see `SearchBackend`) fails too, with a `TypeError` that says what was wrong as
+    the cause.
     """
 
 
@@ -447,6 +462,7 @@ class PermissionedRetriever:
         self.recall_sample_rate = recall_sample_rate
         self._failures = 0
         self._failures_lock = threading.Lock()
+        self._warned: set[str] = set()  # kinds of odd hits warned about (see _deprecated)
 
     # ---- public API ------------------------------------------------------------------------
 
@@ -465,8 +481,9 @@ class PermissionedRetriever:
         """Return at most `k` hits the subject may read, best first.
 
         `query` is text, or a `Query` carrying a vector you computed. Raises `AuthorizationError`
-        when the authorizer fails or gives a malformed answer, `SearchError` when the backend's
-        search or count fails, `AuditError` when one of `required_observers` cannot record the
+        when the authorizer fails or gives a malformed answer (a filter nested more than 100 levels
+        deep included), `SearchError` when the backend's search or count fails or its search returns
+        something other than hits, `AuditError` when one of `required_observers` cannot record the
         call, and `ValueError` or `TypeError` for invalid arguments: `InvalidQuery`, a
         `ValueError`, when the query or `k` is at fault rather than the configuration. Nothing is
         returned in any of these cases.
@@ -916,6 +933,68 @@ class PermissionedRetriever:
         options: dict[str, Any] = {"exact": True} if op.mode == "exact" else {}
         return self.backend, options
 
+    def _replied(self, reply: Any, k: int) -> list[Hit]:
+        """The first k hits of a backend's reply, each checked for what the retriever relies on.
+
+        Raises `TypeError`, which the caller raises as `SearchError`, for what would fail later
+        anyway, outside the backend's errors, or be returned as it is: a reply that is not
+        iterable, or a hit without an id, text, score or metadata, with an id that cannot be hashed
+        (the retriever puts ids in sets), metadata that is not a mapping (the filter and the
+        authorizers read it as one), or a score that is not a number (hits are sorted by it).
+        With a reranker, a hit whose id is not a string is refused too, since the reranker's hits
+        are matched to the chunks by string id; with a redactor, a hit that is not a `Hit`, since
+        the redactor's hits must be `Hit` objects. Other hits that are not `Hit` objects, or whose
+        ids are not strings, work and are only warned about (`_deprecated`). The plan reads no
+        more than k hits of a search for k, so the rest are not checked.
+        """
+        hits = list(itertools.islice(reply, k))
+        for hit in hits:
+            missing = [name for name in ("id", "text", "score", "metadata") if not hasattr(hit, name)]
+            if missing:
+                raise TypeError(f"a search returned a {type(hit).__name__} without {', '.join(missing)}")
+            # As the backend made them, whatever `Hit` declares: a dataclass checks nothing.
+            doc_id: Any = hit.id
+            metadata: Any = hit.metadata
+            score: Any = hit.score
+            try:
+                hash(doc_id)
+            except TypeError:
+                raise TypeError(f"a hit's id must be hashable, and a {type(doc_id).__name__} is not") from None
+            if not isinstance(metadata, Mapping):
+                raise TypeError(f"a hit's metadata is a mapping, not {type(metadata).__name__}")
+            if isinstance(score, bool) or not isinstance(score, numbers.Real):
+                raise TypeError(f"a hit's score is a number, not {type(score).__name__}")
+            if self.reranker is not None and not isinstance(doc_id, str):
+                raise TypeError(f"with a reranker, a hit's id is a string, not {type(doc_id).__name__}")
+            if self.redactor is not None and not isinstance(hit, Hit):
+                raise TypeError(f"with a redactor, a search returns Hit objects, not {type(hit).__name__}")
+        return hits
+
+    def _deprecated(self, hits: Sequence[Any]) -> None:
+        """Warn, once per retriever for each kind, about hits that work but break `Hit`'s types.
+
+        Called from `_run` and `_arun`, outside the backend's errors, so that warnings turned into
+        errors are raised as they are; `stacklevel` points at the code that called `retrieve` or
+        awaited `aretrieve`.
+        """
+        odd = {
+            "class": next((type(h).__name__ for h in hits if not isinstance(h, Hit)), None),
+            "id": next((type(h.id).__name__ for h in hits if not isinstance(h.id, str)), None),
+        }
+        for kind, name in odd.items():
+            if name is None:
+                continue
+            with self._failures_lock:  # retrievals run in several threads at once
+                if kind in self._warned:
+                    continue
+                self._warned.add(kind)
+            what = f"an object of type {name}, not a Hit" if kind == "class" else f"a hit whose id is of type {name}"
+            warnings.warn(
+                f"the backend's search returned {what}; wardowl 4.0 will refuse it with SearchError",
+                DeprecationWarning,
+                stacklevel=4,
+            )
+
     @staticmethod
     def _counted(value: Any) -> int | None:
         """A backend's count: a whole number of chunks, or None when it cannot count them."""
@@ -929,7 +1008,9 @@ class PermissionedRetriever:
         if isinstance(op, _Search):
             backend, options = self._target(op)
             with _backend_errors("search failed"):
-                return backend.search(op.query, op.k, op.filter, **options)
+                hits = self._replied(backend.search(op.query, op.k, op.filter, **options), op.k)
+            self._deprecated(hits)
+            return hits
         if isinstance(op, _Count):
             counter: Any = self.backend
             with _backend_errors("count failed"):
@@ -959,8 +1040,12 @@ class PermissionedRetriever:
             asearch = getattr(backend, "asearch", None)
             with _backend_errors("search failed"):
                 if asearch is not None:
-                    return await asearch(op.query, op.k, op.filter, **options)
-                return await asyncio.to_thread(backend.search, op.query, op.k, op.filter, **options)
+                    reply = await asearch(op.query, op.k, op.filter, **options)
+                else:
+                    reply = await asyncio.to_thread(backend.search, op.query, op.k, op.filter, **options)
+                hits = self._replied(reply, op.k)
+            self._deprecated(hits)
+            return hits
         if isinstance(op, _Count):
             counter: Any = self.backend
             acount = getattr(counter, "acount", None)
@@ -1000,9 +1085,50 @@ class PermissionedRetriever:
 
     @staticmethod
     def _filter(value: Any) -> Filter | None:
-        if value is None or isinstance(value, (In, And, Or)):
-            return value
-        raise AuthorizationError(f"authorizer returned {type(value).__name__}, not a filter")
+        """An authorizer's filter or scope, checked whole: None, or a tree of `In`, `And` and `Or`
+        at most 100 levels deep (as `filter_from_dict` allows), or `AuthorizationError`.
+
+        `And` and `Or` take any clause, so a clause that is not a filter would otherwise reach the
+        backend and fail there, as a `SearchError` that blames the store. A filter deep enough to
+        reach Python's recursion limit would raise `RecursionError` wherever it is matched or
+        translated, and with `recheck=False` the retriever matches it outside the backend's errors.
+        The walk uses a stack of its own, so a deep filter cannot exhaust Python's, and looks at each
+        clause object once, so a clause shared by many parents is not walked again for each.
+        """
+        if value is None:
+            return None
+        if not isinstance(value, (In, And, Or)):
+            raise AuthorizationError(f"authorizer returned {type(value).__name__}, not a filter")
+        heights: dict[int, int] = {}  # id of each clause walked -> levels from it down to its deepest In
+        walking: set[int] = set()  # clauses whose own clauses are still being walked
+        # (clause, None) is still to be walked; (clause, its clauses) is walked once those are.
+        stack: list[tuple[Any, tuple[Any, ...] | None]] = [(value, None)]
+        while stack:
+            node, below = stack.pop()
+            key = id(node)
+            if below is not None:
+                walking.discard(key)
+                heights[key] = height = 1 + max(heights[id(c)] for c in below)
+                if height > _MAX_DEPTH:
+                    raise AuthorizationError(f"authorizer returned a filter nested more than {_MAX_DEPTH} levels deep")
+                continue
+            if key in heights:
+                continue
+            if key in walking:  # a clause that holds itself, which only object.__setattr__ can make
+                raise AuthorizationError("authorizer returned a filter that holds itself")
+            if isinstance(node, In):
+                heights[key] = 1
+                continue
+            if not isinstance(node, (And, Or)):
+                raise AuthorizationError(f"authorizer returned a filter holding {type(node).__name__}, not a filter")
+            clauses = tuple(getattr(node, "clauses", ()))
+            if not clauses:  # And() and Or() refuse this: an empty And would allow everything
+                raise AuthorizationError(f"authorizer returned an {type(node).__name__} without clauses")
+            walking.add(key)
+            stack.append((node, clauses))
+            stack.extend((clause, None) for clause in clauses)
+        result: Filter = value
+        return result
 
     @staticmethod
     def _reranked(hits: list[Hit], ranked: Sequence[Hit]) -> list[Hit]:

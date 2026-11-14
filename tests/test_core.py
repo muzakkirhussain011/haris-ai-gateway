@@ -4,6 +4,10 @@ import asyncio
 import copy
 import json
 import pickle
+import warnings
+from fractions import Fraction
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -144,6 +148,27 @@ def test_unsupported_action_fails_closed():
     retriever = PermissionedRetriever(InMemoryBackend(corpus()), MetadataACLAuthorizer(), action="delete")
     with pytest.raises(AuthorizationError):
         retriever.retrieve("leave", BOB)
+
+
+@pytest.mark.parametrize("strategy", ["prefilter", "postfilter"])
+def test_blank_group_names_grant_nothing_on_either_side(strategy):
+    # Subject accepts "" and "  " as groups, as an identity provider can send them; the sync layer
+    # never writes them. A chunk that lists one must not be readable through it.
+    docs = [
+        Document("empty", "leave", {"allowed_groups": [""]}),
+        Document("blank", "leave", {"allowed_groups": ["  ", "\t"]}),
+        Document("eng", "leave", {"allowed_groups": ["eng"]}),
+    ]
+    subject = Subject("bob", ["", "  ", "\t", "eng"])
+    retriever = PermissionedRetriever(InMemoryBackend(docs), MetadataACLAuthorizer(), strategy=strategy)
+    assert [h.id for h in retriever.retrieve("leave", subject, k=5).hits] == ["eng"]
+    assert MetadataACLAuthorizer().filter_for(subject) == Or(
+        In("allowed_users", ["bob"]), In("allowed_groups", ["eng", "*"])
+    )
+    # Nor does a blank marker for everyone: it would make a chunk that lists "" readable by all.
+    blank = PermissionedRetriever(InMemoryBackend(docs), MetadataACLAuthorizer(everyone=""), strategy=strategy)
+    assert blank.retrieve("leave", Subject("ann"), k=5).hits == []
+    assert [h.id for h in blank.retrieve("leave", subject, k=5).hits] == ["eng"]
 
 
 # ---- strategies --------------------------------------------------------------------------------
@@ -518,3 +543,220 @@ def test_async_authorizer_errors_fail_closed():
     retriever = PermissionedRetriever(InMemoryBackend(corpus()), authorizer, strategy="postfilter")
     with pytest.raises(AuthorizationError):
         asyncio.run(retriever.aretrieve("leave", BOB))
+
+
+# ---- odd answers: deep or malformed filters, replies that are not hits ------------------------
+
+
+def _deep(depth):
+    """A filter `depth` levels deep: an `In` inside `depth - 1` `And`s, built without recursion."""
+    f = In("allowed_groups", ["*"])
+    for _ in range(depth - 1):
+        f = And(f)
+    return f
+
+
+class _Ignores(InMemoryBackend):
+    """A store that ignores the filter: only the retriever then matches a pre-filtered hit against it."""
+
+    def search(self, query, k, filter=None):
+        return super().search(query, k)
+
+
+@pytest.mark.parametrize("recheck", [True, False])
+@pytest.mark.parametrize("store", [InMemoryBackend, _Ignores])
+def test_an_authorizers_filter_nested_more_than_a_hundred_levels_fails_closed(store, recheck):
+    # 5,000 levels exceed Python's recursion limit wherever the filter is matched or translated; with
+    # recheck=False, retrieve raised a bare RecursionError. Now neither depth is searched.
+    for depth in (101, 5_000):
+        authorizer = FunctionAuthorizer(MetadataACLAuthorizer().check, filter_for=lambda s, a, d=depth: _deep(d))
+        retriever = PermissionedRetriever(store(corpus()), authorizer, recheck=recheck)
+        with pytest.raises(AuthorizationError, match="nested more than 100 levels deep"):
+            retriever.retrieve("leave", BOB)
+        with pytest.raises(AuthorizationError, match="nested more than 100 levels deep"):
+            asyncio.run(retriever.aretrieve("leave", BOB))
+
+
+@pytest.mark.parametrize("recheck", [True, False])
+def test_an_authorizers_filter_a_hundred_levels_deep_is_searched(recheck):
+    authorizer = FunctionAuthorizer(MetadataACLAuthorizer().check, filter_for=lambda s, a: _deep(100))
+    retriever = PermissionedRetriever(InMemoryBackend(corpus()), authorizer, recheck=recheck)
+    for result in (retriever.retrieve("leave", BOB), asyncio.run(retriever.aretrieve("leave", BOB))):
+        assert [h.id for h in result.hits] == ["handbook"] and result.violations == 0
+
+
+def test_an_authorizers_scope_is_checked_like_its_filter():
+    class DeepScope:
+        def check(self, subject, hits, action="read"):
+            return [True] * len(hits)
+
+        def filter_for(self, subject, action="read"):
+            return None
+
+        def scope_for(self, subject, action="read"):
+            return _deep(5_000)
+
+    retriever = PermissionedRetriever(InMemoryBackend(corpus()), DeepScope())
+    with pytest.raises(AuthorizationError, match="nested more than 100 levels deep"):
+        retriever.retrieve("leave", BOB)
+    with pytest.raises(AuthorizationError, match="nested more than 100 levels deep"):
+        asyncio.run(retriever.aretrieve("leave", BOB))
+
+
+def _holding_itself():
+    f = Or(In("allowed_groups", ["eng"]))
+    object.__setattr__(f, "clauses", (f,))  # only possible around the constructor
+    return f
+
+
+def _and_without_clauses():
+    f = And(In("allowed_groups", ["eng"]))
+    object.__setattr__(f, "clauses", ())  # And() refuses this: it would allow everything
+    return f
+
+
+@pytest.mark.parametrize(
+    ("answer", "message"),
+    [
+        (lambda: Or(In("allowed_groups", ["eng"]), "everything"), "holding str, not a filter"),
+        (lambda: And(In("tenant", ["acme"]), Or(In("allowed_groups", ["eng"]), None)), "holding NoneType"),
+        (_and_without_clauses, "an And without clauses"),
+        (_holding_itself, "a filter that holds itself"),
+    ],
+    ids=["str", "nested None", "empty And", "cycle"],
+)
+@pytest.mark.parametrize("recheck", [True, False])
+def test_a_filter_holding_something_else_fails_as_the_authorizers_fault(answer, message, recheck):
+    # And() and Or() take any clause. Such a filter reached the store, whose translation failed on
+    # it, and the retrieval raised SearchError, which blames the store.
+    authorizer = FunctionAuthorizer(MetadataACLAuthorizer().check, filter_for=lambda s, a: answer())
+    retriever = PermissionedRetriever(InMemoryBackend(corpus()), authorizer, recheck=recheck)
+    with pytest.raises(AuthorizationError, match=message):
+        retriever.retrieve("leave", BOB)
+    with pytest.raises(AuthorizationError, match=message):
+        asyncio.run(retriever.aretrieve("leave", BOB))
+
+
+def test_a_filter_whose_clauses_are_shared_is_walked_once_per_clause():
+    # 2**64 paths through 65 clause objects: a walk along every path would not end.
+    f = In("allowed_groups", ["*"])
+    for _ in range(64):
+        f = Or(f, f)
+    authorizer = FunctionAuthorizer(lambda s, hits, a: [True] * len(hits), filter_for=lambda s, a: f)
+    store = InMemoryBackend([Document("open", "leave policy", {"allowed_groups": ["*"]})])
+    assert [h.id for h in PermissionedRetriever(store, authorizer).retrieve("leave", BOB).hits] == ["open"]
+
+
+class _Replies(InMemoryBackend):
+    """A store whose every search answers with `reply`, as a broken or foreign backend might."""
+
+    def __init__(self, reply):
+        super().__init__(corpus())
+        self.reply = reply
+
+    def search(self, query, k, filter=None):
+        return self.reply
+
+
+class _AsyncReplies(_Replies):
+    async def asearch(self, query, k, filter=None):
+        return self.reply
+
+
+READABLE = {"allowed_groups": ["*"]}
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        [Hit(["handbook"], "leave", 1.0, READABLE)],  # an id that cannot be hashed
+        [SimpleNamespace(id="handbook", score=1.0, metadata=READABLE)],  # no text
+        [Hit("handbook", "leave", None, READABLE)],  # passed the check and was returned as it was
+        [Hit("handbook", "leave", "high", READABLE), Hit("salaries", "leave", 0.5, READABLE)],
+        [Hit("handbook", "leave", True, READABLE)],
+        [Hit("handbook", "leave", 1.0, None)],  # no metadata to match the filter against
+        [Hit("handbook", "leave", 1.0, ["allowed_groups", "*"])],
+        [{"id": "handbook", "text": "leave", "score": 1.0, "metadata": READABLE}],
+        None,
+        "handbook",
+    ],
+)
+@pytest.mark.parametrize("store", [_Replies, _AsyncReplies], ids=["sync", "async"])
+@pytest.mark.parametrize(("strategy", "recheck"), [("prefilter", True), ("prefilter", False), ("postfilter", True)])
+def test_a_reply_that_is_not_hits_fails_as_the_stores_fault(reply, store, strategy, recheck):
+    events = []
+    retriever = PermissionedRetriever(
+        store(reply), MetadataACLAuthorizer(), strategy=strategy, recheck=recheck, observers=[events.append]
+    )
+    with pytest.raises(SearchError, match=r"^search failed$") as failure:
+        retriever.retrieve("leave", BOB)
+    assert isinstance(failure.value.__cause__, TypeError)
+    with pytest.raises(SearchError, match=r"^search failed$") as failure:
+        asyncio.run(retriever.aretrieve("leave", BOB))
+    assert isinstance(failure.value.__cause__, TypeError)
+    assert [(e.error, e.cause, e.returned_ids) for e in events] == [("SearchError", "TypeError", ())] * 2
+
+
+class _Duck:
+    """A hit of another class, with a hit's fields, as a backend of your own might return."""
+
+    def __init__(self, doc_id, text, score, metadata):
+        self.id, self.text, self.score, self.metadata = doc_id, text, score, metadata
+
+
+@pytest.mark.parametrize(
+    ("reply", "message"),
+    [
+        ([Hit(7, "leave policy", 1.0, READABLE)], "a hit whose id is of type int"),
+        ([_Duck("handbook", "leave policy", 1.0, READABLE)], "an object of type _Duck, not a Hit"),
+    ],
+)
+def test_a_hit_that_works_but_breaks_the_hit_type_is_used_with_a_deprecation_warning(reply, message):
+    # Such hits went through retrieve in 3.0.0: a minor release keeps them working, and warns.
+    retriever = PermissionedRetriever(_Replies(reply), MetadataACLAuthorizer())
+    with pytest.warns(DeprecationWarning, match=f"{message}; wardowl 4.0 will refuse it with SearchError") as caught:
+        result = retriever.retrieve("leave", BOB)
+    assert result.hits == reply
+    assert [Path(w.filename).name for w in caught if "wardowl 4.0" in str(w.message)] == [Path(__file__).name]
+    with warnings.catch_warnings(record=True) as again:
+        warnings.simplefilter("always")
+        assert retriever.retrieve("leave", BOB).hits == reply
+        assert asyncio.run(retriever.aretrieve("leave", BOB)).hits == reply
+    assert not [w for w in again if "wardowl 4.0" in str(w.message)]  # once per retriever
+
+    async def awaited():
+        return await PermissionedRetriever(_AsyncReplies(reply), MetadataACLAuthorizer()).aretrieve("leave", BOB)
+
+    with pytest.warns(DeprecationWarning, match=message) as caught:
+        assert asyncio.run(awaited()).hits == reply
+    assert [Path(w.filename).name for w in caught if "wardowl 4.0" in str(w.message)] == [Path(__file__).name]
+
+
+@pytest.mark.parametrize(
+    ("reply", "options"),
+    [
+        ([Hit(7, "leave policy", 1.0, READABLE)], {"reranker": lambda query, hits: hits}),
+        ([_Duck("handbook", "leave policy", 1.0, READABLE)], {"redactor": lambda subject, hits: hits}),
+    ],
+    ids=["int id, reranker", "another class, redactor"],
+)
+def test_a_hit_that_the_reranker_or_redactor_step_fails_on_is_refused(reply, options):
+    # In 3.0.0 these failed once such a hit passed the check: ValueError from matching the reranker's
+    # hits to the chunks by string id, AuthorizationError from the check that a redactor returns Hits.
+    retriever = PermissionedRetriever(_Replies(reply), MetadataACLAuthorizer(), **options)
+    for call in (lambda: retriever.retrieve("leave", BOB), lambda: asyncio.run(retriever.aretrieve("leave", BOB))):
+        with pytest.raises(SearchError, match=r"^search failed$") as failure:
+            call()
+        assert isinstance(failure.value.__cause__, TypeError)
+
+
+def test_only_the_hits_asked_for_are_read_and_any_real_number_is_a_score():
+    reply = [
+        Hit("handbook", "leave", 2, READABLE),
+        Hit("bob-review", "leave", Fraction(1, 2), {"allowed_users": ["bob"]}),
+        None,  # past k: never read
+    ]
+    retriever = PermissionedRetriever(_Replies(reply), MetadataACLAuthorizer())
+    assert [h.id for h in retriever.retrieve("leave", BOB, k=2).hits] == ["handbook", "bob-review"]
+    with pytest.raises(SearchError):
+        retriever.retrieve("leave", BOB, k=3)
