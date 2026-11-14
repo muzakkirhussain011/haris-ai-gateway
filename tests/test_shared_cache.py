@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 import time
 import uuid
 
@@ -73,6 +74,61 @@ class FakeShared:
             raise ConnectionError("down")
         for key in [k for k in self.data if k.startswith(prefix)]:
             del self.data[key]
+
+
+class IndexedShared(FakeShared):
+    """FakeShared with the index RedisCache keeps: the names written for each subject id. Records
+    every delete_prefix (a scan, in Redis), and can run `between` once inside a write, after the
+    names are listed and before the entries exist, as RedisCache's pipeline orders them."""
+
+    def __init__(self):
+        super().__init__()
+        self.indexes: dict[str, set[str]] = {}
+        self.prefixes: list[str] = []
+        self.between = None
+
+    def set_many_indexed(self, entries, ttl, index):
+        if self.fail:
+            raise ConnectionError("down")
+        self.indexes.setdefault(index, set()).update(entries)
+        if self.between is not None:
+            between, self.between = self.between, None
+            between()
+        self.data.update(entries)
+
+    def delete_indexed(self, index, prefix):
+        if self.fail:
+            raise ConnectionError("down")
+        for key in self.indexes.get(index, ()):
+            if key.startswith(prefix):
+                self.data.pop(key, None)
+
+    def delete_prefix(self, prefix):
+        self.prefixes.append(prefix)
+        super().delete_prefix(prefix)
+
+
+class Unindexed:
+    """A shared cache used as wardowl 3.0 used it, with no index: what a replica not yet upgraded writes."""
+
+    def __init__(self, store):
+        self.store = store
+
+    def get_many(self, keys):
+        return self.store.get_many(keys)
+
+    def set_many(self, entries, ttl):
+        self.store.set_many(entries, ttl)
+
+    def delete_prefix(self, prefix):
+        self.store.delete_prefix(prefix)
+
+
+def _hash_tag(key):
+    """What Redis Cluster hashes for a key: the text between its first "{" and the next "}", if any."""
+    start = key.find("{")
+    end = key.find("}", start + 1)
+    return key[start + 1 : end] if start >= 0 and end > start + 1 else key
 
 
 def _replicas(shared, clock=None, ttl=30.0):
@@ -331,6 +387,181 @@ def test_async_paths_use_the_shared_cache():
     assert (two.checks, two.filters) == (0, 0)
 
 
+# ---- invalidate(subject) through the index of a subject's entries ---------------------------------
+
+ANN = Subject("ann", ["hr"])
+
+
+def test_invalidating_a_subject_deletes_the_entries_its_index_lists_and_scans_nothing():
+    shared = IndexedShared()
+    _, (_one, two), (a, b) = _replicas(shared)
+    a.check(BOB, HITS)
+    a.filter_for(BOB)
+    a.check(Subject("bob", ["hr"]), HITS[:1])  # the same id with other groups: in the same index
+    bobs = set(shared.data)
+    a.check(ANN, HITS)
+    anns = set(shared.data) - bobs
+    assert (len(bobs), len(anns), len(shared.indexes)) == (4, 2, 2)  # one index per subject id
+    a.invalidate(BOB)
+    assert shared.prefixes == []  # nothing scanned for a subject
+    assert {key for key in shared.data if "!epoch" not in key} == anns  # bob's entries deleted, ann's kept
+    b.check(BOB, HITS)
+    b.check(ANN, HITS)
+    assert two.checks == 2  # bob was asked again, ann came from the shared cache
+    a.invalidate()
+    assert shared.prefixes == [f"{NS}:"]  # everyone: the one scan
+    assert all("!epoch" in key for key in shared.data)
+
+
+def test_entries_written_without_an_index_are_refused_after_invalidate_and_deleted_by_invalidating_everyone():
+    # A rolling upgrade: a replica still on 3.0 writes entries that no index lists.
+    shared = IndexedShared()
+    clock = Clock()
+    old_inner, third_inner = Counting(), Counting()
+    old = CachingAuthorizer(old_inner, shared=Unindexed(shared), namespace=NS, clock=clock)
+    new = CachingAuthorizer(Counting(), shared=shared, namespace=NS, clock=clock)
+    old.check(BOB, HITS)
+    legacy = dict(shared.data)
+    assert len(legacy) == 2 and not shared.indexes
+    new.invalidate(BOB)
+    assert legacy.items() <= shared.data.items()  # not deleted: no index lists them...
+    CachingAuthorizer(third_inner, shared=shared, namespace=NS, clock=clock).check(BOB, HITS)
+    assert third_inner.checks == 2  # ...but an upgraded replica refuses them, under the new epoch
+    shared.data.update(legacy)  # (it wrote its own answers under the same names)
+    clock.now += 1.1  # old's own copies expire, so it reads the shared cache again
+    old.check(BOB, HITS)
+    assert old_inner.checks == 4  # and so does the replica not yet upgraded
+    new.invalidate()
+    assert all("!epoch" in key for key in shared.data)  # the scan of everyone deletes them
+
+
+def test_an_entry_written_while_invalidate_runs_stays_listed_and_is_never_read():
+    shared = IndexedShared()
+    clock, (_one, _two), (a, b) = _replicas(shared)
+    # b's invalidate() runs after a listed its names and before a wrote its entries, which a's
+    # answer, obtained before the invalidation, carries the old epoch for.
+    shared.between = lambda: b.invalidate(BOB)
+    a.check(BOB, HITS)
+    late = {key for key in shared.data if "!epoch" not in key}
+    assert len(late) == 2 and late <= set().union(*shared.indexes.values())
+    third_inner = Counting()
+    CachingAuthorizer(third_inner, shared=shared, namespace=NS, clock=clock).check(BOB, HITS)
+    assert third_inner.checks == 2  # not read
+    b.invalidate(BOB)
+    assert not late & set(shared.data)  # listed, so the next invalidation deletes them
+
+
+def _bobs_names():
+    """The names of everything a replica keeps in the shared cache for bob: entries, epoch, index."""
+    shared = IndexedShared()
+    _, _, (a, _b) = _replicas(shared)
+    a.check(BOB, HITS)
+    a.filter_for(BOB)
+    a.check(Subject("bob", ["hr"]), HITS[:1])
+    entries = set(shared.data)
+    a.invalidate(BOB)  # writes bob's epoch
+    names = entries | set(shared.data) | set(shared.indexes)
+    assert len(names) == 6  # four entries, the epoch and the index
+    return names
+
+
+def test_a_subjects_entries_epoch_and_index_share_one_cluster_hash_tag():
+    # Redis Cluster runs a pipeline or a multi-key command only on keys of one slot.
+    assert len({_hash_tag(name) for name in _bobs_names()}) == 1
+
+
+def test_a_subjects_entries_epoch_and_index_share_one_cluster_slot_by_redis_py():
+    key_slot = pytest.importorskip("redis.crc").key_slot
+    assert len({key_slot(name.encode()) for name in _bobs_names()}) == 1
+
+
+def test_ainvalidate_clears_redis_in_a_worker_thread_while_the_event_loop_runs():
+    class Slow(IndexedShared):
+        def __init__(self):
+            super().__init__()
+            self.entered, self.release = threading.Event(), threading.Event()
+            self.threads: set[int] = set()
+
+        def set_many(self, entries, ttl):  # in the index's path, only epochs are written this way
+            self.threads.add(threading.get_ident())
+            super().set_many(entries, ttl)
+
+        def delete_indexed(self, index, prefix):
+            self.threads.add(threading.get_ident())
+            self.entered.set()
+            assert self.release.wait(5), "the event loop never ran while Redis was being cleared"
+            super().delete_indexed(index, prefix)
+
+    shared = Slow()
+    _, (_one, two), (a, b) = _replicas(shared)
+    a.check(BOB, HITS)
+    a.check(ANN, HITS)
+
+    async def main():
+        task = asyncio.create_task(a.ainvalidate(BOB))
+        while not shared.entered.is_set():  # this loop runs while the worker thread waits on Redis
+            await asyncio.sleep(0.01)
+        shared.release.set()
+        await task
+        return threading.get_ident()
+
+    loop_thread = asyncio.run(main())
+    assert shared.threads and loop_thread not in shared.threads
+    b.check(BOB, HITS)
+    b.check(ANN, HITS)
+    assert two.checks == 2  # bob's entries are gone, ann's are not
+
+
+def test_ainvalidate_finishes_in_its_thread_when_the_task_awaiting_it_is_cancelled():
+    class Slow(IndexedShared):
+        def __init__(self):
+            super().__init__()
+            self.entered, self.release = threading.Event(), threading.Event()
+
+        def delete_indexed(self, index, prefix):
+            self.entered.set()
+            assert self.release.wait(5)
+            super().delete_indexed(index, prefix)
+
+    shared = Slow()
+    _, _, (a, _b) = _replicas(shared)
+    a.check(BOB, HITS)
+
+    async def main():
+        task = asyncio.create_task(a.ainvalidate(BOB))
+        while not shared.entered.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        shared.release.set()
+
+    asyncio.run(main())  # which waits for the worker thread before it returns
+    assert all("!epoch" in key for key in shared.data)
+
+
+@pytest.mark.parametrize("make", [FakeShared, IndexedShared], ids=["prefix", "index"])
+def test_ainvalidate_refuses_and_raises_as_invalidate_does(make):
+    shared = make()
+    _, _, (a, _b) = _replicas(shared)
+    with pytest.raises(TypeError):
+        asyncio.run(a.ainvalidate(42))
+    with pytest.raises(ValueError):
+        asyncio.run(a.ainvalidate(""))
+    shared.fail = True
+    with pytest.raises(ConnectionError):
+        asyncio.run(a.ainvalidate(BOB))  # the caller asked for a revocation now: its failure is reported
+
+
+def test_ainvalidate_without_a_shared_cache_drops_this_processs_answers():
+    inner = Counting()
+    cache = CachingAuthorizer(inner)
+    cache.check(BOB, HITS)
+    asyncio.run(cache.ainvalidate(BOB.id))
+    cache.check(BOB, HITS)
+    assert inner.checks == 4
+
+
 @settings(max_examples=80, deadline=None)
 @given(corpora(max_size=15), subjects, queries, st.integers(1, 5), st.sampled_from(["auto", "prefilter", "postfilter"]))
 def test_sharing_never_changes_the_answer(docs, subject, query, k, strategy):
@@ -427,6 +658,79 @@ def test_the_hold_of_an_invalidation_reaches_replicas_through_redis(decoding):
     assert two.checks == 6  # after it, kept as usual
     a.invalidate()
     shared.delete_prefix(f"{namespace}!")  # the epochs, which outlive the test otherwise
+
+
+def _no_scan(*args, **kwargs):
+    raise AssertionError("invalidate() of one subject scanned the database")
+
+
+@needs_redis
+def test_redis_invalidate_of_one_subject_deletes_through_its_index_without_a_scan(monkeypatch):
+    client, namespace, clock = _redis(), f"wo-{uuid.uuid4().hex}", Clock()
+    clock.now = time.time()  # shared entries carry wall-clock expiry times
+    shared = RedisCache(client, signing_key=b"s" * 32)
+    one, two = Counting(), Counting()
+    a = CachingAuthorizer(one, shared=shared, namespace=namespace, clock=clock)
+    b = CachingAuthorizer(two, shared=shared, namespace=namespace, clock=clock)
+    ann = Subject("ann", ["hr"])
+    a.check(BOB, HITS)
+    a.filter_for(BOB)
+    bobs = set(client.scan_iter(match=f"{namespace}:*"))
+    a.check(ann, HITS)
+    anns = set(client.scan_iter(match=f"{namespace}:*")) - bobs
+    indexes = list(client.scan_iter(match=f"{namespace}!index:*"))
+    assert (len(bobs), len(anns), len(indexes)) == (3, 2, 2)
+    assert all(30_000 < client.pttl(index) <= 90_000 for index in indexes)  # ttl plus a minute
+    assert all(len(client.zrange(index, 0, -1)) in (2, 3) for index in indexes)
+    monkeypatch.setattr(client, "scan_iter", _no_scan)
+    a.invalidate(BOB)
+    monkeypatch.undo()
+    assert [client.exists(key) for key in sorted(bobs | anns)] == [key in anns for key in sorted(bobs | anns)]
+    b.check(BOB, HITS)
+    b.check(ann, HITS)
+    assert two.checks == 2  # bob was asked again, ann came from Redis
+    a.invalidate()  # everyone: a scan, which deletes every entry
+    assert not list(client.scan_iter(match=f"{namespace}:*"))
+    shared.delete_prefix(f"{namespace}!")  # the epochs and indexes, which outlive the test otherwise
+
+
+@needs_redis
+def test_redis_entries_written_without_an_index_are_refused_then_deleted_by_invalidating_everyone(monkeypatch):
+    client, namespace, clock = _redis(), f"wo-{uuid.uuid4().hex}", Clock()
+    clock.now = time.time()
+    shared = RedisCache(client, signing_key=b"s" * 32)
+    old = CachingAuthorizer(Counting(), shared=Unindexed(shared), namespace=namespace, clock=clock)
+    new = CachingAuthorizer(Counting(), shared=shared, namespace=namespace, clock=clock)
+    old.check(BOB, HITS)  # as a replica still on 3.0 writes them: no index
+    legacy = set(client.scan_iter(match=f"{namespace}:*"))
+    assert len(legacy) == 2 and not list(client.scan_iter(match=f"{namespace}!index:*"))
+    monkeypatch.setattr(client, "scan_iter", _no_scan)
+    new.invalidate(BOB)
+    monkeypatch.undo()
+    assert all(client.exists(key) for key in legacy)  # not deleted, as no index lists them...
+    third = Counting()
+    CachingAuthorizer(third, shared=shared, namespace=namespace, clock=clock).check(BOB, HITS)
+    assert third.checks == 2  # ...but refused, under the epoch the invalidation wrote
+    new.invalidate()
+    assert not list(client.scan_iter(match=f"{namespace}:*"))
+    shared.delete_prefix(f"{namespace}!")
+
+
+@needs_redis
+def test_redis_index_drops_long_expired_names_and_deletes_only_under_its_prefix():
+    client, ns = _redis(), f"wo-{uuid.uuid4().hex}"
+    cache = RedisCache(client)
+    index, a, b, old = f"{ns}!index:{{t}}", f"{ns}:{{t}}:a", f"{ns}:{{t}}:b", f"{ns}:{{t}}:old"
+    client.zadd(index, {old: int(time.time() * 1000) - 61_000})  # its entry expired over a minute ago
+    cache.set_many_indexed({a: b"1", b: b"2"}, ttl=30, index=index)
+    assert sorted(client.zrange(index, 0, -1)) == [a.encode(), b.encode()]
+    assert 30_000 < client.pttl(index) <= 90_000 and 0 < client.pttl(a) <= 30_000
+    client.set(f"{ns}x:other", b"3")
+    client.zadd(index, {f"{ns}x:other": time.time() * 1000})  # a name someone else put there
+    cache.delete_indexed(index, f"{ns}:{{t}}:")
+    assert cache.get_many([a, b, f"{ns}x:other"]) == [None, None, b"3"]
+    assert client.zcard(index) == 3  # the names stay until they expire from the index
+    client.delete(index, f"{ns}x:other")
 
 
 def test_a_shared_filter_nested_too_deep_is_a_miss():

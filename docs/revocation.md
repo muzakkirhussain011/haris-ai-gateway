@@ -68,9 +68,10 @@ authorizer = CachingAuthorizer(
 
 - **Revocations nobody reports** (a change made directly in the permission service): the delay is at
   most the service's own staleness plus `ttl`.
-- **Revocations you report** by calling `authorizer.invalidate(user_id)` after the change: no
-  retrieval that starts in that process afterwards uses the old decision, and other replicas stop
-  within `local_ttl`. The tests revoke a permission under concurrent retrievals, with one and three
+- **Revocations you report** by calling `authorizer.invalidate(user_id)` after the change (in
+  async code, `await authorizer.ainvalidate(user_id)`, which does the same without blocking the
+  event loop): no retrieval that starts in that process afterwards uses the old decision, and
+  other replicas stop within `local_ttl`. The tests revoke a permission under concurrent retrievals, with one and three
   replicas, and check exactly this. With a service that is itself behind by up to S seconds, its
   own answers can still predate the change for S seconds, cache or not; the cache adds nothing to
   that when `source_staleness` is at least S. The bound after `invalidate()` is then
@@ -103,7 +104,12 @@ and put the revocation in the request path of the change itself:
   the authorizer, or change what its `entities` function returns.
 - **Do not cache, or invalidate before you report success.** Either leave `CachingAuthorizer` out,
   or call `invalidate(user_id)` in the same code that applies the revocation, and only then tell the
-  administrator it is done. `invalidate()` raises if it cannot reach Redis.
+  administrator it is done. `invalidate()` raises if it cannot reach Redis. It also waits for Redis
+  in the calling thread, so in an `async def` handler `await ainvalidate(user_id)` instead, which
+  waits in a worker thread and raises the same errors; if that task is cancelled, call it again
+  before reporting success. With `RedisCache`, `invalidate(user_id)` costs two round trips plus
+  one per 500 entries its index lists, while `invalidate()` of everyone scans the whole Redis
+  database ([what each costs](operations.md#sharing-the-cache-across-processes)).
 - **For permissions on chunks,** call `set_metadata` in that same code, and allow for the store's
   visibility delay.
 - **Keep `recheck=True`** (the default), so every pre-filtered hit is decided by the authorizer as

@@ -49,6 +49,10 @@ authorizer = CachingAuthorizer(openfga, ttl=30, maxsize=100_000)
   role change you handled yourself; `invalidate()` drops everything. An answer the permission
   service gave before the call, to a retrieval still in progress, is not cached after it: once
   `invalidate()` returns, no retrieval that starts in this process uses an answer from before it.
+  With a shared cache, `invalidate()` waits for it in the calling thread; in async code,
+  `await authorizer.ainvalidate(user_id)` (or `ainvalidate()`) does the same work with the shared
+  cache's calls in a worker thread, so the event loop keeps serving
+  ([what each costs](#sharing-the-cache-across-processes)).
 - **A service that is behind:** a permission service can answer from data some seconds old
   (SpiceDB under `minimizeLatency`, OpenFGA's check cache, a policy engine that has not reloaded),
   and so give an answer from before the change just after `invalidate()`. For `source_staleness`
@@ -87,10 +91,12 @@ authorizer = CachingAuthorizer(openfga, ttl=30, shared=shared, namespace="openfg
 - **The revocation bound still holds.** Each shared entry carries its expiry time, and a replica
   that copies it keeps it only for the time it has left, never a fresh `ttl`. This relies on
   replicas' clocks agreeing, as NTP keeps them.
-- **`invalidate(subject)` reaches every replica within `local_ttl`.** It clears its own process and
-  Redis at once; every other replica stops using its own copy within `local_ttl` seconds. Lower
-  `local_ttl` for faster revocation at the cost of more Redis reads. It raises if Redis cannot be
-  cleared, since the caller asked for the revocation now.
+- **`invalidate(subject)` reaches every replica within `local_ttl`.** It clears its own process at
+  once, and in Redis writes a new epoch for the id (next item), after which no replica takes from
+  Redis an entry written for the id before it, then deletes the id's entries; every other replica
+  stops using its own copy within `local_ttl` seconds. Lower `local_ttl` for faster revocation at
+  the cost of more Redis reads. It raises if Redis cannot be cleared, since the caller asked for
+  the revocation now.
 - **A late answer from another replica is never read.** A replica may have asked the permission
   service just before the revocation and write its answer to Redis just after. `invalidate()`
   therefore also stores a new random epoch (one per subject id, and one for `invalidate()` of
@@ -101,6 +107,36 @@ authorizer = CachingAuthorizer(openfga, ttl=30, shared=shared, namespace="openfg
   rolling upgrade, replicas of earlier versions ignore the hold. An attacker who can write to your
   Redis and copies back a signed entry together with its old epoch can extend a decision only until
   that entry's own expiry, at most `ttl` after the permission service gave it.
+- **What an invalidation costs, and where it waits.** For each subject id, `RedisCache` keeps an
+  index of the names of the entries written for it: a sorted set under the id's hash tag, updated
+  in the same pipeline as the entries (the names first), kept for `ttl` plus a minute after its
+  last write, and cleared on each write of the names whose entries expired more than a minute
+  before. `invalidate(subject)` writes the id's epoch, reads its index and deletes the entries it
+  lists with `UNLINK`: a round trip for the epoch, one for the index and one per 500 entries,
+  however many other keys the database holds. `invalidate()` of everyone writes the global epoch,
+  then deletes the namespace's entries with `SCAN`, which visits every key in the database, other
+  applications' keys included, about 1,000 per round trip: about 10,000 round trips for a Redis
+  that also holds 10 million sessions or queue items. Either way `invalidate()` waits for Redis in
+  the calling thread, which in an `async def` handler is the event loop's. There, use
+  `await authorizer.ainvalidate(user_id)`, or `ainvalidate()` for everyone: it drops this
+  process's answers at once, runs the Redis calls in a worker thread with `asyncio.to_thread`, and
+  returns or raises once they are done, as `invalidate()` does. If the task awaiting it is
+  cancelled, the thread still finishes, but you do not learn whether it succeeded.
+- **What `invalidate(subject)` leaves in Redis.** It deletes the entries its index lists. Every
+  entry written for the id before the new epoch, listed or not, was written under an earlier epoch
+  or none, and no replica takes it from Redis once the new epoch is written; one the index does not
+  list stays in Redis until it expires, within `ttl`. That happens to entries written by replicas
+  of 3.0 or earlier during a rolling upgrade, to one a replica writes while the invalidation runs
+  (the index lists it for the next one), and to one whose name is missing from the index: when
+  replicas sharing a namespace run with `ttl` values more than a minute apart, the index can expire
+  before an entry of the replica with the longer one, and an index that Redis evicted lists
+  nothing. `invalidate()` of everyone scans, so it deletes them all.
+- **Keep Redis from evicting these keys.** Epochs, indexes and entries all expire, so under memory
+  pressure any `maxmemory-policy` other than `noeviction` may evict them. Without its index,
+  `invalidate(subject)` deletes none of the entries it listed; without its epoch, an entry written
+  before the invalidation that it did not delete can be used again until it expires. Give the
+  cache a Redis whose policy is `noeviction` (when it is full it refuses writes: an answer it cannot
+  store is a miss, and `invalidate()` raises), or one with memory to spare.
 - **One namespace per policy.** `namespace` is required with a shared cache. Every
   `CachingAuthorizer` with the same Redis and `namespace` uses the same answers, whatever authorizer
   it wraps, so give each differently configured authorizer (another policy, OpenFGA store, tenant
@@ -110,9 +146,13 @@ authorizer = CachingAuthorizer(openfga, ttl=30, shared=shared, namespace="openfg
   nor see other processes, so choosing the names stays your part.
 - **Upgrading.** Entries written by an earlier version are not read when the keys or format changed,
   as they did in 1.3 and again with exact, type-aware keys, so the first requests after such an
-  upgrade ask the permission service. During a rolling upgrade, an `invalidate(subject)` made by a
-  replica of one version does not clear the other version's entries: call `invalidate()` once the
-  upgrade is done, or allow for `ttl`.
+  upgrade ask the permission service. During such a rolling upgrade, an `invalidate(subject)` made
+  by a replica of one version does not clear the other version's entries: call `invalidate()` once
+  the upgrade is done, or allow for `ttl`. From 3.0 to 3.1 the keys, the format and the epochs are
+  the same, so each version refuses what either wrote before an invalidation, and an
+  `invalidate(subject)` made by a 3.0 replica still deletes every entry of the id; but entries that
+  3.0 replicas write are in no index, so one made by a 3.1 replica leaves them in Redis until they
+  expire. Call `invalidate()` once every replica runs 3.1 to delete them at once.
 - **A failing or slow Redis never decides anything.** A read or write that fails is logged and
   treated as a miss: the permission service is asked. A slow Redis only fails once the client gives
   up, and redis-py waits without limit by default, so a Redis that hangs would hold up every
@@ -127,7 +167,11 @@ authorizer = CachingAuthorizer(openfga, ttl=30, shared=shared, namespace="openfg
   without a valid signature is ignored.
 
 Another store works too: pass any object with `get_many`, `set_many` and `delete_prefix`
-(`wardowl.caching.SharedCache`).
+(`wardowl.caching.SharedCache`). `invalidate(subject)` then calls `delete_prefix` with the id's
+prefix. If the store also has `set_many_indexed(entries, ttl, index)` and
+`delete_indexed(index, prefix)`, as `RedisCache` does, `CachingAuthorizer` writes each subject id's
+entries through the first, with an index name of their own, and `invalidate(subject)` deletes them
+through the second; `invalidate()` of everyone always calls `delete_prefix`.
 
 ## Changing a document's permissions
 
