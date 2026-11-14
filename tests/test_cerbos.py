@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -163,6 +164,24 @@ def test_check_batches_and_uses_the_resource_field(server):
     assert authz.check(ANN, hits) == [True] * 5
     assert [len(p["resources"]) for _, p in server.requests] == [2, 2, 1]
     assert server.requests[0][1]["resources"][0]["resource"]["id"] == "d0"
+
+
+def test_total_timeout_bounds_every_batch_of_a_check_together(server):
+    respond = _effects({"eng"})
+
+    def slow(path, payload):
+        time.sleep(0.15)
+        return respond(path, payload)
+
+    server.responder = slow
+    hits = [Hit(f"c{i}", "t", 1.0, {"team": "eng"}) for i in range(20)]
+    authz = CerbosAuthorizer(server.url, batch_size=1, timeout=2.0, total_timeout=0.4)
+    with pytest.raises(AuthorizationError, match="total_timeout ran out") as failure:
+        authz.check(ANN, hits)
+    assert isinstance(failure.value.__cause__, TimeoutError) and len(server.requests) <= 3
+    server.requests.clear()
+    server.responder = respond
+    assert authz.check(ANN, hits) == [True] * 20 and len(server.requests) == 20  # its own deadline
 
 
 @pytest.mark.parametrize(

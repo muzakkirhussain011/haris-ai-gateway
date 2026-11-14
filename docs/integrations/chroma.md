@@ -63,6 +63,18 @@ chunk between them can leave list fields the update does not know of. Every sear
 checks each hit's JSON copy against the filter, and drops a hit that the filter matches only
 through such a field.
 
+## One writer at a time
+
+`ChromaBackend` takes no `revision`, unlike pgvector and MongoDB: chromadb's `add`, `upsert` and
+`update` take no condition on the stored record, so there is no write that compares a revision and
+writes in one step. Its `add` (a delete, then an add) and its `set_metadata` (a read, then an
+update) are each two calls, and the write that lands last wins. When an indexer and a permission
+sync write the same document, a late write from data read before a revocation undoes it, so run
+the writes for each document one after another
+([One writer at a time for each document](../operations.md#one-writer-at-a-time-for-each-document)).
+`set_metadata` is not made a single call: that would mean reading each chunk's text and vector and
+writing them back, which opens a race of its own with an `add` of new text in between.
+
 ## How the filter becomes `where`
 
 `In(field, values)` becomes an `$or` of `$in` on the scalar field (one per value type, since
@@ -124,8 +136,8 @@ whichever client you use.
 
 Chroma searches an HNSW index, and the backend has no switch for exact search, so treat a filtered
 search as approximate, like an unfiltered one. In the [benchmarks](../benchmarks.md) (local Chroma
-1.5.9, default settings), pre-filtered searches found 0.996 to 1.000 of the true top 10 for users
-who may read 0.06% to 20% of the collection, and 0.990 with everything readable, which is the
+1.5.9, default settings), pre-filtered searches found 0.995 to 1.000 of the true top 10 for users
+who may read 0.06% to 20% of the collection, and 0.986 with everything readable, which is the
 index's own recall: high, but not exact. A result of `k` chunks can then miss a chunk the user may
 read and still say `complete=True`; a shorter one says `complete=False`, since the index may have
 stopped early ([Concepts](../concepts.md#what-a-result-tells-you)). Chroma's HNSW settings,
@@ -134,13 +146,13 @@ such as `ef_search` in the collection's `hnsw` configuration, trade latency for 
 ## Performance
 
 In the [benchmarks](../benchmarks.md) (57,600 chunks, local Chroma 1.5.9), pre-filtered queries kept
-recall at 0.990 or better, but took 200 to 900 ms against about 18 ms unfiltered, rising with the
+recall at 0.986 or better, but took 200 to 900 ms against about 16 ms unfiltered, rising with the
 number of groups in the filter. So:
 
 - When users may read a small part of the collection, keep the default (`auto`, which pre-filters):
   it is the only strategy that finds their documents.
 - When users may read most of it, `strategy="postfilter"` returns the same results far faster
-  (20 ms instead of 876 ms when everything was readable). That holds when post-filtering sends
+  (19.5 ms instead of 848.4 ms when everything was readable). That holds when post-filtering sends
   Chroma no `where`, as with `MetadataACLAuthorizer` in the benchmark. An `AllOf` whose parts all
   give filters sends its whole filter as a scope even with `strategy="postfilter"`
   ([Concepts](../concepts.md#what-the-store-receives)), so post-filtering is then no faster.

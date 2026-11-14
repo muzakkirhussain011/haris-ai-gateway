@@ -32,8 +32,9 @@
 </p>
 
 A RAG answer can quote a chunk that the person asking is not allowed to read, because vector search
-ranks chunks by similarity, not by permission. **wardowl stops that:** it applies your permission
-system inside the vector store's search, checks every hit again and fails closed.
+ranks chunks by similarity, not by permission. **wardowl stops that:** it puts your permission
+system's filter inside the vector store's search when the system can express one, checks every hit
+before it is returned and fails closed.
 
 ```bash
 pip install wardowl
@@ -62,25 +63,26 @@ pgvector, Qdrant, Milvus, OpenFGA, SpiceDB, OPA, Cerbos and
 [more](https://muzakkirhussain011.github.io/wardowl/integrations/index.html). `aretrieve` is the
 async equivalent, with the same arguments and guarantees.
 
-**Measured** on 57,600 real chunks (BEIR FiQA, run of 2026-10-16,
+**Measured** on 57,600 real chunks (BEIR FiQA, run of 2026-11-08,
 [full results](https://github.com/muzakkirhussain011/wardowl/blob/main/benchmarks/results/fiqa-qwen3-embedding-0.6b.md)):
 
 - **No forbidden chunk** in 21,000 retrievals through wardowl, on pgvector, Chroma and brute-force
   search.
 - **Recall kept where filtering afterwards fails:** for users who may read 0.9% of the corpus, far
-  from what they ask about, taking the top 10 and then filtering found none of the true top 10
-  (recall@10 0.000); wardowl's pre-filter on pgvector found 99.5% of them (0.995).
+  from what they ask about, taking the top 10 and then filtering found almost none of the true top
+  10 (recall@10 0.001); wardowl's pre-filter on pgvector found 99.1% of them (0.991).
 
 <p align="center">
   <a href="https://muzakkirhussain011.github.io/wardowl/#see-it-in-47-seconds"><img src="https://raw.githubusercontent.com/muzakkirhussain011/wardowl/main/docs/_static/brand/wardowl-film-thumbnail.webp" alt="Watch the 47-second wardowl film: your information stays yours" width="720"></a>
 </p>
 
 **wardowl** is an open-source Python library for permission-aware retrieval in RAG
-(retrieval-augmented generation). It applies your permission system (OpenFGA, SpiceDB, OPA, Cerbos,
-Cedar, access lists or your own rules) inside your vector store's search (pgvector, Pinecone,
-Qdrant, Elasticsearch, Milvus and more), checks every hit again and fails closed, so each user's
-LLM prompt holds only the documents that user is allowed to read. It was called needtoknow before
-version 2.0.
+(retrieval-augmented generation). When your permission system can express what a user may read as
+a filter (OpenFGA, SpiceDB, Cerbos, access lists on the chunks, and OPA when its policy returns
+one), wardowl puts that filter inside your vector store's search (pgvector, Pinecone, Qdrant,
+Elasticsearch, Milvus and more) and checks every hit again. Cedar, Casbin and Ory Keto check each
+candidate after the search instead. Either way it fails closed, so each user's LLM prompt holds
+only the documents that user is allowed to read. It was called needtoknow before version 2.0.
 
 ## Why
 
@@ -580,22 +582,22 @@ for randomly generated corpora, permissions, users and queries, every strategy m
 ## Benchmarks
 
 On 57,600 real chunks (BEIR FiQA, Qwen3-Embedding-0.6B), across 33,000 retrievals, no wardowl
-strategy returned a single forbidden chunk. Filtering inside the search kept recall@10 at 0.949 or
+strategy returned a single forbidden chunk. Filtering inside the search kept recall@10 at 0.950 or
 better on pgvector for users who may read anywhere from 0.06% to 100% of the corpus, including when
 what they may read is far from what they ask about. Filtering after a top-10 search found almost
 nothing for selective permissions. Method, tables and caveats: [Benchmarks](https://muzakkirhussain011.github.io/wardowl/benchmarks.html).
 
 | Readable (far from the query) | Naive top-k, then filter | wardowl postfilter | wardowl prefilter (pgvector) |
 |---|---|---|---|
-| 0.9% | 0.000 | 0.048 | 0.995 |
-| 4.8% | 0.000 | 0.314 | 0.950 |
-| 20% | 0.041 | 0.974 | 0.949 |
+| 0.9% | 0.001 | 0.048 | 0.991 |
+| 4.8% | 0.001 | 0.314 | 0.952 |
+| 20% | 0.042 | 0.977 | 0.950 |
 
 At a million chunks (MS MARCO in PostgreSQL + pgvector, on 4 CPUs), pre-filtering kept recall@10
-between 0.88 and 0.97 for users who may read 0.1% to 100% of the corpus, at a median of 3 to 21 ms
-one query at a time; the machine served up to 126 requests a second. Open Policy Agent as the
-permission service cost 8 to 9% of throughput, and `CachingAuthorizer` recovered nearly all of it. No
-retrieval leaked: none of the 185,040 chunks returned under concurrent load, each checked against its
+between 0.886 and 0.973 for users who may read 0.1% to 100% of the corpus, at a median of 3 to 21 ms
+one query at a time; the machine served up to 131 requests a second. Open Policy Agent as the
+permission service cost 7.9 to 8.6% of throughput, and `CachingAuthorizer` recovered nearly all of it. No
+retrieval leaked: none of the 190,990 chunks returned under concurrent load, each checked against its
 user's permissions, and none one at a time, there or on Qdrant, Elasticsearch, OpenSearch and
 Weaviate measured the same way on the same million chunks ([benchmarks](https://muzakkirhussain011.github.io/wardowl/benchmarks.html#every-store-on-the-same-million-chunks)).
 

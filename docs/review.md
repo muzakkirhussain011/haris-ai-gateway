@@ -161,6 +161,8 @@ published as advisory
 | October 2026 | KetoAuthorizer's default batch of 100 exceeded Keto's default limit of 10, so retrievals of more than 10 chunks failed | 2.1.0 |
 | October 2026 | A chunk shortened after its redaction spans were written made every retrieval that reached it fail | 2.1.0 |
 | October 2026 | Chroma refused one large write, so loading a big corpus failed | 2.1.0 |
+| October 2026 | Chroma refused every search by a subject in about 1,000 groups, and the first search by a subject in 40,000 groups ended the Python process ([GHSA-pxx6-228g-4fw5](https://github.com/muzakkirhussain011/wardowl/security/advisories/GHSA-pxx6-228g-4fw5)) | 2.0.2, 2.1.1 |
+| October 2026 | After `invalidate()`, a permission service still answering from a stale snapshot refilled the cache for its whole `ttl` ([GHSA-3f2r-rrm4-mhwj](https://github.com/muzakkirhussain011/wardowl/security/advisories/GHSA-3f2r-rrm4-mhwj)) | 2.0.2, 2.1.1 |
 
 ## Reporting
 

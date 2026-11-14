@@ -1,7 +1,12 @@
+---
+description: Permission-aware retrieval returns the best matches among the chunks the asking user may read. This page explains how wardowl does it.
+---
+
 # Concepts
 
-wardowl has four parts: the **subject** who asks, the **backend** that searches, the
-**authorizer** that decides, and the **retriever** that combines them and enforces the
+Permission-aware retrieval returns the best matches among the chunks the asking user may read, not
+among all chunks. wardowl has four parts: the **subject** who asks, the **backend** that searches,
+the **authorizer** that decides, and the **retriever** that combines them and enforces the
 guarantees.
 
 ## Subjects

@@ -6,6 +6,9 @@
 * `timeout` bounds a whole call: connecting to each address of the host, the TLS handshake,
   sending, every read of the answer, the pause before a retry and the retry itself. An answer
   larger than `max_response_bytes` (10 MiB by default) is refused.
+* `total_timeout` bounds every call an authorizer makes for one `check` or `filter_for` together:
+  `deadline()` gives the moment it runs out, and each call it is passed to ends then, or after
+  `timeout`, whichever comes first. Once it has passed, no further request is sent.
 * Looking up the host's addresses is the one step `timeout` does not bound, though the time it takes
   counts against it. The standard library has no timeout for `getaddrinfo`, and a lookup run in a
   thread cannot be stopped: each one that hung would hold a thread until the system resolver gave
@@ -38,6 +41,7 @@ import http.client
 import io
 import ipaddress
 import json
+import math
 import os
 import socket
 import ssl
@@ -73,7 +77,8 @@ class CircuitBreaker:
     `AuthorizationError`, caused by `CircuitOpenError`, at once, without contacting the service,
     for `reset_after` seconds. Then one request is let through as a probe: if it succeeds the
     breaker closes, if it fails the breaker opens again. A failure is a request that got no HTTP
-    response, or a 5xx one; any other response shows that the service is up. Retrieval fails closed
+    response, or a 5xx one; any other response shows that the service is up. A request that an
+    authorizer's `total_timeout` cut short counts as neither. Retrieval fails closed
     while the breaker is open, as it would if every request failed, but a struggling service is not
     flooded with requests.
 
@@ -110,6 +115,14 @@ class CircuitBreaker:
                     "the permission service keeps failing; requests are paused (circuit open)"
                 ) from CircuitOpenError("requests are paused")
             self._probing = True
+
+    def release(self) -> None:
+        """Let go of a request that `allow` let through without recording an outcome. The client
+        calls it for a request that `total_timeout` cut short: the caller ran out of time, which
+        says nothing about whether the service is up. A probe released this way leaves the breaker
+        open, and the next call after the cooldown is let through as a probe again."""
+        with self._lock:
+            self._probing = False
 
     def record(self, ok: bool) -> None:
         """Record the outcome of a request that `allow` let through."""
@@ -271,6 +284,7 @@ class JsonClient:
         ssl_context: ssl.SSLContext | None = None,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         allow_insecure: bool = False,
+        total_timeout: float | None = None,
     ) -> None:
         parts = urlsplit(url)
         if parts.scheme not in ("http", "https") or not parts.hostname:
@@ -279,6 +293,11 @@ class JsonClient:
             raise ValueError("retries must be zero or more")
         if timeout <= 0 or max_response_bytes < 1:
             raise ValueError("timeout and max_response_bytes must be positive")
+        total: Any = total_timeout
+        if total is not None and (
+            isinstance(total, bool) or not isinstance(total, (int, float)) or not 0 < total < math.inf
+        ):
+            raise ValueError("total_timeout must be None or a positive number of seconds")
         if ssl_context is not None and parts.scheme != "https":
             raise ValueError(f"ssl_context is only used with https://, but the {service} url is {parts.scheme}://")
         self._proxied = _proxy_applies(parts)
@@ -291,6 +310,7 @@ class JsonClient:
         self.url = url.rstrip("/")
         self.service = service
         self.timeout = timeout
+        self.total_timeout: float | None = None if total is None else float(total)
         self.retries = retries
         self.breaker = breaker
         self.max_response_bytes = max_response_bytes
@@ -300,17 +320,34 @@ class JsonClient:
         self._ssl = ssl_context or (ssl.create_default_context() if parts.scheme == "https" else None)
         self._local = threading.local()
 
-    def post_json(self, path: str, payload: Any, what: str, *, lines: bool = False) -> Any:
+    def deadline(self) -> float | None:
+        """When `total_timeout`, counted from now, runs out (a `time.monotonic()` value), or None
+        without one. An authorizer takes it once per `check` or `filter_for` and passes it to each
+        of that call's requests."""
+        return None if self.total_timeout is None else time.monotonic() + self.total_timeout
+
+    def post_json(
+        self, path: str, payload: Any, what: str, *, lines: bool = False, deadline: float | None = None
+    ) -> Any:
         """POST `payload` and return the decoded answer; with `lines`, a list with one decoded
-        value per line of a newline-delimited JSON answer (a streamed response)."""
+        value per line of a newline-delimited JSON answer (a streamed response). `deadline`, from
+        `deadline()`, ends the call then if `timeout` would end it later; a call made after it has
+        passed sends nothing."""
         try:
             body = json.dumps(payload).encode()
         except (TypeError, ValueError) as exc:
             raise AuthorizationError(f"{what}: the input is not JSON-serialisable") from exc
+        if deadline is not None and deadline <= time.monotonic():
+            # Before the breaker: a request never sent says nothing about the service's health.
+            late = TimeoutError("total_timeout ran out")
+            raise AuthorizationError(f"{what} was not sent: total_timeout ran out") from late
         if self.breaker is not None:
             self.breaker.allow()
-        deadline = time.monotonic() + self.timeout
+        own = time.monotonic() + self.timeout
+        shared = deadline is not None and deadline < own  # total_timeout ends this call, not timeout
+        deadline = min(own, deadline) if deadline is not None else own
         reachable = False  # recorded on every way out, so a probe can never leave the breaker stuck
+        cut_short = False  # by total_timeout: no outcome to record (see CircuitBreaker.release)
         try:
             attempt = 0
             while True:
@@ -318,6 +355,9 @@ class JsonClient:
                 try:
                     status, raw = self._send(path, body, deadline)
                 except TimeoutError as exc:
+                    if shared:
+                        cut_short = True
+                        raise AuthorizationError(f"{what} timed out: total_timeout ran out") from exc
                     raise AuthorizationError(f"{what} timed out after {self.timeout} s") from exc
                 except ssl.SSLCertVerificationError as exc:
                     raise AuthorizationError(f"{what}: TLS certificate verification failed") from exc
@@ -339,7 +379,10 @@ class JsonClient:
                 time.sleep(pause)
         finally:
             if self.breaker is not None:
-                self.breaker.record(reachable)
+                if cut_short:
+                    self.breaker.release()
+                else:
+                    self.breaker.record(reachable)
 
     @staticmethod
     def _decode(status: int, raw: bytes, what: str, lines: bool = False) -> Any:

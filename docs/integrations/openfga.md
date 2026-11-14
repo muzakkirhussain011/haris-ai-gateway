@@ -54,6 +54,12 @@ Change the names with `object_type=`, `user_type=`, `relations={"read": "viewer"
 distinct resource once even when several chunks share it. A per-item error, or a response that does
 not decide every resource, raises `AuthorizationError`.
 
+The requests are sent one after another: r distinct resources take r / `batch_size` of them,
+rounded up. `timeout=` bounds each request. `total_timeout=` (seconds; no bound by default) bounds
+all the requests of one `check` or `filter_for` together: once it runs out, the request in flight
+is abandoned, nothing more is sent, and the call raises `AuthorizationError` caused by a
+`TimeoutError`.
+
 ## Pre-filtering with ListObjects
 
 `filter_for` calls ListObjects for every document the user may view and returns
@@ -113,8 +119,9 @@ them apart too.
 ## Failing closed
 
 Every failure raises `AuthorizationError`: an unreachable server, a timeout (`timeout=`, 2 seconds
-by default, for the whole call except the DNS lookup of the host, as
-[for OPA](opa.md#failing-closed)), an unexpected response or one larger than `max_response_bytes=`
+by default, for each request except the DNS lookup of the host, as
+[for OPA](opa.md#failing-closed); `total_timeout=` for a whole call, as [above](#checks)), an
+unexpected response or one larger than `max_response_bytes=`
 (10 MiB by default), or an action with no configured relation. `headers=` adds headers to every
 request, for example an API token; an `Authorization` header over `http://` to another machine
 needs `allow_insecure=True`, as for [OPA](opa.md#failing-closed). Connections are reused and

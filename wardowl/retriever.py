@@ -48,7 +48,9 @@ The algorithm is written once, as a generator of operations; `retrieve` runs it 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import dataclasses
+import functools
 import logging
 import math
 import random
@@ -269,6 +271,7 @@ class _Redact:
 
 _Op = _FilterFor | _ScopeFor | _Search | _Count | _Check | _Rerank | _Redact
 _log = logging.getLogger("wardowl")
+_UNRECORDED = "the retrieval could not be recorded, so nothing was returned"
 _Plan = Generator[_Op, Any, RetrievalResult]
 RerankFunction = Callable[[Any, list[Hit]], Sequence[Hit]]
 
@@ -326,6 +329,8 @@ class PermissionedRetriever:
     event first, and must record it: when one raises after a retrieval that found its hits, the
     retrieval raises `AuditError` and returns nothing, and `observers` then receive an event with
     that error. A retrieval that failed raises its own error, whatever the observers do.
+    `aretrieve` calls all of them in a worker thread, so they may be called from several threads
+    at once.
 
     `reranker` reorders the result after the permission check: the retriever finds the top
     `rerank_depth` hits the subject may read (or k, if larger, and at most `max_candidates`), the
@@ -493,7 +498,8 @@ class PermissionedRetriever:
         """The async form of `retrieve`, with the same arguments and guarantees.
 
         It uses the backend's `asearch` and the authorizer's `afilter_for` and `acheck` when they
-        exist, and runs the sync methods in a thread otherwise. The redactor runs in a thread.
+        exist, and runs the sync methods in a thread otherwise. The redactor runs in a thread, and so
+        do the observers, which have received the event before `aretrieve` returns or raises.
         """
         started, clock, timings = time.time(), time.perf_counter(), _Timings()
         try:
@@ -511,9 +517,14 @@ class PermissionedRetriever:
             except StopIteration as done:
                 result: RetrievalResult = done.value
         except BaseException as exc:  # a cancelled or interrupted call is reported too, then re-raised
-            self._emit(query, subject, k, started, clock, timings, None, exc)
+            event = self._built(query, subject, k, started, clock, timings, None, exc)
+            if isinstance(exc, (Exception, asyncio.CancelledError)):
+                await self._adeliver(event, succeeded=False)
+            else:  # GeneratorExit, KeyboardInterrupt, SystemExit: nothing more may be awaited
+                self._deliver(event, succeeded=False)
             raise
-        self._emit(query, subject, k, started, clock, timings, result, None)  # AuditError, if required
+        event = self._built(query, subject, k, started, clock, timings, result, None)  # AuditError, if required
+        self._unrecorded(await self._adeliver(event, succeeded=True))  # and here
         return result
 
     def _emit(
@@ -527,31 +538,62 @@ class PermissionedRetriever:
         result: RetrievalResult | None,
         error: BaseException | None,
     ) -> None:
-        """Give the event to the observers. Raises `AuditError` only after a retrieval that found its
-        hits (`error` is None), when a required observer could not record it."""
+        """Give the event to the observers in this thread. Raises `AuditError` only after a retrieval
+        that found its hits (`error` is None), when a required observer could not record it."""
+        event = self._built(query, subject, k, started, clock, timings, result, error)
+        self._unrecorded(self._deliver(event, succeeded=error is None))
+
+    def _built(
+        self,
+        query: str | Query,
+        subject: Subject,
+        k: int,
+        started: float,
+        clock: float,
+        timings: _Timings,
+        result: RetrievalResult | None,
+        error: BaseException | None,
+    ) -> RetrievalEvent | None:
+        """The event for the observers, or None when there are none or it cannot be built. After a
+        retrieval that found its hits, an event that cannot be built for required observers raises
+        `AuditError` instead."""
         if not self.observers and not self.required_observers:
-            return
+            return None
         try:
-            event = self._event(query, subject, k, started, clock, timings, result, error)
+            return self._event(query, subject, k, started, clock, timings, result, error)
         except Exception as exc:  # reporting must never replace what retrieval returns or raises
             _log.exception("wardowl could not build the retrieval event")
             if self.required_observers and error is None:
                 # ... but nothing returns when the record a required observer must keep cannot be made.
-                raise AuditError("the retrieval could not be recorded, so nothing was returned") from exc
-            return
+                raise AuditError(_UNRECORDED) from exc
+            return None
+
+    @staticmethod
+    def _unrecorded(failure: Exception | None) -> None:
+        """Raise `AuditError` for what a required observer raised, if it raised."""
+        if failure is not None:
+            raise AuditError(_UNRECORDED) from failure
+
+    def _deliver(self, event: RetrievalEvent | None, *, succeeded: bool) -> Exception | None:
+        """Give `event` to the required observers, then to the others, and tell those that define
+        `observer_failed` about each that raised. Returns what the first required observer raised
+        when the retrieval `succeeded`, for the caller to raise as `AuditError`, and None otherwise:
+        a retrieval that failed raises its own error, so this never raises."""
+        if event is None:
+            return None
         failures: list[tuple[Observer, RetrievalEvent, Exception]] = []
         for observer in self.required_observers:
-            failure = self._notify(observer, event)
+            failure = self._tell(observer, event)
             if failure is not None:
                 failures.append((observer, event, failure))
-        unrecorded = failures[0][2] if failures and error is None else None
+        unrecorded = failures[0][2] if failures and succeeded else None
         if unrecorded is not None:
             # The other observers hear what the caller gets: an AuditError and no chunks.
             event = dataclasses.replace(
                 event, returned_ids=(), complete=False, error=AuditError.__name__, cause=type(unrecorded).__name__
             )
         for observer in self.observers:
-            failure = self._notify(observer, event)
+            failure = self._tell(observer, event)
             if failure is not None:
                 failures.append((observer, event, failure))
         for failed, seen, failure in failures:
@@ -563,19 +605,35 @@ class PermissionedRetriever:
                     hook(failed, seen, failure)
                 except Exception:
                     _log.exception("wardowl observer %r failed to record a failed observer", listener)
-        if unrecorded is not None:
-            raise AuditError("the retrieval could not be recorded, so nothing was returned") from unrecorded
+        return unrecorded
 
-    def _notify(self, observer: Observer, event: RetrievalEvent) -> Exception | None:
+    def _tell(self, observer: Observer, event: RetrievalEvent) -> Exception | None:
         """Give `event` to `observer`; what it raised, logged and counted, or None."""
         try:
             observer(event)
-        except Exception as exc:  # never raised from here: _emit decides what a failure changes
+        except Exception as exc:  # never raised from here: the caller decides what a failure changes
             _log.exception("wardowl observer %r failed", observer)
-            with self._failures_lock:
+            with self._failures_lock:  # observers run in several worker threads at once under aretrieve
                 self._failures += 1
             return exc
         return None
+
+    async def _adeliver(self, event: RetrievalEvent | None, *, succeeded: bool) -> Exception | None:
+        """`_deliver` in a worker thread, awaited. An audit sink writes to a file, a socket or a
+        collector, and can block: on the event loop it would hold up every other request."""
+        if event is None:
+            return None
+        try:
+            delivered = asyncio.get_running_loop().run_in_executor(
+                None, functools.partial(contextvars.copy_context().run, self._deliver, event, succeeded=succeeded)
+            )
+        except RuntimeError:  # the executor is shut down, as when the loop closes: deliver here
+            return self._deliver(event, succeeded=succeeded)
+        # Shielded: a call cancelled while its event is on the way stops waiting, but the event is
+        # still delivered, so every call is reported. Such a call raises CancelledError, whatever a
+        # required observer then does.
+        unrecorded: Exception | None = await asyncio.shield(delivered)
+        return unrecorded
 
     def _event(
         self,

@@ -28,6 +28,18 @@ name cannot change what it refers to.
 Checks go to `POST /relation-tuples/batch/check`, `batch_size` tuples at a time (10 by default).
 Each chunk is one tuple, plus one for each of the subject's groups with `group_subjects=True`.
 
+The batches are sent one after another, so a check of n chunks for a subject in g groups sends up
+to n × (1 + g) / `batch_size` requests, rounded up, with `group_subjects=True` (n / `batch_size`
+without): 1,000 chunks for a subject in 20 groups is 2,100 requests at the default size. `timeout=`
+bounds each request. `total_timeout=` (seconds; no bound by default) bounds all the requests of one
+`check` together: once it runs out, the request in flight is abandoned, nothing more is sent, and
+the check raises `AuthorizationError` caused by a `TimeoutError`. Post-filtering can call `check`
+once for each round of candidates, and each call has its own `total_timeout`.
+
+```python
+authorizer = KetoAuthorizer("http://keto:4466", group_subjects=True, timeout=1.0, total_timeout=3.0)
+```
+
 ## Batch size
 
 Keto refuses a batch check of more than `limit.max_batch_check_size` tuples with HTTP 400, and that
@@ -86,8 +98,9 @@ so the search starts inside the subject's tenant.
 
 Every failure raises `AuthorizationError`, and the retriever returns nothing: an unreachable server,
 a malformed answer, a wrong number of results, or a result that carries an error (an unknown
-namespace, for example). `timeout=` (2 seconds by default) bounds the whole call except the DNS
-lookup of the host ([OPA](opa.md#failing-closed) explains), and an answer larger than
+namespace, for example). `timeout=` (2 seconds by default) bounds each request except the DNS
+lookup of the host ([OPA](opa.md#failing-closed) explains), `total_timeout=` bounds a whole check
+([above](#how-chunks-map-to-keto)), and an answer larger than
 `max_response_bytes=` (10 MiB by default) is refused. An `Authorization` header over
 `http://` to another machine needs `allow_insecure=True`, as for [OPA](opa.md#failing-closed).
 Connections are reused, transient failures are retried once, and a `CircuitBreaker` can pause

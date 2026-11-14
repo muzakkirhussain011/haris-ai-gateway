@@ -8,6 +8,25 @@ All notable changes are recorded here. The format follows
 
 ### Added
 
+- `revision=` on `add` and `set_metadata` of `PgVectorBackend` and `MongoDBBackend`, and
+  `wardowl.backends.StaleRevision`. Every backend keeps the write that lands last, so when an
+  indexer and a permission sync write the same document, an indexer that read the document before a
+  revocation and writes after the sync wrote it puts the revoked access back, and nothing corrects
+  it until the document changes again (found in an internal review). With `revision`, the source
+  document's revision read before its data, a chunk stored with a newer revision is not replaced and
+  the call raises `StaleRevision`, naming those chunks. pgvector compares and writes each chunk in
+  one statement under its row lock (`INSERT ... ON CONFLICT ... DO UPDATE ... WHERE`, and an
+  `UPDATE` that keeps a newer row), in one transaction per call, so a refused call writes nothing.
+  MongoDB stores the revision in `wardowl_revision`, looks for newer chunks before writing (and
+  writes nothing when it finds one), then compares and writes each chunk in one atomic update; a
+  newer write that lands after the look is kept, while the other chunks of the call are written. The
+  comparison is per chunk, so a chunk that is not stored is written whatever its revision. It is
+  optional: without `revision`, both backends write exactly as before. `create_schema` creates new
+  tables with a nullable `revision bigint` column and leaves existing tables alone; add the column
+  to a table created by 2.1 or earlier with `ALTER TABLE ... ADD COLUMN revision bigint` before
+  passing a revision. CI tests both against real servers, including a newer pgvector write that
+  commits while a stale one waits for its row. Chroma has no write that compares and writes in one
+  step, so `ChromaBackend` takes no revision.
 - `ChromaBackend(fallback_candidates=...)`, how many chunks a search reads when its filter is too
   large to send to Chroma whole (1,000 by default), and `wardowl.backends.chroma.FilterTooLarge`,
   the `ValueError` that `filter_to_where` raises for such a filter. See Fixed.
@@ -60,6 +79,16 @@ All notable changes are recorded here. The format follows
   (without `indexed_only`). In vector mode, `count` asks Qdrant for an exact count, and
   `search(..., exact=True)` searches with a copy of `search_params` that sets `exact=True` and
   `indexed_only=False`. ACORN is set through `search_params`, as before.
+- `total_timeout=...` on `KetoAuthorizer`, `SpiceDBAuthorizer`, `OpenFGAAuthorizer` and
+  `CerbosAuthorizer`, in seconds: one deadline for all the requests of one `check` or
+  `filter_for`. These authorizers send a large check as several requests, one after another, and
+  `timeout` bounds each request alone, so a check could take its number of requests times
+  `timeout`: for Keto with `group_subjects=True`, 1,000 candidates for a subject in 20 groups is
+  2,100 requests. Once `total_timeout` runs out, the request in flight is abandoned, nothing more
+  is sent, and the call raises `AuthorizationError` caused by a `TimeoutError`. A request it cut
+  short counts as neither a success nor a failure for a `CircuitBreaker`, which gains `release()`
+  for that. None, the default, sets no bound, as before. Each authorizer's page now gives its
+  number of requests per check.
 - `wardowl.UnsupportedSubject`, raised by an authorizer when its permission service cannot represent
   the subject's id or one of its groups, before anything is sent. It is an `AuthorizationError`, so
   code that catches that and retrieval behave as before (retrieval fails closed), and a
@@ -94,9 +123,34 @@ All notable changes are recorded here. The format follows
   recorded (M17).
 - `RedisBackend(check_timeout_policy=False)` accepts RESP2 answers without reading the server's
   timeout policy, as before; see Changed.
+- `create_app(retrieval_timeout=...)` and `add_search_tool(retrieval_timeout=...)`, in seconds,
+  bound each retrieval of the HTTP service and the MCP tool. A retrieval that takes longer is
+  cancelled, answers 503 or ends with a tool error, and returns nothing; the `wardowl` logger
+  records the timeout, and the retrieval's event records `CancelledError`. Neither waited for a
+  retrieval's end before: a store or permission service that never answered held the request
+  indefinitely, while `/healthz` kept answering. A synchronous call already running in a worker
+  thread cannot be stopped and runs on to its own client's timeout. None, the default, sets no
+  bound, as before.
+- `create_app(max_workers=...)` replaces the event loop's default executor, while the application's
+  lifespan runs, with a thread pool of that many threads. Every synchronous store, authorizer,
+  reranker and redactor call of `aretrieve`, `CachingAuthorizer`'s Redis calls and the observers run
+  in that executor, whose default size, CPython's, bounded the service's concurrency without being
+  set or documented. None, the default, leaves the executor alone, as before. The HTTP service page
+  documents both settings, and that `/healthz` reports liveness only.
 
 ### Changed
 
+- `aretrieve` calls the observers in a worker thread of the event loop's default executor, and waits
+  for them before it returns or raises, as before. They ran on the event loop, so an audit sink that
+  blocked on its stream (a full disk, a network mount, a collector that stopped reading) stopped
+  every request the HTTP service or the MCP server was serving until the write returned. Now it
+  delays only the request whose event it writes. The event is still built when the retrieval ends,
+  so its timings do not include the wait for a thread, and a call cancelled while its event is on
+  the way stops waiting, while the event is still delivered. Observers must be thread-safe, as they
+  already had to be for `retrieve` called from several threads; `JsonLinesAudit` and the
+  OpenTelemetry observers are. A retrieval closed without finishing (`GeneratorExit`) still calls
+  them in place, since it can await nothing more. Required observers (see Added) run there too,
+  first, and `observer_failures` is counted under a lock.
 - `RedisBackend` no longer takes a RESP2 answer on trust. Under the Query Engine's default
   `search-on-timeout` policy, `return`, a search that runs out of time answers with the results
   found so far; a RESP3 answer then carries a warning, on which the backend already raised, but a
@@ -237,6 +291,13 @@ All notable changes are recorded here. The format follows
   when events are lost or recall samples fail. The compliance page offered the event stream as the
   audit control without saying that a sink that cannot write loses events (M17). The Redis page
   describes the RESP2 check and `check_timeout_policy`.
+- The writes for one source document must happen one after another. Operations has a section on
+  it, with what `revision` does on pgvector and MongoDB and that the other backends have no such
+  check; the Google Drive page shows how a late re-index undoes a revocation that the changes feed
+  never reports again, and how to pass Drive's `version` as the revision (Google does not document
+  whether a change of sharing raises it, and wardowl's tests do not run against Drive, so the page
+  says to check). The threat model adds T18, and the security model, revocation, production
+  checklist, runbook, extending guide and the pgvector, MongoDB and Chroma pages say the same.
 - A 47-second film on the documentation's front page, linked from the README: what wardowl does,
   shown with an AI assistant that many companies share.
 - The README opens with the problem, the runnable quickstart (which a new test runs, checking that
@@ -274,6 +335,27 @@ All notable changes are recorded here. The format follows
   run did exactly that: it set a 20-second deadline and left the request timeout at its default, so
   OpenFGA never started and its configuration was reported as a start-up timeout. The run now sets
   the request timeout as well.
+- Corrected how the README, the FAQ and the site's description for search engines summed up
+  wardowl. They said it applies every listed permission system inside the vector store's search.
+  The filter goes inside the search only when the permission system can express one (OpenFGA,
+  SpiceDB, Cerbos, access lists, and OPA when its policy returns one); Cedar, Casbin and Ory Keto
+  check each candidate after the search, as the integrations tables already said.
+- The published benchmark results are now those of re-executions on 2026-11-07 and 2026-11-08,
+  each of the same notebook at the same commit as the run it replaces. The results files, the
+  Benchmarks page, the README and the pages that quote them give the new numbers; no wardowl
+  strategy leaked in any of them. Where a statement no longer held, it now says what the
+  re-execution measured: OpenSearch's first throughput setting ran at full speed (it was under 1
+  request a second in two of three runs before), and Elasticsearch's quantized default index took
+  more disk than `int8_hnsw` and `hnsw` rather than less. The Benchmarks page also no longer links a
+  LanceDB tuning run that does not exist, or lists Redis as not measured at a million chunks.
+
+## [2.1.1] - 2026-11-13
+
+A security release from the 2.1 branch. It carries two fixes listed above under [Unreleased] and nothing else: `ChromaBackend` no longer sends Chroma a filter that can crash the process ([GHSA-pxx6-228g-4fw5](https://github.com/muzakkirhussain011/wardowl/security/advisories/GHSA-pxx6-228g-4fw5)), and `CachingAuthorizer.invalidate()` no longer lets a permission service that is itself behind refill the cache ([GHSA-3f2r-rrm4-mhwj](https://github.com/muzakkirhussain011/wardowl/security/advisories/GHSA-3f2r-rrm4-mhwj)), with `SpiceDBAuthorizer.max_staleness` and `CachingAuthorizer(source_staleness=...)`, which that fix needs. `RetrievalResult.complete` keeps its 2.1 meaning there. The full notes are on the [release page](https://github.com/muzakkirhussain011/wardowl/releases/tag/v2.1.1).
+
+## [2.0.2] - 2026-11-13
+
+The same two security fixes for the 2.0 branch, without 2.1.0's batched Chroma writes. The 2.0 line does not carry two security fixes of 2.1.0 that change behaviour (`SpiceDBAuthorizer`'s `group_subjects` default, and the text of the exception behind an `AuthorizationError` in its message); its notes say how to get them. The full notes are on the [release page](https://github.com/muzakkirhussain011/wardowl/releases/tag/v2.0.2).
 
 ## [2.1.0] - 2026-10-24
 
@@ -1499,7 +1581,9 @@ needed, in which case it will be announced in a second release candidate. Instal
 - The project is now `wardowl`, a permission-aware retrieval library (ADR 0005). The earlier
   Rampart gateway lives on as an example deployment in `examples/gateway`.
 
-[Unreleased]: https://github.com/muzakkirhussain011/wardowl/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/muzakkirhussain011/wardowl/compare/v2.1.1...HEAD
+[2.1.1]: https://github.com/muzakkirhussain011/wardowl/compare/v2.1.0...v2.1.1
+[2.0.2]: https://github.com/muzakkirhussain011/wardowl/compare/v2.0.1...v2.0.2
 [2.1.0]: https://github.com/muzakkirhussain011/wardowl/compare/v2.0.1...v2.1.0
 [2.0.1]: https://github.com/muzakkirhussain011/wardowl/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/muzakkirhussain011/wardowl/compare/v1.6.0...v2.0.0

@@ -1,4 +1,13 @@
+---
+description: Enforce document permissions in RAG with wardowl. Install it, connect your permission system, and retrieve only the chunks each user may read.
+---
+
 # Getting started
+
+This page shows how to enforce document permissions in RAG with wardowl: install it, connect the
+permission system that says who may read each chunk, and pass the authenticated user to
+`PermissionedRetriever.retrieve`. It returns only the chunks that user may read, and when the
+permission check fails it raises an error instead of returning unfiltered results.
 
 ## Install
 

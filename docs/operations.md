@@ -159,6 +159,33 @@ subject's groups are read at query time. `CachingAuthorizer` keys each decision 
 metadata, so a chunk whose metadata changed is decided again at once, and cached filters expire
 after `ttl`.
 
+### One writer at a time for each document
+
+`add` and `set_metadata` replace what is stored, whenever the data they write was read. When two
+writers handle one document, such as an ingestion queue that re-indexes it and a permission sync
+that writes its sharing, the write that lands last wins. An indexer that read the document before a
+revocation, and writes after the sync wrote the revocation, puts the revoked access back, and
+nothing corrects it until the document changes again. So:
+
+- Run the writes for each source document one after another, each from its read of the source to
+  its write: one queue or worker per document id, or a lock on the document id in every writer.
+  Writes for different documents can run at the same time.
+- On pgvector and MongoDB, also pass the source document's revision to both calls
+  (`add(..., revision=n)` and `set_metadata(..., revision=n)`): a chunk stored with a newer
+  revision is not replaced, and the call raises `StaleRevision`. Read the revision before the data,
+  never after. The comparison is per chunk, and a chunk that is not stored has no revision: a late
+  write to chunks that were deleted meanwhile, or whose ids changed, is written.
+
+| Store | `revision=` | What a refused call leaves written |
+|---|---|---|
+| pgvector | Each chunk compared and written by one statement under its row lock; one transaction per call | Nothing |
+| MongoDB | A look for newer chunks first, then one atomic update per chunk; not one transaction | Nothing when the look finds them. A newer write that lands after the look is kept, and the call writes the other chunks before it raises |
+| Every other backend | Not offered | Running the writes in order is the only protection |
+
+[Google Drive](integrations/google-drive.md#one-writer-at-a-time-for-each-file) shows both for a
+Drive sync, and [pgvector](integrations/pgvector.md#revisions) and
+[MongoDB](integrations/mongodb.md#revisions) the details.
+
 ## Resilience of remote permission services
 
 The HTTP authorizers, `OPAAuthorizer`, `OpenFGAAuthorizer`, `SpiceDBAuthorizer`, `CerbosAuthorizer`
@@ -171,6 +198,13 @@ and `KetoAuthorizer`, share an HTTP client built for permission checks on every 
   effects. Timeouts are not retried, and neither are other HTTP errors or invalid answers, so the
   worst case is one `timeout`, plus the DNS lookup when a connection is opened, which only the
   system resolver's settings bound (see [OPA](integrations/opa.md#failing-closed)).
+- **One deadline for a whole check**, with `total_timeout`. `timeout` bounds each request, and
+  `KetoAuthorizer`, `SpiceDBAuthorizer`, `OpenFGAAuthorizer` and `CerbosAuthorizer` send a large
+  check as several requests, one after another, so without it a check can take its number of
+  requests times `timeout`. `total_timeout` bounds all the requests of one `check` or `filter_for`
+  together: once it runs out, nothing more is sent and the call raises `AuthorizationError`. A
+  request it cuts short counts as neither a success nor a failure for the circuit breaker, since
+  it says nothing about the service. Each authorizer's page gives its number of requests per check.
 - **A circuit breaker** pauses requests to a service that keeps failing, so retries do not pile on
   during an outage. Retrieval fails closed either way; the breaker makes it fail fast.
 - **Redirects are never followed**, and the standard `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY`
@@ -190,6 +224,7 @@ authorizer = OpenFGAAuthorizer(
     "https://openfga.internal:8443",
     store_id,
     timeout=1.0,
+    total_timeout=3.0,  # every request of one check together
     circuit_breaker=CircuitBreaker(failures=5, reset_after=30),
     ssl_context=tls,
 )
@@ -272,8 +307,18 @@ without storing them. Rotating the key breaks that link, which can be what you w
 flushes after each event:
 
 ```json
-{"action":"read","authorize_ms":0.18,"cause":null,"complete":true,"denied":0,"duration_ms":4.21,"error":null,"examined":2,"fallback":null,"k":5,"query_hmac":"9f2c...","rerank_ms":0.0,"reranked":0,"returned_ids":["handbook","policy-7"],"sampled_recall":null,"search_ms":3.87,"searches":1,"shortfall":null,"shortfall_ms":0.0,"started_at":1792152000.12,"strategy":"prefilter","subject_id":"bob","violations":0}
+{"action":"read","authorize_ms":0.18,"cause":null,"complete":true,"denied":0,"duration_ms":4.21,"error":null,"examined":2,"fallback":null,"k":5,"query_hmac":"9f2c...","recall_sample":null,"rerank_ms":0.0,"reranked":0,"returned_ids":["handbook","policy-7"],"sampled_recall":null,"search_ms":3.87,"searches":1,"shortfall":null,"shortfall_ms":0.0,"started_at":1792152000.12,"strategy":"prefilter","subject_id":"bob","violations":0}
 ```
+
+`retrieve` calls the observers in the caller's thread. `aretrieve` calls them in a worker thread of
+the event loop's default executor, off the event loop, and waits for them before it returns or
+raises: an observer that blocks on a full disk, a network mount or a collector that stopped
+reading delays the request whose event it is writing, but not the other requests the loop serves.
+Either way an observer can be called from several threads at once, so it must be thread-safe, as
+`JsonLinesAudit` and the OpenTelemetry observers are. A cancelled retrieval, such as one the
+[HTTP service](integrations/http.md#time-bounds-and-threads) stopped at its `retrieval_timeout`, is
+reported with `error = "CancelledError"`. A call cancelled while its event is on the way to the
+observers stops waiting at once, and the event is still delivered.
 
 ### When an observer fails
 
@@ -303,7 +348,10 @@ A retrieval that failed for another reason raises its own error, whatever the ob
 required observer that wrote the event keeps it even when another required observer then fails,
 so the log can hold a retrieval whose caller received `AuditError`; it never misses one whose
 caller received chunks. As for a failing store, the HTTP service answers `AuditError` with 500, and
-the MCP server's tool fails with "Error executing tool search" and nothing more.
+the MCP server's tool fails with "Error executing tool search" and nothing more. Under `aretrieve`,
+required observers run in the worker thread with the others; a call cancelled while its event is
+on the way raises `CancelledError`, and a required observer that then fails is still logged and
+counted.
 
 ## Tracing
 

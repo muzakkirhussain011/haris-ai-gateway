@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -71,6 +72,29 @@ def test_each_chunk_is_checked_for_the_user_and_denied_without_its_object(server
         {"namespace": "Document", "object": "plan", "relation": "view", "subject_id": "ann"},
         {"namespace": "Document", "object": "pay", "relation": "view", "subject_id": "ann"},
     ]
+
+
+def test_total_timeout_bounds_every_batch_of_a_check_together(server):
+    # The review's case: one request per batch, sent one after another, each with its own timeout.
+    respond = granting(set())
+
+    def slow(payload):
+        time.sleep(0.15)
+        return respond(payload)
+
+    server.responder = slow
+    hits = [hit(f"c{i}", f"d{i}") for i in range(20)]
+    authz = KetoAuthorizer(server.url, batch_size=1, timeout=2.0, total_timeout=0.4)
+    started = time.monotonic()
+    with pytest.raises(AuthorizationError, match="total_timeout ran out") as failure:
+        authz.check(ANN, hits)
+    assert isinstance(failure.value.__cause__, TimeoutError)
+    # Each request takes at least 0.15 s, so at most three start within 0.4 s; without the bound, 20 would.
+    assert len(server.requests) <= 3 and time.monotonic() - started < 2.0
+    server.requests.clear()
+    server.responder = respond
+    assert KetoAuthorizer(server.url, batch_size=1, total_timeout=5).check(ANN, hits) == [False] * 20
+    assert len(server.requests) == 20  # a bound that holds changes nothing
 
 
 def test_group_subjects_allow_a_chunk_granted_to_one_of_the_groups(server):

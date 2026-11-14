@@ -22,4 +22,5 @@ jobs:
       - name: Compare the published checks with their floors
         env:
           SCORECARD_COMMIT: ${{ github.event.workflow_run.head_sha }}
+          GITHUB_TOKEN: ${{ github.token }} # read-only: compares two commits of this public repository
         run: python3 .github/scripts/check_scorecard_floor.py

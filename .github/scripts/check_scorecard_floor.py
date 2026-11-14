@@ -7,6 +7,9 @@ raised to hold the new level. Checks without a floor (those the project cannot c
 as Code-Review or Contributors) are printed but never fail.
 
 `SCORECARD_COMMIT`, when set, makes the script wait until the published result is for that commit.
+The service keeps only the latest result, so when several commits reach main within minutes, the
+result for an earlier one is replaced before it can be read. A result for a later commit on main
+(one that contains `SCORECARD_COMMIT`, by GitHub's compare API) is then checked instead.
 """
 
 from __future__ import annotations
@@ -23,17 +26,35 @@ API = "https://api.securityscorecards.dev/projects/github.com/"
 FLOORS = Path(".github/scorecard-floor.json")
 
 
+def contains(repo: str, base: str, head: str) -> bool:
+    """Whether `head` is `base` or a later commit that contains it, by GitHub's compare API."""
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{repo}/compare/{base}...{head}",
+        headers={"Accept": "application/vnd.github+json"},
+    )
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    # A fixed https URL; the repository and commits come from GitHub's own environment and the API.
+    with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
+        return json.load(response).get("status") in ("ahead", "identical")
+
+
 def published(repo: str, commit: str | None, attempts: int = 10, wait: float = 30) -> dict[str, Any]:
-    """The published result, after waiting for the one for `commit` when it is given."""
+    """The published result, after waiting for the one for `commit` (or a later commit) when it is given."""
     for attempt in range(attempts):
         # A fixed https URL; the repository name comes from GitHub's own environment.
         with urllib.request.urlopen(API + repo, timeout=30) as response:  # noqa: S310
             result: dict[str, Any] = json.load(response)
-        if commit is None or result.get("repo", {}).get("commit") == commit:
+        found = result.get("repo", {}).get("commit")
+        if commit is None or found == commit:
+            return result
+        if found and contains(repo, commit, found):
+            print(f"::notice::Scorecard's result is for {found[:7]}, a later commit than {commit[:7]}; checking it")
             return result
         if attempt < attempts - 1:
             time.sleep(wait)
-    raise SystemExit(f"Scorecard has not published a result for commit {commit} yet")
+    raise SystemExit(f"Scorecard has not published a result for commit {commit} or a later one yet")
 
 
 def compare(floors: dict[str, int], checks: list[dict[str, Any]]) -> list[str]:

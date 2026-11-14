@@ -39,12 +39,20 @@ fails. Each item links to the page with the details.
 - [ ] A permission change at the source reaches the chunks' metadata (`set_metadata`) within your
   revocation target, and you know each source document's chunk ids.
   ([Operations](operations.md#changing-a-documents-permissions))
+- [ ] The writes for each source document (re-indexing and permission sync) happen one after
+  another, so a late write from data read before a revocation cannot undo it; on pgvector and
+  MongoDB, every writer also passes the document's `revision`.
+  ([Operations](operations.md#one-writer-at-a-time-for-each-document))
 
 **The permission service**
 
 - [ ] HTTP authorizers have a `timeout` and `retries` you have chosen, and a shared
   `CircuitBreaker` so a failing service is not flooded.
   ([Operations](operations.md#resilience-of-remote-permission-services))
+- [ ] The HTTP service and the MCP tool have a `retrieval_timeout`, and the HTTP service's thread
+  pool is sized with `max_workers` for the concurrency you expect. Every store and permission
+  service still has its own client timeouts, which free the threads that `retrieval_timeout`
+  cannot stop. ([HTTP service](integrations/http.md#time-bounds-and-threads))
 - [ ] Connections use TLS and credentials (`headers=`, or `token=` for SpiceDB).
 - [ ] `CachingAuthorizer` sits in front, with a `ttl` chosen as a security decision: it is the
   longest a revoked permission keeps granting access. ([Operations](operations.md#permission-caching))
@@ -72,7 +80,7 @@ fails. Each item links to the page with the details.
   describes.
 - [ ] Capacity is measured on your own data with the load harness in `benchmarks/`
   ([Benchmarks](benchmarks.md#reproduce-it)). In ours, over a million chunks, one 4-CPU machine
-  shared by PostgreSQL and the load generator peaked at 126 requests a second.
+  shared by PostgreSQL and the load generator peaked at 131 requests a second.
 
 ## When something fails
 
@@ -81,7 +89,7 @@ says why. The table shows what each failure looks like.
 
 | What fails | What wardowl does | What you see |
 |---|---|---|
-| The permission service is down, slow or erroring | Raises `AuthorizationError` after the timeout and retries; with a circuit breaker open, at once | `wardowl.retrievals` with `error.type = AuthorizationError`; no results reach the model |
+| The permission service is down, slow or erroring | Raises `AuthorizationError` after the timeout and retries, or when an authorizer's `total_timeout` for the whole check runs out; with a circuit breaker open, at once | `wardowl.retrievals` with `error.type = AuthorizationError`; no results reach the model |
 | The permission service gives a malformed answer (wrong count, non-booleans, not a filter) | Raises `AuthorizationError`; never caches the answer | As above |
 | The vector store is down | Raises the store client's own error; nothing is returned | `error.type` names that error |
 | The vector store ignores or mistranslates the filter | The re-check drops every chunk outside it | `violations > 0` on the result, the event and the `wardowl.violations` metric |
@@ -93,6 +101,8 @@ says why. The table shows what each failure looks like.
 | `invalidate()` cannot reach Redis | Raises, because the caller asked for a revocation now | The exception at the caller |
 | An observer raises | Logs and counts it; retrieval is unaffected | An error on the `wardowl` logger; `observer_failures` and `wardowl.observer_failures` rise |
 | A required observer raises (`required_observers`) | Raises `AuditError`; nothing is returned | As above, and `wardowl.retrievals` with `error.type = AuditError` |
+| An observer blocks (a full disk, a collector that stopped reading) | Under `aretrieve`, waits for it in a worker thread: that request is delayed, the others are not | Slower requests; with `retrieval_timeout`, 503s or tool errors |
+| A retrieval in the HTTP service or the MCP tool takes longer than `retrieval_timeout` | Cancels it and returns nothing: 503, or a tool error | An error on the `wardowl` logger; `error.type = CancelledError` |
 | A recall sample's count or exact search fails | Logs it; returns the retrieval's hits | `recall_sample = failed`; `wardowl.recall_samples` with that value |
 | Redis answers in RESP2 and its `search-on-timeout` policy is not `fail` | Raises, since a timed-out search would look complete | `SearchError`, with the reason in its `__cause__` |
 

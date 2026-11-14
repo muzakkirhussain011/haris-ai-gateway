@@ -10,9 +10,10 @@ from functools import partial
 import pytest
 
 from wardowl import And, Document, In, MetadataACLAuthorizer, Or, PermissionedRetriever, Query, Subject
-from wardowl.backends import NothingMatches
+from wardowl.backends import NothingMatches, StaleRevision
 from wardowl.backends._engines import TERMS_FIELD, digest, tag, terms
 from wardowl.backends.mongodb import (
+    REVISION_FIELD,
     WRITE_FIELD,
     MongoDBBackend,
     create_search_index,
@@ -194,6 +195,18 @@ def test_delete_waits_until_the_index_no_longer_returns_the_chunks():
     backend.delete([])
     backend.delete(["b"], wait=False)
     assert collection.probes == before and collection.documents == {}
+
+
+@pytest.mark.parametrize("bad", [True, 1.5, "7", 2**63, -(2**63) - 1])
+def test_a_revision_must_be_a_64_bit_integer(bad):
+    pytest.importorskip("pymongo")
+    collection = FakeCollection()
+    backend = MongoDBBackend(collection, EMBED)
+    with pytest.raises(ValueError, match="revision must be an integer"):
+        backend.add([Document("a", "leave", {})], revision=bad)
+    with pytest.raises(ValueError, match="revision must be an integer"):
+        backend.set_metadata({"a": {}}, revision=bad)
+    assert collection.documents == {}  # refused before anything is sent
 
 
 def test_wrong_configuration_is_rejected():
@@ -521,5 +534,108 @@ def test_server_keyword_mode_ranks_by_bm25_inside_the_filter():
         assert keyword.search(hostile, 5, In("allowed_groups", ["nobody"])) == []
         keyword.set_metadata({"b": {"allowed_groups": ["*"]}})
         assert [h.id for h in keyword.search("payouts", 5, In("allowed_groups", ["*"]))] == ["b"]
+    finally:
+        collection.drop()
+
+
+# ---- revisions on a local Atlas deployment -----------------------------------------------------
+
+
+def _part(users, ids=("a#0", "a#1")):
+    """Chunks of one source document, readable by `users`."""
+    return [Document(i, f"salary bands part {i}", {"allowed_users": list(users)}) for i in ids]
+
+
+def _stored(collection):
+    """Each stored chunk's readers and revision, by id."""
+    found = collection.find({}, {"metadata": 1, REVISION_FIELD: 1})
+    return {d["_id"]: (d["metadata"].get("allowed_users"), d.get(REVISION_FIELD)) for d in found}
+
+
+def _readable(backend, user):
+    retriever = PermissionedRetriever(backend, MetadataACLAuthorizer(), strategy="prefilter")
+    return sorted(h.id for h in retriever.retrieve("salary", Subject(user), 5).hits)
+
+
+def test_server_refuses_a_write_older_than_the_stored_revision():
+    collection = _collection()
+    backend = MongoDBBackend(collection, EMBED)
+    try:
+        backend.add(_part(["alice"]), revision=5)  # the indexer, at revision 5
+        backend.set_metadata({c.id: {"allowed_users": []} for c in _part([])}, revision=6)  # the revocation
+        # The indexer's late write, read at revision 5, with a chunk the document did not have before.
+        with pytest.raises(StaleRevision) as refused:
+            backend.add(_part(["alice"], ("a#0", "a#1", "a#2")), revision=5)
+        assert refused.value.ids == ("a#0", "a#1") and refused.value.revision == 5
+        assert _stored(collection) == {"a#0": ([], 6), "a#1": ([], 6)}  # found before writing: nothing written
+        with pytest.raises(StaleRevision):
+            backend.set_metadata({"a#0": {"allowed_users": ["alice"]}}, revision=5)
+        assert _stored(collection) == {"a#0": ([], 6), "a#1": ([], 6)}
+        assert _readable(backend, "alice") == []
+        # The same revision again (a retry) is written, and so is a newer one; ids not stored stay ignored.
+        backend.set_metadata({"a#0": {"allowed_users": ["bob"]}, "gone": {"allowed_users": ["bob"]}}, revision=6)
+        assert _stored(collection) == {"a#0": (["bob"], 6), "a#1": ([], 6)}
+        backend.add(_part(["carol"], ("a#0", "a#1", "a#2")), revision=7)
+        assert _stored(collection) == {"a#0": (["carol"], 7), "a#1": (["carol"], 7), "a#2": (["carol"], 7)}
+        assert _readable(backend, "carol") == ["a#0", "a#1", "a#2"]
+    finally:
+        collection.drop()
+
+
+class LooksTooEarly(MongoDBBackend):
+    """Its look before writing finds nothing newer, as when a newer write lands just after the look."""
+
+    def _refuse_newer(self, ids, revision):
+        pass
+
+
+def test_server_compares_each_chunk_in_the_update_that_writes_it():
+    collection = _collection()
+    backend = LooksTooEarly(collection, EMBED)
+    try:
+        backend.add(_part(["alice"]), revision=5)
+        backend.set_metadata({"a#0": {"allowed_users": []}}, revision=6)
+        with pytest.raises(StaleRevision) as refused:
+            backend.add(_part(["alice"], ("a#0", "a#1", "a#2")), revision=5)
+        assert refused.value.ids == ("a#0",)
+        # Not one transaction: the chunks that were not newer are written, and searchable on return.
+        assert _stored(collection) == {"a#0": ([], 6), "a#1": (["alice"], 5), "a#2": (["alice"], 5)}
+        assert _readable(backend, "alice") == ["a#1", "a#2"]
+        with pytest.raises(StaleRevision) as refused:
+            backend.set_metadata({"a#0": {"allowed_users": ["alice"]}, "a#1": {"allowed_users": []}}, revision=5)
+        assert refused.value.ids == ("a#0",)
+        assert _stored(collection) == {"a#0": ([], 6), "a#1": ([], 5), "a#2": (["alice"], 5)}
+        assert _readable(backend, "alice") == ["a#2"]
+    finally:
+        collection.drop()
+
+
+def test_server_writes_without_a_revision_are_unconditional():
+    collection = _collection()
+    backend = MongoDBBackend(collection, EMBED)
+    try:
+        backend.add(_part(["alice"]), revision=3)
+        backend.set_metadata({"a#0": {"allowed_users": ["bob"]}})  # leaves the stored revision
+        backend.add(_part(["carol"], ("a#1",)))  # replaces the whole document, its revision too
+        assert _stored(collection) == {"a#0": (["bob"], 3), "a#1": (["carol"], None)}
+        with pytest.raises(StaleRevision) as refused:
+            backend.add(_part(["dave"]), revision=2)
+        assert refused.value.ids == ("a#0",)  # a chunk stored without a revision is never newer
+        assert _stored(collection) == {"a#0": (["bob"], 3), "a#1": (["carol"], None)}
+    finally:
+        collection.drop()
+
+
+def test_server_stores_values_that_look_like_operators_as_written_under_a_revision():
+    collection = _collection()
+    backend = MongoDBBackend(collection, EMBED)
+    metadata = {"allowed_groups": ["$$ROOT", "$metadata"], "note": "$content", "nested": {"path": "$_id"}}
+    try:
+        backend.add([Document("d", "$content and $$ROOT", metadata)], revision=1)
+        stored = collection.find_one({"_id": "d"})
+        assert stored["content"] == "$content and $$ROOT" and stored["metadata"] == metadata
+        assert stored[REVISION_FIELD] == 1 and stored[TERMS_FIELD] == permission_terms(metadata)
+        retriever = PermissionedRetriever(backend, MetadataACLAuthorizer(), strategy="prefilter")
+        assert [h.id for h in retriever.retrieve("content", Subject("ann", ["$$ROOT"]), 5).hits] == ["d"]
     finally:
         collection.drop()

@@ -18,6 +18,10 @@ An observer may also define `observer_failed(observer, event, error)`. After eve
 had an event, the retriever calls it once for each observer that raised on that event, with that
 observer, the event it was given and the exception. `wardowl.otel.OpenTelemetryMetrics` counts
 them in `wardowl.observer_failures`.
+
+`retrieve` calls observers, required or not, and `observer_failed`, in the caller's thread;
+`aretrieve` calls them in a worker thread, off the event loop, and waits for them before it
+returns or raises. Observers may therefore be called from several threads at once.
 """
 
 from __future__ import annotations

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import threading
 import time
 
 import pytest
@@ -286,6 +287,156 @@ def test_observers_hear_of_failed_observers_and_a_failure_there_changes_nothing(
     assert [h.id for h in retriever.retrieve("leave", BOB).hits] == ["handbook"]
     assert heard == [(full, "bob", "OSError")]
     assert "failed to record a failed observer" in caplog.text and retriever.observer_failures == 1
+
+
+def test_required_observers_run_in_worker_threads_and_every_failure_is_counted():
+    threads, lock = set(), threading.Lock()
+
+    def full(event):
+        with lock:
+            threads.add(threading.get_ident())
+        time.sleep(0.01)  # holds its worker, so concurrent calls fail in different threads
+        raise OSError("disk full")
+
+    retriever = PermissionedRetriever(InMemoryBackend(DOCS), MetadataACLAuthorizer(), required_observers=[full])
+
+    async def run():
+        return await asyncio.gather(*(retriever.aretrieve("leave", BOB) for _ in range(20)), return_exceptions=True)
+
+    outcomes = asyncio.run(run())
+    assert all(isinstance(o, AuditError) and isinstance(o.__cause__, OSError) for o in outcomes)
+    assert retriever.observer_failures == 20 and threading.get_ident() not in threads
+
+
+def test_a_call_cancelled_while_a_required_observer_fails_raises_cancelled_error():
+    entered, release = threading.Event(), threading.Event()
+
+    def full(event):
+        entered.set()
+        release.wait(10)
+        raise OSError("disk full")
+
+    retriever = PermissionedRetriever(InMemoryBackend(DOCS), MetadataACLAuthorizer(), required_observers=[full])
+
+    async def run():
+        call = asyncio.ensure_future(retriever.aretrieve("leave", BOB))
+        for _ in range(500):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call  # nothing was returned, and the caller stopped waiting
+        release.set()
+        for _ in range(500):  # the delivery goes on in its thread
+            if retriever.observer_failures:
+                break
+            await asyncio.sleep(0.01)
+
+    try:
+        asyncio.run(run())
+    finally:
+        release.set()
+    assert entered.is_set() and retriever.observer_failures == 1
+
+
+def test_aretrieve_calls_observers_in_a_worker_thread_before_it_returns_or_raises():
+    where = []
+
+    def observer(event):
+        try:
+            asyncio.get_running_loop()
+            where.append(("event loop", event.error))
+        except RuntimeError:
+            where.append(("worker thread", event.error))
+
+    ok = PermissionedRetriever(InMemoryBackend(DOCS), MetadataACLAuthorizer(), observers=[observer])
+    authz = FunctionAuthorizer(lambda s, h, a: (_ for _ in ()).throw(ConnectionError("down")))
+    failing = PermissionedRetriever(InMemoryBackend(DOCS), authz, observers=[observer], strategy="postfilter")
+
+    async def run():
+        await ok.aretrieve("leave", BOB)
+        delivered = list(where)  # before aretrieve returned
+        with pytest.raises(AuthorizationError):
+            await failing.aretrieve("leave", BOB)
+        return delivered, list(where)
+
+    delivered, everything = asyncio.run(run())
+    assert delivered == [("worker thread", None)]
+    assert everything == [("worker thread", None), ("worker thread", "AuthorizationError")]
+
+
+def test_a_call_cancelled_while_its_event_is_on_the_way_stops_waiting_and_is_still_reported():
+    entered, release, events = threading.Event(), threading.Event(), []
+
+    def slow(event):  # an audit sink that takes its time
+        entered.set()
+        release.wait(10)
+        events.append(event)
+
+    retriever = PermissionedRetriever(InMemoryBackend(DOCS), MetadataACLAuthorizer(), observers=[slow])
+
+    async def run():
+        call = asyncio.ensure_future(retriever.aretrieve("leave", BOB))
+        for _ in range(500):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call  # at once, without waiting for the observer
+        waited = events == []
+        release.set()
+        return waited
+
+    try:
+        waited = asyncio.run(run())  # which waits for the executor's threads before it returns
+    finally:
+        release.set()
+    assert entered.is_set() and waited
+    assert [e.returned_ids for e in events] == [("handbook",)]  # the finished retrieval, reported once
+
+
+def test_observers_are_still_called_when_the_executor_is_shut_down():
+    from concurrent.futures import ThreadPoolExecutor
+
+    events = []
+    retriever = PermissionedRetriever(InMemoryBackend(DOCS), MetadataACLAuthorizer(), observers=[events.append])
+
+    async def run():
+        pool = ThreadPoolExecutor(1)
+        asyncio.get_running_loop().set_default_executor(pool)
+        pool.shutdown()  # as when the loop closes: nothing more runs in a thread
+        with pytest.raises(AuthorizationError) as failure:
+            await retriever.aretrieve("leave", BOB)  # the authorizer's filter cannot run in a thread either
+        return failure.value
+
+    error = asyncio.run(run())
+    assert isinstance(error.__cause__, RuntimeError)  # the retrieval's own error, not the reporting one
+    assert [e.error for e in events] == ["AuthorizationError"]
+
+
+def test_a_closed_retrieval_is_reported_without_awaiting_anything():
+    events = []
+
+    class Native:
+        """An authorizer with a native filter, which suspends once."""
+
+        def check(self, subject, hits, action="read"):
+            return [True] * len(hits)
+
+        def filter_for(self, subject, action="read"):
+            return None
+
+        async def afilter_for(self, subject, action="read"):
+            await asyncio.sleep(0)
+            return None
+
+    retriever = PermissionedRetriever(InMemoryBackend(DOCS), Native(), observers=[events.append])
+    call = retriever.aretrieve("leave", BOB)
+    call.send(None)  # runs to the first suspension, inside afilter_for
+    call.close()  # GeneratorExit: the event is delivered on the spot, since nothing may be awaited now
+    assert [e.error for e in events] == ["GeneratorExit"]
 
 
 def test_a_query_with_a_lone_surrogate_is_fingerprinted_not_refused():

@@ -1,6 +1,6 @@
 ---
 layout: landing
-description: Permission-aware retrieval for RAG. Every user gets only the chunks they are allowed to read, whatever vector store, permission system or framework you use.
+description: wardowl is an open-source Python library for permission-aware retrieval in RAG. Every user gets only the chunks they are allowed to read.
 ---
 
 # Retrieval that knows who's asking
@@ -8,8 +8,9 @@ description: Permission-aware retrieval for RAG. Every user gets only the chunks
 ```{raw} html
 <div class="wo-hero">
   <p class="wo-hero__lead">
-    wardowl puts your permission system inside RAG retrieval. Every user gets only the chunks
-    they are allowed to read, whatever vector store, permission system or framework you use.
+    wardowl is an open-source Python library that puts your permission system inside RAG
+    retrieval. Every user gets only the chunks they are allowed to read, whatever vector store,
+    permission system or framework you use.
   </p>
   <div class="wo-hero__actions">
     <a class="sd-btn sd-btn-primary sd-rounded-pill" href="quickstart.html">Get started</a>
@@ -101,8 +102,8 @@ permissions stored on the chunks), or checks candidates one by one.
 
 :::{grid-item-card} 2. Filter inside the search
 :class-card: wo-step
-The filter runs inside the vector store's own query, so the nearest chunks the user may read come
-back, however few of the corpus that is.
+When the authorizer gives a filter, it runs inside the vector store's own query, so the nearest
+chunks the user may read come back, however few of the corpus that is.
 :::
 
 :::{grid-item-card} 3. Check, then return
@@ -240,20 +241,20 @@ forbidden chunks returned in 21,000 benchmark retrievals
 
 :::{grid-item-card}
 :class-card: wo-stat
-<span class="wo-stat__value">0.88–0.97</span>
+<span class="wo-stat__value">0.886–0.973</span>
 recall@10 at a million chunks, pre-filtered on pgvector
 :::
 
 :::{grid-item-card}
 :class-card: wo-stat
-<span class="wo-stat__value">129/s</span>
+<span class="wo-stat__value">131/s</span>
 retrievals on 4 CPUs, a million chunks in PostgreSQL
 :::
 
 :::{grid-item-card}
 :class-card: wo-stat
-<span class="wo-stat__value">8–10%</span>
-cost of a remote permission service, all of it recovered by caching
+<span class="wo-stat__value">7.9–8.6%</span>
+cost of a remote permission service, nearly all of it recovered by caching
 :::
 ::::
 
