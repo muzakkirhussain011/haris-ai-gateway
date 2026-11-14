@@ -241,3 +241,57 @@ def test_redis_deletes_a_large_prefix_in_batches():
     RedisCache(client).delete_prefix("ns:[1]")
     assert client.unlinked == [500, 500, 200]
     assert client.patterns == ["ns:\\[1\\]*"]  # glob characters in the prefix are matched literally
+
+
+class IndexClient:
+    """Stands in for a redis.Redis: records the pipeline, holds one index, and refuses to scan."""
+
+    def __init__(self, names, decoded):
+        self.commands, self.unlinked = [], []
+        self.names = names if decoded else [name.encode() for name in names]
+
+    def pipeline(self, transaction):
+        commands = self.commands
+
+        class Pipeline:
+            def __getattr__(self, command):
+                return lambda *args, **kwargs: commands.append((command, args, kwargs))
+
+        return Pipeline()
+
+    def zrange(self, name, start, end):
+        assert (start, end) == (0, -1)
+        return self.names
+
+    def unlink(self, *keys):
+        self.unlinked.append(keys)
+
+    def scan_iter(self, *args, **kwargs):
+        raise AssertionError("scanned the database")
+
+
+def test_redis_writes_an_entrys_name_to_the_index_before_the_entry():
+    client = IndexClient([], decoded=False)
+    cache = RedisCache(client, signing_key=b"k" * 32)
+    cache.set_many_indexed({"ns:{t}:a": b"1", "ns:{t}:b": b"2"}, ttl=30, index="ns!index:{t}")
+    names = [command for command, _, _ in client.commands]
+    assert names == ["zadd", "zremrangebyscore", "pexpire", "set", "set", "execute"]
+    (_, (index, scores), _), (_, (_, _, cutoff), _), (_, (_, keep), _) = client.commands[:3]
+    assert index == "ns!index:{t}" and set(scores) == {"ns:{t}:a", "ns:{t}:b"}
+    assert len(set(scores.values())) == 1 and next(iter(scores.values())) - cutoff == 90_000  # ttl plus a minute
+    assert keep == 90_000
+    _, (key, blob), options = client.commands[3]
+    assert key == "ns:{t}:a" and blob.endswith(b"1") and len(blob) == 65 and options == {"px": 30_000}  # signed
+    client.commands.clear()
+    cache.set_many_indexed({}, ttl=30, index="ns!index:{t}")
+    assert client.commands == []  # nothing to write, not even the index
+
+
+@pytest.mark.parametrize("decoded", [False, True])
+def test_redis_deletes_only_the_indexed_keys_under_the_prefix_in_batches(decoded):
+    names = [f"ns:{{t}}:{i}" for i in range(1200)] + ["ns:{u}:0", "other-app:session"]
+    client = IndexClient(names, decoded)
+    RedisCache(client).delete_indexed("ns!index:{t}", "ns:{t}:")
+    assert [len(keys) for keys in client.unlinked] == [500, 500, 200]
+    deleted = {key for keys in client.unlinked for key in keys}
+    assert b"ns:{t}:0" in deleted and b"ns:{u}:0" not in deleted and b"other-app:session" not in deleted

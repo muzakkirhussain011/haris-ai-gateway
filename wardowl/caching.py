@@ -35,6 +35,11 @@ answer another replica obtained before the invalidation and writes after it is n
 cache that fails is treated as a miss: the authorizer is asked, and the cache is never the reason
 access is granted. The epoch also carries the end of the invalidation's hold, so every replica
 holds back the subject's answers as the one that called `invalidate()` does.
+
+`invalidate()` waits for the shared cache in the calling thread. With `RedisCache`,
+`invalidate(subject)` deletes the subject's entries through an index of their names, so its cost
+grows with that subject's entries; `invalidate()` of everyone scans the whole Redis database. In
+async code, `await ainvalidate(...)` does the same work in a worker thread.
 """
 
 from __future__ import annotations
@@ -234,7 +239,14 @@ class CacheStats:
 
 @runtime_checkable
 class SharedCache(Protocol):
-    """A cache every process shares, such as Redis. Keys are strings and values opaque bytes."""
+    """A cache every process shares, such as Redis. Keys are strings and values opaque bytes.
+
+    A store can also have the two methods `RedisCache` adds: `set_many_indexed(entries, ttl,
+    index)`, which stores the entries as `set_many` does and records their keys under the name
+    `index` for at least as long, and `delete_indexed(index, prefix)`, which deletes the recorded
+    keys that start with `prefix`. `CachingAuthorizer` then writes each subject id's entries with an
+    index of their own, and `invalidate(subject)` deletes them through it instead of calling
+    `delete_prefix`. A store with only the three methods below works as before."""
 
     def get_many(self, keys: Sequence[str]) -> list[bytes | None]:
         """The value of each key, or None when it is absent."""
@@ -246,6 +258,19 @@ class SharedCache(Protocol):
 
     def delete_prefix(self, prefix: str) -> None:
         """Delete every key that starts with `prefix`."""
+        ...
+
+
+@runtime_checkable
+class _IndexedSharedCache(SharedCache, Protocol):
+    """A `SharedCache` that also keeps an index of the keys written for each subject id."""
+
+    def set_many_indexed(self, entries: Mapping[str, bytes], ttl: float, index: str) -> None:
+        """Store each entry for `ttl` seconds, and record its key in `index` for at least as long."""
+        ...
+
+    def delete_indexed(self, index: str, prefix: str) -> None:
+        """Delete every key recorded in `index` that starts with `prefix`."""
         ...
 
 
@@ -403,6 +428,12 @@ class CachingAuthorizer:
             return f"{self.namespace}!epoch"
         return f"{self.namespace}!epoch:{{{_digest(str(subject_id))}}}"
 
+    def _index_name(self, subject_id: str) -> str:
+        # The names of the id's entries, for a shared cache that keeps an index (RedisCache does).
+        # Outside "namespace:" like the epochs, so a listing of the entries finds only entries; the
+        # id's hash tag puts it in the cluster slot of the id's entries, written in one pipeline.
+        return f"{self.namespace}!index:{{{_digest(str(subject_id))}}}"
+
     def _global(self) -> tuple[str | None, float, float]:
         """The shared cache's global epoch, when this process read it (on its own clock), and when
         the hold of the `invalidate()` that set it ends (on the wall clock); read again once this
@@ -508,15 +539,20 @@ class CachingAuthorizer:
         if self.shared is None or epoch is _UNKNOWN or epoch is _HOLD:
             return
         expires = self._wall() + self.ttl
-        blobs = {}
+        by_subject: dict[str, dict[str, bytes]] = {}  # one subject per call, as check() takes one
         for key, value in entries:
             blob = self._encode(value, expires, epoch)
             if blob is not None:
-                blobs[self._name(key)] = blob
-        if not blobs:
+                by_subject.setdefault(key[1].id, {})[self._name(key)] = blob
+        if not by_subject:
             return
+        shared = self.shared
         try:
-            self.shared.set_many(blobs, self.ttl)
+            if isinstance(shared, _IndexedSharedCache):
+                for subject_id, blobs in by_subject.items():
+                    shared.set_many_indexed(blobs, self.ttl, self._index_name(subject_id))
+            else:
+                shared.set_many({name: blob for blobs in by_subject.values() for name, blob in blobs.items()}, self.ttl)
         except Exception:
             _log.warning("wardowl shared cache write failed", exc_info=True)
             self._count("shared_failures")
@@ -537,16 +573,51 @@ class CachingAuthorizer:
         `source_staleness`, no retrieval that starts in this process more than `source_staleness`
         seconds later is given access the change took away, nor one in another process more than
         `source_staleness` plus `local_ttl` seconds later.
+
+        With a shared cache, the calling thread waits until it has answered. With `RedisCache`,
+        `invalidate(subject)` takes one round trip to write the subject's epoch, one to read the
+        index of the entries written for that id, and one to delete each 500 entries the index
+        lists, whatever else the database holds. `invalidate()` of everyone writes the global
+        epoch, then runs `SCAN` over the whole Redis database, other applications' keys included,
+        about 1,000 keys per round trip, and deletes the namespace's entries 500 at a time. From
+        async code, `await ainvalidate(...)` instead.
         """
+        subject_id = self._invalidated_id(subject)
+        self._drop_local(subject_id)  # first, so this process stops at once even if Redis fails below
+        if self.shared is not None:
+            self._invalidate_shared(subject_id)
+
+    async def ainvalidate(self, subject: Subject | str | None = None) -> None:
+        """`invalidate()` for async code, with the same effect, guarantees and errors.
+
+        Once the coroutine runs, this process stops using its answers at once, without waiting, as
+        `invalidate()` does before it calls the shared cache. The shared cache's calls (the epoch,
+        then the deletion through the index or, for everyone, the scan) run in a worker thread
+        with `asyncio.to_thread`, so the event loop serves other requests while they wait for
+        Redis; the coroutine returns once they are done, and raises what they raise. If the task
+        awaiting it is cancelled, the worker thread still finishes them, but the caller is not
+        told whether they succeeded: call it again before reporting the revocation done.
+        """
+        subject_id = self._invalidated_id(subject)
+        self._drop_local(subject_id)
+        if self.shared is not None:
+            await asyncio.to_thread(self._invalidate_shared, subject_id)
+
+    @staticmethod
+    def _invalidated_id(subject: Subject | str | None) -> str | None:
+        """The subject id an `invalidate()` names (None for everyone), or an error for a bad one."""
         if subject is not None and not isinstance(subject, (Subject, str)):
             # An id of another type (42 for "42") would miss this process's entries, keyed by the id.
             raise TypeError(f"invalidate() takes a Subject, a subject id or None, not {type(subject).__name__}")
         subject_id = subject.id if isinstance(subject, Subject) else subject
         if subject_id == "":
             raise ValueError("a subject id is non-empty; pass None to drop every decision")
-        self._drop_local(subject_id)  # first, so this process stops at once even if Redis fails below
-        if self.shared is None:
-            return
+        return subject_id
+
+    def _invalidate_shared(self, subject_id: str | None) -> None:
+        """The shared cache's part of `invalidate()`, after this process dropped its own answers."""
+        shared = self.shared
+        assert shared is not None
         # A new epoch first, so that entries written under the old one are refused from now on;
         # then the entries themselves are deleted. Epochs lie outside "namespace:", so they stay.
         # Hex, not raw random bytes: a Redis client made with decode_responses=True must read it.
@@ -557,15 +628,22 @@ class CachingAuthorizer:
         epoch = token.encode()
         lifetime = self.ttl + self.source_staleness + _EPOCH_MARGIN
         if subject_id is None:
-            self.shared.set_many({self._epoch_name(None): epoch}, lifetime)
+            shared.set_many({self._epoch_name(None): epoch}, lifetime)
             epoch_id, hold = _epoch(epoch)
             with self._lock:
                 self._global_version += 1
                 self._global_epoch = (self._clock(), epoch_id, hold)
-            self.shared.delete_prefix(f"{self.namespace}:")
+            shared.delete_prefix(f"{self.namespace}:")
         else:
-            self.shared.set_many({self._epoch_name(subject_id): epoch}, lifetime)
-            self.shared.delete_prefix(f"{self._tag(subject_id)}:")
+            shared.set_many({self._epoch_name(subject_id): epoch}, lifetime)
+            prefix = f"{self._tag(subject_id)}:"
+            if isinstance(shared, _IndexedSharedCache):
+                # Only the entries the index lists: those written without one (by wardowl 3.0 and
+                # earlier, or by a write whose index update failed) stay until they expire, but
+                # carry an earlier epoch, which every replica refuses from the line above on.
+                shared.delete_indexed(self._index_name(subject_id), prefix)
+            else:
+                shared.delete_prefix(prefix)
         # Again: a retrieval here may have copied an old shared entry into this process after the
         # first drop and before the new epoch, under the generation that drop started.
         self._drop_local(subject_id)
@@ -776,6 +854,9 @@ class CachingAuthorizer:
 # ---- Redis ---------------------------------------------------------------------------------------
 
 _SIGNATURE = 64  # hex characters of an HMAC-SHA256
+# How long a name stays in an index after its entry expired, in milliseconds, and how much longer
+# than `ttl` an index lives after its last write: far more than replicas' clocks disagree by.
+_INDEX_GRACE_MS = 60_000
 
 
 def _glob_escape(text: str) -> str:
@@ -792,6 +873,11 @@ class RedisCache:
     (random bytes known only to your application, for example 32 from `secrets.token_bytes`) and
     every value is signed with HMAC-SHA256 over its key and content: an entry without a valid
     signature is ignored, so the authorizer is asked instead.
+
+    For each subject id, `CachingAuthorizer` also keeps here an index of the names of the entries
+    it wrote (`set_many_indexed`), a sorted set under the id's hash tag, so that
+    `invalidate(subject)` deletes them without scanning the database (`delete_indexed`).
+    `delete_prefix`, which `invalidate()` of everyone uses, scans the whole database.
     """
 
     def __init__(self, client: Any, *, signing_key: bytes | None = None) -> None:
@@ -820,14 +906,63 @@ class RedisCache:
             values.append(blob)
         return values
 
+    def _blob(self, key: str, value: bytes) -> bytes:
+        return self._signature(key, value) + value if self._key is not None else value
+
     def set_many(self, entries: Mapping[str, bytes], ttl: float) -> None:
         pipe = self.client.pipeline(transaction=False)
         for key, value in entries.items():
-            blob = self._signature(key, value) + value if self._key is not None else value
-            pipe.set(key, blob, px=max(1, int(ttl * 1000)))
+            pipe.set(key, self._blob(key, value), px=max(1, int(ttl * 1000)))
         pipe.execute()
 
+    def set_many_indexed(self, entries: Mapping[str, bytes], ttl: float, index: str) -> None:
+        """`set_many`, and record each key in the sorted set `index`, scored by when it expires,
+        so that `delete_indexed` finds the keys without a scan.
+
+        One pipeline: the names go into the index first, then the entries are written. An entry
+        therefore exists only once its name is listed, and `delete_indexed` never removes names,
+        so an invalidation running alongside either deletes the entry or leaves its name for the
+        next one. Each write also drops from the index the names whose entries expired more than
+        a minute ago, by this process's clock, and keeps the index for `ttl` plus a minute: it
+        lists only entries written in the `ttl` plus a minute before its last write, and expires
+        `ttl` plus a minute after it. Give `index` the hash tag of the keys, so that in Redis
+        Cluster they share its slot.
+        """
+        if not entries:
+            return
+        lifetime = max(1, int(ttl * 1000))
+        now = int(time.time() * 1000)
+        pipe = self.client.pipeline(transaction=False)
+        pipe.zadd(index, dict.fromkeys(entries, now + lifetime))
+        pipe.zremrangebyscore(index, "-inf", now - _INDEX_GRACE_MS)
+        pipe.pexpire(index, lifetime + _INDEX_GRACE_MS)
+        for key, value in entries.items():
+            pipe.set(key, self._blob(key, value), px=lifetime)
+        pipe.execute()
+
+    def delete_indexed(self, index: str, prefix: str) -> None:
+        """Delete the keys listed in the sorted set `index` that start with `prefix`.
+
+        One round trip reads the index, and one deletes each 500 of its keys, with `UNLINK`: the
+        cost grows with the keys it lists, not with the database. A name that does not start
+        with `prefix` is left alone, so a name someone else put in the index deletes nothing
+        else. The names stay in the index until they expire from it.
+        """
+        wanted = prefix.encode()
+        doomed: list[bytes] = []
+        for name in self.client.zrange(index, 0, -1):
+            raw = name.encode() if isinstance(name, str) else bytes(name)
+            if raw.startswith(wanted):
+                doomed.append(raw)
+        for start in range(0, len(doomed), 500):
+            self.client.unlink(*doomed[start : start + 500])
+
     def delete_prefix(self, prefix: str) -> None:
+        """Delete every key that starts with `prefix`, with `SCAN` and `UNLINK`.
+
+        `SCAN` visits every key in the database, other applications' included, about 1,000 per
+        round trip, so the cost grows with the whole database, not with the keys deleted.
+        """
         batch: list[Any] = []
         for key in self.client.scan_iter(match=_glob_escape(prefix) + "*", count=1000):
             batch.append(key)

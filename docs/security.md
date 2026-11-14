@@ -100,8 +100,10 @@ carries an HMAC-SHA256 over its key and content, and anything unsigned, tampered
 under another key is ignored. Keep that Redis private to the application either way. Key names are
 digests, so the subjects and chunks are not readable from a key listing. A failing Redis is only
 ever a miss, and a hanging one too once the client has timeouts
-([Operations](operations.md#sharing-the-cache-across-processes)). `invalidate()` clears Redis at
-once and reaches other replicas within `local_ttl` (1 second by default).
+([Operations](operations.md#sharing-the-cache-across-processes)). `invalidate()` writes a new
+epoch to Redis at once, under which no entry written before it is accepted, deletes those entries
+(for one subject, those its index lists), and reaches other replicas within `local_ttl` (1 second
+by default).
 
 **A scope only narrows the search.** `scope_for` (from `TenantAuthorizer` inside `AllOf`, for
 example) limits which chunks post-filtering searches, and every candidate is still checked. A scope
