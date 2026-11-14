@@ -29,6 +29,24 @@ All notable changes are recorded here. The format follows
   authorizer with another marker, a span whose readers were written in the authorizer's form, with
   `"*"` meaning a group of that name, was shown to everyone. The defaults are the names and marker
   it read before, so nothing changes without the new arguments.
+- `SpiceDBAuthorizer(consistency=...)` also takes a function of no arguments that returns the
+  consistency requirement, so that every request can carry the ZedToken of the application's latest
+  write (M13 in the readiness review). It is called once for each `check` or `filter_for` that
+  sends SpiceDB a request, before the first, and every request of that call (each
+  CheckBulkPermissions batch, each subject's LookupResources) carries what it returned; a call that
+  sends nothing does not call it. A mapping was the only form, fixed when the authorizer was
+  created, and `atLeastAsFresh` guarantees data at least as fresh as its token and nothing more, so
+  a token passed once covered no later write. The documentation still told operators to declare
+  `max_staleness=0` with it, and a `CachingAuthorizer` told so holds nothing back after
+  `invalidate()`: an answer from before a later revocation could be kept for its whole `ttl`. What
+  the function returns must be exactly one of SpiceDB's four requirements, with a non-empty token
+  for `atLeastAsFresh` and `atExactSnapshot`. Anything else, None or `{}` included, or an exception
+  from the function, raises `AuthorizationError` and nothing is sent, rather than a weaker
+  requirement being used. With a function, `max_staleness` is 11 seconds unless you pass it,
+  whatever the function returns. A mapping is sent as given, unchecked, and declares the same
+  `max_staleness` as before. The tests cover a token per call, one evaluation for a call of several
+  requests, the failures, a mapping, `max_staleness` for both forms, and, against a real SpiceDB, a
+  revocation reported to the cache with the token of its write.
 
 ### Deprecated
 
@@ -103,26 +121,6 @@ All notable changes are recorded here. The format follows
   a group name of only spaces that the sync layer wrote included. `SpanRedactor` reads a span's
   readers the same way. This only removes access through names that name no group; `Subject` still
   accepts them, and every other name is matched as before.
-
-### Documentation
-
-- Redaction said a span gives its readers "in the same form as `MetadataACLAuthorizer`'s
-  permissions", which held only for the authorizer's default field names and marker, and the
-  redactor needs lists where the authorizer also takes a single string. The page now names the
-  fields and the marker, shows how to give the redactor the authorizer's own, and says how the two
-  differ. The threat model's T14 says where the 100-level bound is enforced.
-- `MongoDBBackend.exact_search` is True for a vector backend created with `exact=True`, which runs
-  `$vectorSearch` as an ENN search: MongoDB documents that it "exhaustively searches all the
-  indexed vector embeddings", with the permission filter as its pre-filter. The retriever therefore
-  reports a short result from such a backend as complete (`shortfall="exhausted"`), where 3.0
-  reported `complete=False` and `shortfall="unknown"`, and `check_backend` checks it as exact. The
-  hits returned do not change. Only what the index has caught up with counts: a chunk written with
-  `wait=False` or by another tool can be missing from a search made just after it. Keyword mode and
-  `exact=False` are unchanged. CI runs the conformance kit against Atlas Local with `exact=True`
-  (U20 in the readiness review).
-
-### Fixed
-
 - A store left in needtoknow 1.x's layout now raises `ValueError`, naming the upgrade step that
   writes the chunks into a new collection, instead of misbehaving without an error (U5, U9, U18
   and U21 in the readiness review). The upgrading guide tells 1.x users to index again, and nothing
@@ -186,29 +184,22 @@ All notable changes are recorded here. The format follows
   and a subject's entries, epoch and index hash to one cluster slot (by redis-py's slot function;
   Redis Cluster itself is not tested in CI).
 
-### Added
-
-- `SpiceDBAuthorizer(consistency=...)` also takes a function of no arguments that returns the
-  consistency requirement, so that every request can carry the ZedToken of the application's latest
-  write (M13 in the readiness review). It is called once for each `check` or `filter_for` that
-  sends SpiceDB a request, before the first, and every request of that call (each
-  CheckBulkPermissions batch, each subject's LookupResources) carries what it returned; a call that
-  sends nothing does not call it. A mapping was the only form, fixed when the authorizer was
-  created, and `atLeastAsFresh` guarantees data at least as fresh as its token and nothing more, so
-  a token passed once covered no later write. The documentation still told operators to declare
-  `max_staleness=0` with it, and a `CachingAuthorizer` told so holds nothing back after
-  `invalidate()`: an answer from before a later revocation could be kept for its whole `ttl`. What
-  the function returns must be exactly one of SpiceDB's four requirements, with a non-empty token
-  for `atLeastAsFresh` and `atExactSnapshot`. Anything else, None or `{}` included, or an exception
-  from the function, raises `AuthorizationError` and nothing is sent, rather than a weaker
-  requirement being used. With a function, `max_staleness` is 11 seconds unless you pass it,
-  whatever the function returns. A mapping is sent as given, unchecked, and declares the same
-  `max_staleness` as before. The tests cover a token per call, one evaluation for a call of several
-  requests, the failures, a mapping, `max_staleness` for both forms, and, against a real SpiceDB, a
-  revocation reported to the cache with the token of its write.
-
 ### Documentation
 
+- Redaction said a span gives its readers "in the same form as `MetadataACLAuthorizer`'s
+  permissions", which held only for the authorizer's default field names and marker, and the
+  redactor needs lists where the authorizer also takes a single string. The page now names the
+  fields and the marker, shows how to give the redactor the authorizer's own, and says how the two
+  differ. The threat model's T14 says where the 100-level bound is enforced.
+- `MongoDBBackend.exact_search` is True for a vector backend created with `exact=True`, which runs
+  `$vectorSearch` as an ENN search: MongoDB documents that it "exhaustively searches all the
+  indexed vector embeddings", with the permission filter as its pre-filter. The retriever therefore
+  reports a short result from such a backend as complete (`shortfall="exhausted"`), where 3.0
+  reported `complete=False` and `shortfall="unknown"`, and `check_backend` checks it as exact. The
+  hits returned do not change. Only what the index has caught up with counts: a chunk written with
+  `wait=False` or by another tool can be missing from a search made just after it. Keyword mode and
+  `exact=False` are unchanged. CI runs the conformance kit against Atlas Local with `exact=True`
+  (U20 in the readiness review).
 - The module docstring, the SpiceDB page and
   [Revocation and consistency](https://muzakkirhussain011.github.io/wardowl/revocation.html) said
   to declare `max_staleness=0` when sending `atLeastAsFresh` with "the token of every change you
