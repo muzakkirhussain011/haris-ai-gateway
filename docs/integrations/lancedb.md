@@ -72,6 +72,12 @@ from wardowl.backends.lancedb import permission_terms
 row["wardowl_terms"] = permission_terms(metadata)
 ```
 
+The terms are derived from the metadata: recompute them with `permission_terms` in the same write
+as every change to a row's metadata, as `set_metadata` does. A tool that changes the metadata alone
+leaves the old terms. Terms that grant more than the metadata let the pre-filtered search find the
+row, and the re-check drops it and counts it in `violations`; terms that grant less hide the row
+from pre-filtered searches, and nothing reports it.
+
 A row whose `metadata` is not a JSON object carries no permissions, so the re-check denies it.
 
 ## Keyword search and hybrid search

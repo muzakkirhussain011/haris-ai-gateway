@@ -52,21 +52,35 @@ bound was the cause, decide `ttl` again as the security decision it is.
 
 ## The violations count rose
 
-**What it means.** The store returned chunks outside the filter it was given. The re-check
+**What it means.** The store returned chunks that the re-check then rejected. The re-check
 (`recheck=True`, the default) dropped them, so none reached the caller. With `recheck=False`, from
 1.4.0 they are matched against the filter in the process and dropped too; before 1.4.0 they were
-passed through, so upgrade if you use it.
+passed through, so upgrade if you use it. The filter the store applied and the re-check disagreed:
+a bug in the store is one reason, and the table below lists the others.
 
-1. From the events with `violations` above 0, find which retriever, and so which store and index,
-   and since when.
-2. Look at what changed then: the store's version, the index mapping or schema, the type of a
-   permission field (a number where the filter has strings), your own backend's translation, or a
-   wardowl upgrade.
-3. Run `wardowl.testing.check_backend` against a staging copy of that store at that version
-   ([conformance kit](extending.md#test-it-with-the-conformance-kit)). It compares the store's
-   answers with the reference semantics on generated documents and filters.
-4. Report it as SECURITY.md describes: a store that returns what the filter excludes is a bug in its
-   translation, even though the re-check contained it.
+1. From the events with `violations` above 0, find which retriever, and so which store, index and
+   authorizer, and since when. Note whether the count stays up or comes in bursts.
+2. Find the rejected chunks. Events name only the chunks returned, so repeat the search outside
+   the retriever for an affected subject and question:
+
+   ```python
+   f = authorizer.filter_for(subject)
+   hits = backend.search(question, k, f)
+   rejected = [h for h, ok in zip(hits, authorizer.check(subject, hits)) if not ok]
+   ```
+
+   With `recheck=False`, the retriever rejects the hits for which `wardowl.matches(f, h.metadata)`
+   is False. A cause that has passed, such as an index that caught up, leaves `rejected` empty.
+3. Go down this table.
+
+| Possible cause | How to tell | What to do |
+|---|---|---|
+| Another tool changed the metadata and left the permission terms stale (Elasticsearch, OpenSearch, Milvus, MongoDB, Redis, Weaviate, LanceDB, Vespa, Cassandra, Pinecone) | Read a rejected chunk with the store's own client: its `wardowl_terms` differ from what wardowl writes for its metadata (`permission_terms(metadata)`, in the modules of the backends that have it), and a writer other than wardowl wrote it | Have every writer recompute the terms in the same write as each metadata change, or change metadata only with `set_metadata`. Rewrite the stale chunks. Look for chunks of the same writer whose terms grant less than their metadata: those are hidden from pre-filtered searches, and nothing counts them. |
+| MongoDB's index had not caught up with a write | The store is MongoDB; the violations came while `add` or `set_metadata` ran, or after writes made with `wait=False`, and `rejected` is empty now | Nothing failed: such a chunk is dropped, not leaked ([Writes become searchable shortly after](integrations/mongodb.md#writes-become-searchable-shortly-after)). Expect bursts around writes; investigate violations that persist. |
+| Chroma records without wardowl's JSON copy of the metadata | The store is Chroma, and the rejected records have no `wardowl_metadata` key: another tool wrote them, or they are kept from needtoknow 1.x, which wrote `needtoknow_metadata` | Write them with the backend's `add`. For a 1.x collection, index the chunks into a new collection, as [Upgrading](upgrading.md) says for needtoknow 1.x. |
+| The authorizer's filter selects more than its `check` allows | `rejected` is not empty, its metadata and terms agree, and the authorizer's `check` denies chunks its filter selects: a field of a shape the policy does not expect (a list as OpenFGA's or SpiceDB's resource id, a list compared with `==` in Cerbos), an OPA policy whose filter and decisions differ, or a `FunctionAuthorizer` whose `filter_for` is broader than its `check`. `wardowl.testing.check_authorizer` with those subjects and chunks fails | Store each field in the shape the policy assumes, or correct the policy so the filter selects exactly what `check` allows ([OPA](integrations/opa.md#filters-for-pre-filtering), [Cerbos](integrations/cerbos.md#pre-filtering-from-query-plans)) |
+| A permission changed between the filter and the check | The authorizer asks OpenFGA or SpiceDB, whose filter (ListObjects or LookupResources) and check (BatchCheck or CheckBulkPermissions) are separate calls, or a `CachingAuthorizer` still holds a filter from before the change; the violations follow permission changes | Nothing failed: the chunk the check now denies was dropped. With `CachingAuthorizer`, call `invalidate()` when permissions change, so a filter cached before the change stops being used ([Revocation and consistency](revocation.md)). |
+| None of these: the store or the backend's translation | The count rose after a change: the store's version, the index mapping or schema, the type of a permission field (a number where the filter has strings), your own backend's translation, or a wardowl upgrade. `wardowl.testing.check_backend` fails against a staging copy of that store at that version ([conformance kit](extending.md#test-it-with-the-conformance-kit)); it compares the store's answers with the reference semantics on generated documents and filters | Report it as SECURITY.md describes: a store that returns what the filter excludes is a bug in its translation, even though the re-check contained it. |
 
 ## Retrievals fail with AuthorizationError
 

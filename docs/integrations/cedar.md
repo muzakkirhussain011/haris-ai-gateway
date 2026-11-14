@@ -47,6 +47,23 @@ payroll = {
 authorizer = CedarAuthorizer(POLICIES, entities=[payroll])
 ```
 
+## Tenants
+
+The policies above have no tenant: a group name that two tenants both use, such as `hr`, is one
+group to them. With several tenants in one store, add the tenant check,
+`AllOf(TenantAuthorizer(), CedarAuthorizer(...))`. It denies another tenant's chunks before Cedar
+is asked, and since Cedar gives no filter, the retriever then post-filters inside the subject's
+tenant rather than across the whole store
+([Scoped post-filtering](../combining.md#scoped-post-filtering)). A policy can also refuse other
+tenants itself, as the acceptance suite's
+[`documents.cedar`](https://github.com/muzakkirhussain011/wardowl/blob/main/acceptance/policies/cedar/documents.cedar)
+does:
+
+```text
+forbid (principal, action, resource)
+unless { principal has tenant && resource has tenant && principal.tenant == resource.tenant };
+```
+
 ## How it fails
 
 - **No pre-filter.** `filter_for` returns None, so the retriever post-filters: every candidate is

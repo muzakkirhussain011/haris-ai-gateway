@@ -32,6 +32,19 @@ backend.set_metadata({cid: with_access(metadata, access) for cid, metadata in ch
 result without embedding the chunks again
 ([Changing a document's permissions](../operations.md#changing-a-documents-permissions)).
 
+If your `MetadataACLAuthorizer` uses other field names or another everyone marker, pass the same
+ones to `with_access`. Nothing compares the two: with its defaults, `with_access` writes
+`allowed_users` and `allowed_groups` and keeps your own fields as they were, so a revocation never
+reaches the fields the authorizer reads.
+
+```python
+from wardowl import MetadataACLAuthorizer
+
+authorizer = MetadataACLAuthorizer(users_field="readers", groups_field="reader_groups", everyone="all")
+names = {"users_field": "readers", "groups_field": "reader_groups", "everyone": "all"}
+backend.set_metadata({cid: with_access(metadata, access, **names) for cid, metadata in chunks.items()})
+```
+
 ## How Drive sharing maps onto subjects
 
 | Drive grant | Gives | A `Subject` matches when |
@@ -43,7 +56,10 @@ result without embedding the chunks again
 
 Every Drive role (reader, commenter, writer, file organizer, organizer and owner) can read the
 file's content, so each one counts. Use the same addresses as subject ids, and give each subject
-the `domain:` group of its own domain.
+the `domain:` group of its own domain. Ids and group names are compared exactly, and nothing in
+wardowl lowercases a subject's: lowercase the user's address and group addresses where you build
+the `Subject`, since an address your identity provider sends as `Ann@example.com` does not match
+`ann@example.com`.
 
 Drive groups can contain groups, and a grant to a group reaches the members of the groups inside
 it. A subject's `groups` must therefore list every group it belongs to, directly or not. Cloud
@@ -53,6 +69,23 @@ returns them in one call (Workspace Enterprise and Cloud Identity Premium); othe
 Admin SDK's `groups.list(userKey=...)` for the user and again for each group found. Resolve them
 when the user signs in, as for any group-based permission: the chunks need no update when someone
 joins or leaves a group.
+
+### With OpenFGA or SpiceDB as well
+
+When the same subjects also go to a permission service, for example in
+`AnyOf(MetadataACLAuthorizer(), OpenFGAAuthorizer(...))`, the service's rules for ids apply to them
+too. A subject the service would refuse raises `UnsupportedSubject` on every retrieval, which fails
+closed.
+
+- **OpenFGA** does not accept a `:` in a group name, so with its default
+  `contextual_groups=True`, `OpenFGAAuthorizer` refuses a subject holding the `domain:example.com`
+  group ([OpenFGA](openfga.md#the-model)). Choose another prefix for both the connector and your
+  subjects: `GoogleDriveACL(service, domain_prefix="domain/")` writes `domain/example.com`.
+  Changing the prefix changes what the chunks store, so sync every file again after you change it.
+- **SpiceDB** takes only letters, digits and `/_|-=+` in an id, so a Drive address cannot be a
+  subject id there, nor, with `group_subjects=True`, a group name
+  ([SpiceDB](spicedb.md#the-schema)). Map the subject to the ids your SpiceDB relationships use
+  before it reaches `SpiceDBAuthorizer`.
 
 ## What grants nothing
 
@@ -96,6 +129,34 @@ if access.expires_at is not None:
     schedule_sync(file_id, at=access.expires_at)  # your scheduler
 ```
 
+A job that looks for expired chunks asks the store itself, with its own client: no wardowl backend
+lists chunks by their metadata. The field is text that sorts in time order, so a comparison with the current time,
+written the same way, finds the chunks whose expiry has passed.
+
+To enforce the expiry inside wardowl as well, add a check of your own to the access lists:
+
+```python
+from datetime import UTC, datetime
+
+from wardowl import AllOf, FunctionAuthorizer, MetadataACLAuthorizer
+
+
+def not_expired(subject, hits, action):
+    now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    expiries = [hit.metadata.get("access_expires_at") for hit in hits]
+    return [expires is None or (isinstance(expires, str) and expires > now) for expires in expiries]
+
+
+authorizer = AllOf(MetadataACLAuthorizer(), FunctionAuthorizer(not_expired))
+```
+
+A chunk whose expiry has passed is then readable by nobody, not even users whose own grants have
+not expired, until the next sync writes the file's current sharing. `FunctionAuthorizer` gives no
+filter, so the retriever post-filters inside the access lists' filter: the store still filters on
+it, but the retriever fetches `k × overfetch` candidates (4k by default), more when too few pass,
+and runs both checks on each, where pre-filtering would search for k. `strategy="prefilter"`
+raises `ValueError` with this authorizer.
+
 ## Shared drives and your domains
 
 A shared drive can be open only to its members, or only to users of its domain. Grants made
@@ -109,6 +170,17 @@ instead of everyone. Pass it when sharing outside the organization is turned off
 subjects only ever come from your own domains, and always for shared drives open only to their
 domain's users: a file in such a drive raises `ValueError` without it. A subdomain counts only
 when it is listed.
+
+## Tenants
+
+The sync writes only the permission fields (and `access_expires_at`); `with_access` keeps every
+other key, so a tenant is whatever your ingestion stored on the chunks, and a sync never changes
+it. With `TenantAuthorizer`, set the tenant on every chunk at ingestion
+([Tenant isolation](../combining.md#tenant-isolation)). When `domains` lists several domains, a
+file can be shared across them, and under `TenantAuthorizer` its chunks are still readable only in
+the tenant they carry. If the domains belong to one Workspace, make that Workspace the tenant
+rather than each domain; otherwise, store a list of tenants (`{"tenant": ["acme", "globex"]}`) on
+chunks that several of them may read.
 
 ## Credentials
 

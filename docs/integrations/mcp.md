@@ -94,6 +94,14 @@ add_search_tool(server, retriever, verify(os.environ["KNOWLEDGE_TOKEN"]))  # set
 server.run()  # stdio
 ```
 
+`OIDCAuthenticator` takes the subject's id from the token's `sub` and its groups from the groups
+claim, unchanged, as for the [HTTP service](http.md#mapping-a-real-providers-tokens): they must
+match your permissions exactly, and a permission service's rules for ids apply to them. OpenFGA
+refuses a group name with a space or a `:` when groups are sent as contextual tuples
+([OpenFGA](openfga.md#the-model)), and SpiceDB accepts only letters, digits and `/_|-=+` in a
+subject id, and in group names with `group_subjects=True` ([SpiceDB](spicedb.md#the-schema)). Send
+group ids or paths, such as Keycloak's `/acme/hr`, rather than display names.
+
 The subject then stays the same for the life of the process, after the token expires too, so the
 launcher must stop the process when the user signs out. For a server several people reach, use
 Streamable HTTP with a token verifier, as at the top of this page: every request carries the user's
