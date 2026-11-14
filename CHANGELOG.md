@@ -54,8 +54,6 @@ All notable changes are recorded here. The format follows
   leaves in Redis, and why the Redis behind the cache should not evict keys: an evicted epoch or
   index weakens what an invalidation deletes or refuses. Revocation, the runbook and the security
   model say the same where they describe `invalidate()`.
-### Documentation
-
 - What a rise in `violations` can mean. Concepts, the quickstart and the README said it means the
   store ignored the filter, and the runbook looked only for a store bug; it also rises when another
   tool leaves the permission terms stale on the stores that keep them, when MongoDB's index has not
