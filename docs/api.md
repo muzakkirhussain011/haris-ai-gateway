@@ -281,7 +281,7 @@ An observer is any callable that takes a `RetrievalEvent`. One that also defines
    :members: add, delete, set_metadata, search, save, load
 
 .. autoclass:: wardowl.backends.vespa.VespaBackend
-   :members: add, delete, set_metadata, search, close
+   :members: add, delete, set_metadata, search, exact_search, close
 
 .. autofunction:: wardowl.backends.vespa.schema
 
