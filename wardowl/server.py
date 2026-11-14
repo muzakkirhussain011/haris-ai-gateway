@@ -143,7 +143,7 @@ class OIDCAuthenticator:
         groups_claim: str = "groups",
         require_groups: bool = False,
         tenant_claim: str | None = None,
-        leeway: float = 0,
+        leeway: float | datetime.timedelta = 0,
         lifespan: float = 300,
         cooldown: float = 30,
         timeout: float = 5,
